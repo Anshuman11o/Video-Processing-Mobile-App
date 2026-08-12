@@ -35,6 +35,10 @@ tokens.json
 *~
 .DS_Store
 
+# Scratch worktrees created by background agents. Committed agent config
+# (.claude/settings.json, skills) is still tracked.
+.claude/worktrees/
+
 # Node.js
 node_modules/
 npm-debug.log*
