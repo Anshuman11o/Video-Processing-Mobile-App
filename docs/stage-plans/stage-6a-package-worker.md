@@ -460,23 +460,111 @@ _To be run against LocalStack. Nothing checked off until observed._
       `rungs × (ceil(duration/6) + 1) + 3`; worst case at `MaxDuration` 60s and
       3 rungs is **36 PUTs**, ~32 MB.
 
-### Known defect: the first caption is dropped
+### Known defect: caption timing — MEASURED AND FIXED in 8B, 2026-08-13
 
-Captions round-trip through the master, but **shifted about 112 ms early, and a
-cue starting at t=0 is lost entirely.** Observed: the mock's `0→3s` cue is
-absent, and its `3→6s` cue surfaces at `00:02.888`.
+**Status: closed.** The offset was real, the dropped first cue was not, and the
+fix is `X-TIMESTAMP-MAP` — verified against a real player, which is exactly what
+6A said it needed.
 
-The cause is the MPEG-TS start PTS, which subtitle cues are offset against.
-`-muxdelay 0 -muxpreload 0` already cuts this from ~1.4s to ~0.07s — without
-those flags the whole track would sit over a second early. The residual is small
-but it reliably eats the first cue, and the mock always starts one at zero.
+#### What 6A originally recorded, kept for the record
 
-Not fixed here, deliberately. The candidate fix is emitting `X-TIMESTAMP-MAP` in
-the VTT, and **ffmpeg ignores that header entirely** — four different values
-produced byte-identical output during research — so it cannot be verified in this
-environment while real players do honour it. Shipping an unverifiable fix for a
-subtitle-sync bug risks trading a 112 ms shift for a much worse one. It needs a
-real player test, which is Stage 7 territory.
+> Captions round-trip through the master, but **shifted about 112 ms early, and a
+> cue starting at t=0 is lost entirely.** Observed: the mock's `0→3s` cue is
+> absent, and its `3→6s` cue surfaces at `00:02.888`.
+>
+> The cause is the MPEG-TS start PTS, which subtitle cues are offset against.
+> `-muxdelay 0 -muxpreload 0` already cuts this from ~1.4s to ~0.07s. Not fixed
+> here, deliberately: the candidate fix is `X-TIMESTAMP-MAP` and **ffmpeg ignores
+> that header entirely** — four different values produced byte-identical output —
+> so it could not be verified with the only tool 6A had.
+
+#### The oracle
+
+**A headless Swift program using AVFoundation** (`AVURLAsset` +
+`AVPlayerItemLegibleOutput`), Xcode 16.1 / Swift 6.0.2, loading the master over
+`http://localhost:4566`. It reports the **item-timeline position at which the
+player presents each cue**, as a number, to microsecond resolution.
+
+Deliberately **not ffmpeg**: ffmpeg is the instrument that produced 6A's reading,
+and it ignores the very header under evaluation. ffprobe was used only to
+establish ground truth about PTS values in the TS bytes, never to conclude what a
+player would display.
+
+**Limitations, stated plainly.** AVFoundation is one player. It is Safari's HLS
+engine on macOS and the iOS player's engine, so the headless probe is strictly
+more precise than the Safari check Stage 7 and 8B both planned — but
+**ExoPlayer has still never seen this stream.** Everything below is an
+AVFoundation result and must not be recorded as an Android one.
+
+#### The measurement — a controlled before/after on identical media
+
+Authored cue times in `subs_000.vtt` (`MOCK_TRANSCRIBE=true`, 640×480, 30fps,
+10s): `0.000`, `3.000`, `6.000`, `9.000`. Same job, same segments, the only
+difference being whether the VTT carries the header:
+
+| Authored | No `X-TIMESTAMP-MAP` (before) | `MPEGTS:6000` (after) |
+|---|---|---|
+| `0.000` | **`-0.066667`** | `+0.000333` |
+| `3.000` | `2.933333` | `3.000333` |
+| `6.000` | `5.933333` | `6.000333` |
+| `9.000` | `8.933333` | `9.000333` |
+| **offset** | **66.667 ms early** | **0.333 ms late** |
+
+**Two corrections to the original diagnosis:**
+
+1. **The first cue is NOT dropped.** It is delivered at a *negative* item time
+   and therefore displayed from the very start of playback. Verified by seeking:
+   at `t = 0.5`, `1.5` and `2.8` the player reports `segment 1` as current, and
+   only at `t = 2.95` does it advance to `segment 2`. **The dropped-first-cue
+   half of 6A's finding was an artefact of ffmpeg's reader**, which discards a
+   cue that begins before the stream does. A player does not.
+2. **The offset is not a constant, and not 112 ms.** It is exactly the TS start
+   PTS, which is the encoder's B-frame reorder delay: measured `has_b_frames=2`,
+   so `2/fps`. A 30fps source gives 6000 ticks (66.7 ms); the **same code on a
+   24fps source gives 7500 ticks (83.3 ms)** — verified by running both. Anything
+   that baked 112 ms, or any other constant, into the packager would have been
+   wrong for most sources.
+
+#### Which candidate, and why
+
+**(b) — emit `X-TIMESTAMP-MAP` with `MPEGTS` derived from the measured start
+PTS.** Implemented in `media/subtitles.go`, wired in `packager.go`.
+
+- **(a) do nothing** is refuted: the player is *not* fine. It is reliably
+  66.7 ms early, and the error grows as frame rate falls.
+- **(c) shift the cue timestamps** would work but bakes an environment-specific
+  constant into stored content, and the 24fps run shows the constant is not even
+  stable across sources on this machine.
+- **(d) force the start PTS to zero** cannot actually reach zero. The shift is
+  `max(video reorder delay, AAC priming)`; `-avoid_negative_ts make_zero` already
+  applies (min DTS is 0 — PTS is still 6000), and killing the video term needs
+  `-bf 0`, which costs compression and still leaves the 1920-tick (21.3 ms) AAC
+  priming delay. Verified from the packet timestamps: the first audio PTS is
+  exactly `startPTS − 1920` in both the 30fps and 24fps jobs.
+
+The anchor is the **video** start PTS, not the container's. That distinction was
+measured, not assumed: `MPEGTS:6000` landed every cue exactly on its authored
+time, while `MPEGTS:4080` — the container start, lower because AAC priming sits
+earlier — left them 21.3 ms early.
+
+#### Residual, and what is still unknown
+
+- **VERIFIED:** a deterministic **0.33 ms** residual (30 ticks at 90 kHz),
+  reproducible across three runs of the same job, sign varying by source
+  (+0.33 ms at 30fps, −0.33 ms at 24fps). Cause **UNKNOWN**. It is 200× smaller
+  than the defect it replaced and far below any perceptual or spec threshold, so
+  it is recorded rather than chased.
+- **VERIFIED:** a cue-less `WEBVTT` carrying the new header still loads, still
+  lists **English** in the player's track picker, and plays through without error
+  or crash. **The first time any client has consumed the silent-clip path** — 6A
+  verified only that the file was valid.
+- **UNKNOWN:** what MPEG-TS timestamp **ExoPlayer** anchors on. If it seeds from
+  the container start rather than the video start, it will read these cues 21.3 ms
+  early instead of 0.33 ms late — still an improvement on 66.7 ms, but not the
+  same number. **8B-1 must re-run this measurement on the emulator**, and a
+  disagreement between the two players is itself the finding **[DECIDE 3]** asked
+  for.
+- **UNKNOWN:** anything about real AWS. Unchanged by this work.
 
 ### The crash-resume branch: settled
 
