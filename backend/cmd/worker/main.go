@@ -12,11 +12,14 @@ import (
 
 	"github.com/anshumanagarwal/dayreel/internal/config"
 	"github.com/anshumanagarwal/dayreel/internal/db"
+	"github.com/anshumanagarwal/dayreel/internal/events"
 	"github.com/anshumanagarwal/dayreel/internal/models"
 	"github.com/anshumanagarwal/dayreel/internal/queue"
 	"github.com/anshumanagarwal/dayreel/internal/storage"
+	"github.com/anshumanagarwal/dayreel/internal/transcribe"
 	"github.com/anshumanagarwal/dayreel/internal/worker"
 	"github.com/anshumanagarwal/dayreel/internal/worker/extract"
+	transcribeworker "github.com/anshumanagarwal/dayreel/internal/worker/transcribe"
 	"github.com/anshumanagarwal/dayreel/internal/worker/validate"
 )
 
@@ -73,7 +76,20 @@ func buildStage(name models.StageName, cfg *config.Config, s3Client *storage.S3C
 		// output. OutputKey is derived from the job ID rather than from the
 		// input key, so a bad input cannot cause a write outside its own prefix.
 		return extract.New(s3Client, cfg.S3ProcessedBucket, extract.DefaultOptions), nil
-	case models.StageTranscribe, models.StagePackage:
+	case models.StageTranscribe:
+		// The transcriber is chosen per job because the mock needs the clip
+		// duration, which only the manifest knows.
+		newDecoder := func(m *events.ExtractManifest) transcribe.Transcriber {
+			if cfg.MockTranscribe {
+				return transcribe.Mock{DurationSeconds: m.DurationSeconds}
+			}
+			return transcribe.NewWhisperCPP(cfg.WhisperModelPath)
+		}
+		if cfg.MockTranscribe {
+			log.Printf("worker[transcribe] MOCK_TRANSCRIBE=true — no model will be run")
+		}
+		return transcribeworker.New(s3Client, cfg.S3ProcessedBucket, newDecoder), nil
+	case models.StagePackage:
 		return nil, unimplementedStageError(name)
 	default:
 		return nil, unknownStageError(name)

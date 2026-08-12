@@ -45,13 +45,16 @@ func TestGate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			// Derived from DefaultLimits rather than hardcoded: MaxDuration is a
+			// cost lever that is expected to be tuned, and a test that pins the
+			// number fails on tuning instead of on a real regression.
 			name:    "over duration rejected",
-			probe:   media.ProbeResult{HasVideo: true, VideoCodec: "h264", DurationSec: 601},
+			probe:   media.ProbeResult{HasVideo: true, VideoCodec: "h264", DurationSec: limitSeconds() + 1},
 			wantErr: true,
 		},
 		{
 			name:  "exactly at the limit passes",
-			probe: media.ProbeResult{HasVideo: true, VideoCodec: "h264", DurationSec: 600},
+			probe: media.ProbeResult{HasVideo: true, VideoCodec: "h264", DurationSec: limitSeconds()},
 		},
 		{
 			name:    "unknown duration rejected",
@@ -103,4 +106,10 @@ func TestCustomLimits(t *testing.T) {
 	if err := s.gate(&media.ProbeResult{HasVideo: true, VideoCodec: "h264", DurationSec: 3}); err == nil {
 		t.Error("h264 should be rejected under custom limits")
 	}
+}
+
+// limitSeconds is DefaultLimits.MaxDuration in seconds, so the duration cases
+// track the configured limit instead of a literal.
+func limitSeconds() float64 {
+	return DefaultLimits.MaxDuration.Seconds()
 }

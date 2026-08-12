@@ -65,13 +65,26 @@ awslocal sqs create-queue --queue-name dayreel-dlq --attributes '{
 DLQ_ARN="arn:aws:sqs:${AWS_REGION}:${ACCOUNT_ID}:dayreel-dlq"
 
 # Create worker queues with DLQ redrive policy (maxReceiveCount=3)
+#
+# Transcribe gets a longer visibility timeout than the rest. Every other stage
+# finishes in about a second, but speech recognition runs for minutes on CPU. If
+# the message becomes visible again while the first worker is still transcribing,
+# SQS redelivers and a second worker starts the same job — and the runner's
+# idempotency guard cannot catch that, because it checks whether the output
+# exists and the output does not exist until the work finishes.
 for QUEUE in dayreel-validate dayreel-extract dayreel-transcribe dayreel-package; do
+  if [ "$QUEUE" = "dayreel-transcribe" ]; then
+    VISIBILITY="900"
+  else
+    VISIBILITY="300"
+  fi
+
   awslocal sqs create-queue --queue-name "$QUEUE" --attributes '{
-    "VisibilityTimeout": "300",
+    "VisibilityTimeout": "'"${VISIBILITY}"'",
     "MessageRetentionPeriod": "86400",
     "RedrivePolicy": "{\"deadLetterTargetArn\":\"'"${DLQ_ARN}"'\",\"maxReceiveCount\":\"3\"}"
   }' || true
-  echo "  Created queue: $QUEUE"
+  echo "  Created queue: $QUEUE (visibility ${VISIBILITY}s)"
 done
 
 echo "SQS queues created."

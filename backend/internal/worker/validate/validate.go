@@ -33,7 +33,12 @@ type Limits struct {
 // DefaultLimits are starting values, not measured ones; real input may argue
 // for different bounds.
 var DefaultLimits = Limits{
-	MaxDuration:        10 * time.Minute,
+	// 60s, lowered from 10 minutes. This is the only guard between a
+	// mis-selected large file and a long, billed processing run, and
+	// config/free-tier.md flags it as a cost lever against a $20 total budget.
+	// Test clips are <=10s, so this leaves generous headroom while making an
+	// accidental upload fail fast instead of transcribing for minutes.
+	MaxDuration:        60 * time.Second,
 	AllowedVideoCodecs: []string{"h264", "hevc"},
 	AllowedAudioCodecs: []string{"aac", "mp3"},
 }
