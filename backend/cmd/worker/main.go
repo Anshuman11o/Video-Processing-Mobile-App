@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 
 	"github.com/anshumanagarwal/dayreel/internal/config"
@@ -49,11 +48,13 @@ func main() {
 		log.Fatalf("create dynamodb client: %v", err)
 	}
 
-	// The same queue database the API writes to, and the same one every other
-	// stage runner opens. Nothing coordinates them in this process: SQLite's own
-	// write lock is what makes a claim safe across processes, which is why the
-	// four stages can be four separate binaries on one box.
-	queueClient, err := openQueue(cfg)
+	// The same broker the API writes to, whichever QUEUE_DRIVER names. Nothing
+	// coordinates the stage runners in this process: on SQLite the database's
+	// own write lock is what makes a claim safe across processes, on SQS the
+	// visibility timeout is, and either way the four stages can be four separate
+	// binaries.
+	queueLogger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	queueClient, err := queue.FromConfig(ctx, cfg, queueLogger)
 	if err != nil {
 		log.Fatalf("open queue: %v", err)
 	}
@@ -68,44 +69,14 @@ func main() {
 		log.Fatalf("%v", err)
 	}
 
-	log.Printf("worker starting: stage=%s region=%s queue=%s",
-		stageName, cfg.AWSRegion, cfg.QueueDBPath)
+	log.Printf("worker starting: stage=%s region=%s queue_driver=%s",
+		stageName, cfg.AWSRegion, cfg.QueueDriver)
 
 	if err := worker.NewRunner(stage, queueClient, dbClient, s3Client, cfg).Run(ctx); err != nil {
 		log.Fatalf("worker: %v", err)
 	}
 
 	log.Println("worker exited")
-}
-
-// openQueue creates the queue database directory and opens the broker, wrapped
-// in structured logging.
-//
-// Duplicated from cmd/api rather than shared: the two binaries are deployed
-// independently and the only thing they must agree on is the configuration,
-// which they already read from the same place.
-func openQueue(cfg *config.Config) (queue.Queue, error) {
-	// SQLite will not create missing parent directories. A worker started before
-	// the API on a fresh checkout would otherwise fail on a path that is only
-	// missing its directory.
-	if dir := filepath.Dir(cfg.QueueDBPath); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, err
-		}
-	}
-
-	q, err := queue.Open(queue.Options{
-		Path:              cfg.QueueDBPath,
-		VisibilityTimeout: cfg.QueueVisibilityTimeout,
-		MaxDeliveries:     cfg.QueueMaxDeliveries,
-		PollInterval:      cfg.QueuePollInterval,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	return queue.WithLogging(q, logger), nil
 }
 
 // buildStage maps a stage name to its implementation. Stages 4A-6A land here.

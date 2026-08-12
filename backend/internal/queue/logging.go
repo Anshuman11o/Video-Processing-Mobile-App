@@ -155,10 +155,25 @@ func (l *LoggingQueue) finish(ctx context.Context, msg string, attrs []any, err 
 func messageAttrs(m Message) []any {
 	attrs := []any{
 		slog.String("queue", m.Queue),
-		slog.Int64("msg_id", m.ID),
+		msgIDAttr(m),
 		slog.Int("receive_count", m.ReceiveCount),
 	}
 	return append(attrs, stageAttrs(m.Stage)...)
+}
+
+// msgIDAttr emits the broker's identifier under one attribute name, whatever
+// shape that identifier has.
+//
+// SQLite numbers its messages, so msg_id stays a JSON number and existing log
+// queries against it keep working. SQS identifies a message by UUID, so on that
+// driver the same key carries a string. The alternative — two attributes, one
+// always empty — would mean anyone tracing a video through the pipeline had to
+// know which broker wrote the line before they could search for it.
+func msgIDAttr(m Message) slog.Attr {
+	if m.ID != 0 {
+		return slog.Int64("msg_id", m.ID)
+	}
+	return slog.String("msg_id", m.Ident())
 }
 
 // stageAttrs pulls the payload identifiers out of a StageMessage, tolerating nil

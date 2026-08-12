@@ -42,11 +42,11 @@ path. Expand incrementally once the core flow works.
 │       │  in-process                 │  claim / ack / dead-letter            │
 │       │  TTL cache                  ▼                                       │
 │       │  (status)         ┌───────────────────┐                             │
-│       │                   │  SQLite queue     │  data/queue.db              │
-│       │                   │  (validate,       │  one row per message,       │
-│       │                   │   extract,        │  `visible_at` is the        │
-│       │                   │   transcribe,     │  visibility timeout,        │
-│       │                   │   package, dlq)   │  `queue` is the routing key │
+│       │                   │  QUEUE (pluggable)│  QUEUE_DRIVER picks one:    │
+│       │                   │  (validate,       │   sqlite → data/queue.db    │
+│       │                   │   extract,        │     (default, one file)     │
+│       │                   │   transcribe,     │   sqs → real Amazon SQS     │
+│       │                   │   package, dlq)   │  Same five queue names.     │
 │       │                   └───────────────────┘                             │
 │       │                                                                     │
 │       └──────────────┬──────────────┐                                       │
@@ -70,11 +70,25 @@ Dropping SQS did not drop any of these. The SQLite queue implements the same
 contract — claim with a visibility timeout, ack on success, dead-letter after N
 deliveries — which is the part the pipeline actually depends on.
 
+**The queue is pluggable.** `QUEUE_DRIVER` selects it at startup:
+
+| Driver | When |
+|--------|------|
+| `sqlite` (default) | Everything, until the constraint below bites. One file, no account, no per-request cost. |
+| `sqs` | Workers on more than one machine, or the queue has to outlive the box. Billed per request; the queues must be created first with `make sqs-setup`. |
+
+Both implement `queue.Queue`, both dead-letter explicitly rather than trusting a
+broker policy, and `queue.FromConfig` is the only code that knows there are two
+— the API, the runner and all four stages take the interface. Where the
+semantics genuinely differ (SQS's 10-message and 20-second ceilings, its
+client-computed lease deadline, its per-request cost) is written down in
+`backend/internal/queue/CONTEXT.md`.
+
 **Local-first:** the entire local stack is two Go processes and a file. S3 and
 DynamoDB are real AWS from the start, so there is no emulator to install and no
 emulator-vs-real behaviour gap to debug. The same binaries run on a VM if we
-deploy; only the queue would be swapped for a hosted broker, behind the same
-interface.
+deploy — and the one piece that has to change for a second host, the queue, is
+now a configuration value rather than a port.
 
 **Deferred (deliberate, not an oversight):**
 - **No CDN.** At this scale — a handful of short clips — CloudFront is cost and
@@ -84,15 +98,18 @@ interface.
 - **No managed container hosting.** ECS Fargate buys autoscaling we don't need. The
   Go binaries are identical either way, so this is a hosting choice we can revisit
   without touching application code.
-- **No Docker, no LocalStack, no Redis, no SQS.** The project processes a handful
+- **No Docker, no LocalStack, no Redis.** The project processes a handful
   of 10–60 second clips. Containers, an AWS emulator, and a separate cache server
-  cost 1.5–2.5 GB of RAM and buy nothing at that scale. SQS becomes a SQLite
-  queue, Redis becomes an in-process TTL cache, and Compose has nothing left to
-  orchestrate. See `infra/CONTEXT.md`.
-- **No S3 event notifications.** Real S3 cannot notify a SQLite file, so uploads
-  no longer start the pipeline by themselves; the API enqueues the validate
-  message on `POST /jobs/{id}/complete`. Event-driven start returns with a real
-  broker, if ever.
+  cost 1.5–2.5 GB of RAM and buy nothing at that scale. Redis becomes an
+  in-process TTL cache, and Compose has nothing left to orchestrate. See
+  `infra/CONTEXT.md`. SQS is the exception: it came back as a selectable driver
+  rather than the only option, because "the workers must share a filesystem with
+  the API" is a real ceiling and the emulator was never what made SQS expensive.
+- **No S3 event notifications.** The API enqueues the validate message on
+  `POST /jobs/{id}/complete` rather than S3 doing it. This started as a SQLite
+  constraint — real S3 cannot notify a file — and stays that way on SQS too, so
+  the pipeline starts the same way on both drivers instead of having two
+  entry paths to reason about.
 
 ---
 
@@ -131,7 +148,7 @@ interface.
 │   │   │   ├── transcribe/
 │   │   │   └── packager/
 │   │   ├── storage/             # S3 client wrapper
-│   │   ├── queue/               # Self-hosted SQLite queue (claim/ack/DLQ)
+│   │   ├── queue/               # Broker: SQLite (default) or SQS, one interface
 │   │   └── cache/               # In-process TTL cache for job status
 │   ├── go.mod
 │   ├── go.sum
@@ -148,7 +165,7 @@ interface.
 │   └── CONTEXT.md               # Why there is no compose stack here
 │
 ├── config/
-│   ├── aws-limits.md            # S3 and DynamoDB constraints, local queue settings
+│   ├── aws-limits.md            # S3 and DynamoDB constraints, queue settings
 │   ├── free-tier.md             # Cost constraints, $20 budget (no free tier)
 │   └── CONTEXT.md
 │
@@ -160,6 +177,7 @@ interface.
 │
 └── scripts/
     ├── dev-setup.sh             # One-command local setup
+    ├── aws-sqs-setup.sh         # Create/inspect/delete the SQS queues (QUEUE_DRIVER=sqs)
     ├── test-upload.sh           # CLI test: upload video, poll status
     └── CONTEXT.md
 ```
@@ -547,7 +565,7 @@ Append as we go. Same problem never debugged twice.
 **config/aws-limits.md:**
 - S3: 5MB min part size, 10,000 max parts, 5TB max object
 - DynamoDB: 400KB item limit, 1KB RCU, 1KB WCU
-- Queue: 5-minute visibility timeout, maxDeliveries=3 (local SQLite, not SQS)
+- Queue: 5-minute visibility timeout, maxDeliveries=3 — same on both drivers
 
 **config/free-tier.md:**
 - **No free tier on this account** (confirmed 2026-08-12). Everything bills from

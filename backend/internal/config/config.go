@@ -17,8 +17,18 @@ type Config struct {
 	S3HLSBucket       string
 	DynamoDBTable     string
 
-	// Queue settings. The broker is a local SQLite file rather than SQS, so the
-	// knobs that used to be queue attributes in AWS live here instead.
+	// QueueDriver selects the broker: QueueDriverSQLite (the default, a local
+	// file) or QueueDriverSQS (real Amazon SQS). It is validated by
+	// queue.FromConfig rather than here, so an unusable value fails at the one
+	// place that can name the alternatives.
+	QueueDriver string
+
+	// Queue settings. QueueDBPath and QueuePollInterval configure the SQLite
+	// driver only — SQS has no file and does its long polling server-side.
+	// QueueVisibilityTimeout and QueueMaxDeliveries apply to both, and on SQS
+	// they must match what scripts/aws-sqs-setup.sh wrote onto the queues: the
+	// queue's own attributes are what AWS enforces, and these are what the
+	// workers believe.
 	QueueDBPath            string
 	QueueVisibilityTimeout time.Duration
 	QueueMaxDeliveries     int
@@ -64,6 +74,8 @@ type Config struct {
 
 // Load reads configuration from environment variables with sensible defaults.
 func Load() *Config {
+	driver := getEnv("QUEUE_DRIVER", QueueDriverSQLite)
+
 	return &Config{
 		Port:              getEnv("API_PORT", "8080"),
 		AWSRegion:         getEnv("AWS_REGION", "us-east-1"),
@@ -72,18 +84,55 @@ func Load() *Config {
 		S3HLSBucket:       getEnv("S3_HLS_BUCKET", "dayreel-hls-output"),
 		DynamoDBTable:     getEnv("DYNAMODB_TABLE", "dayreel-jobs"),
 
+		// SQLite is the default because it is the one that costs nothing and
+		// needs no account: a fresh checkout runs the whole pipeline without an
+		// AWS queue existing. SQS is opted into.
+		QueueDriver: driver,
+
 		QueueDBPath: getEnv("QUEUE_DB_PATH", "./data/queue.db"),
 		// Five minutes is the SQS default and comfortably outlives every stage
 		// except transcribe, which heartbeats instead.
 		QueueVisibilityTimeout: getEnvDuration("QUEUE_VISIBILITY_TIMEOUT", 5*time.Minute),
 		QueueMaxDeliveries:     getEnvInt("QUEUE_MAX_DELIVERIES", 3),
-		QueuePollInterval:      getEnvDuration("QUEUE_POLL_INTERVAL", 250*time.Millisecond),
+		QueuePollInterval:      getEnvDuration("QUEUE_POLL_INTERVAL", defaultPollInterval(driver)),
 
 		MockTranscribe:   getEnv("MOCK_TRANSCRIBE", "true") == "true",
 		S3PublicEndpoint: getEnv("S3_PUBLIC_ENDPOINT", ""),
 		UploadPartSize:   getEnvBytes("UPLOAD_PART_SIZE", DefaultUploadPartSize),
 		WhisperModelPath: getEnv("WHISPER_MODEL_PATH", "/models/ggml-base.bin"),
 	}
+}
+
+// The valid values of QUEUE_DRIVER. They are constants rather than bare strings
+// so the factory's switch, its error message and this default cannot drift apart.
+const (
+	// QueueDriverSQLite is the self-hosted broker: one file, no service, no
+	// per-request cost, and no way for a worker on another host to reach it.
+	QueueDriverSQLite = "sqlite"
+
+	// QueueDriverSQS is Amazon SQS: reachable from anywhere, billed per
+	// request, and requiring the queues to exist before anything starts.
+	QueueDriverSQS = "sqs"
+)
+
+// defaultPollInterval picks the default for QUEUE_POLL_INTERVAL, which is the
+// one queue knob whose sensible value depends on the driver.
+//
+// The runner passes it to Receive as the long-poll duration, and the same number
+// means two very different things there. On SQLite it is a local ticker's
+// cadence: 250ms costs four queries a second against a file and nothing else.
+// On SQS it becomes WaitTimeSeconds, whose granularity is one second — so 250ms
+// is a request that returns immediately, and since the consume loop has no delay
+// of its own between receives, an idle worker would spin as fast as the network
+// allows, billed per request. 20s is SQS's maximum long poll and the only value
+// that keeps four idle workers inside the free tier.
+//
+// An explicit QUEUE_POLL_INTERVAL still wins on both; this is only the default.
+func defaultPollInterval(driver string) time.Duration {
+	if driver == QueueDriverSQS {
+		return 20 * time.Second
+	}
+	return 250 * time.Millisecond
 }
 
 // DefaultUploadPartSize is S3's minimum size for a non-final part. Anything

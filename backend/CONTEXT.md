@@ -24,7 +24,7 @@ backend/
 │   ├── events/                  # Stage message types, queue/bucket constants, extract manifest
 │   ├── media/                   # ffmpeg/ffprobe wrappers, HLS ladder, playlists
 │   ├── models/job.go            # Job, StageState, UploadInfo data models
-│   ├── queue/                   # Self-hosted SQLite queue (see its CONTEXT.md)
+│   ├── queue/                   # Broker: SQLite (default) or SQS, one interface (see its CONTEXT.md)
 │   ├── storage/                 # S3 multipart upload, presigned URLs, whole-object I/O
 │   ├── transcribe/              # whisper.cpp and the mock transcriber
 │   └── worker/                  # Shared consume loop plus the four stages
@@ -33,11 +33,13 @@ backend/
 
 ## What is and isn't AWS
 
-S3 and DynamoDB are the only remote dependencies, and they are real AWS — there
-is no emulator. The queue is a local SQLite file (`QUEUE_DB_PATH`), and the
-status cache lives in the API's own memory. That means the AWS SDK's default
-credential chain must resolve: environment variables, `~/.aws/credentials`, or
-an instance/task role. Nothing injects static test credentials any more.
+S3 and DynamoDB are always real AWS — there is no emulator. The status cache
+lives in the API's own memory. The queue is a choice: `QUEUE_DRIVER=sqlite` (the
+default) is a local file at `QUEUE_DB_PATH` and touches no AWS service at all,
+while `QUEUE_DRIVER=sqs` is real Amazon SQS and needs the queues created first
+(`make sqs-setup`). Either way the AWS SDK's default credential chain must
+resolve: environment variables, `~/.aws/credentials`, or an instance/task role.
+Nothing injects static test credentials any more.
 
 The SQLite driver is the pure-Go `modernc.org/sqlite`, which registers itself as
 `sqlite` and not `sqlite3`. A cgo binding such as `mattn/go-sqlite3` would not
@@ -105,9 +107,10 @@ cd backend && go run ./cmd/api
 WORKER_STAGE=validate go run ./cmd/worker
 ```
 
-Requires a `.env` with working AWS credentials (see `.env.example`). The queue
-database and its parent directory are created on first start by whichever binary
-starts first.
+Requires a `.env` with working AWS credentials (see `.env.example`). On the
+SQLite driver the queue database and its parent directory are created on first
+start by whichever binary starts first; on the SQS driver the queues must exist
+already, and a missing one fails at the first receive rather than at boot.
 
 ## Tests
 
@@ -116,5 +119,7 @@ cd backend && go test ./...
 ```
 
 No test needs AWS, LocalStack, or a running queue: the SQLite queue tests use a
-temporary file, and the presigning tests sign with credentials they put in the
-environment themselves. The media tests skip when `ffmpeg` is absent.
+temporary file, the SQS driver tests exercise its request shaping and error
+translation without opening a socket, and the presigning tests sign with
+credentials they put in the environment themselves. The media tests skip when
+`ffmpeg` is absent.

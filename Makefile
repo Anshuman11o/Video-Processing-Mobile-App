@@ -3,8 +3,12 @@
 # The local stack is two Go processes and a SQLite file. There are no
 # containers to start and no AWS emulator: S3 and DynamoDB calls go to a real
 # AWS account, so `make verify` is the closest thing to "is my stack up?".
+#
+# The queue is the one pluggable piece. QUEUE_DRIVER=sqlite (the default) needs
+# nothing but the file; QUEUE_DRIVER=sqs needs the queues to exist first, which
+# is what the sqs-* targets below are for.
 
-.PHONY: api worker workers queue-peek queue-reset verify test help
+.PHONY: api worker workers queue-peek queue-reset sqs-setup sqs-status sqs-teardown verify test help
 
 # Overridable so these stay in step with .env without duplicating it.
 QUEUE_DB_PATH ?= data/queue.db
@@ -31,9 +35,14 @@ help:
 	@echo "  make worker       - Run one pipeline stage (STAGE=validate by default)"
 	@echo "  make workers      - Run all four stages in one terminal"
 	@echo ""
-	@echo "Queue:"
+	@echo "Queue (SQLite driver — the default):"
 	@echo "  make queue-peek   - Dump the SQLite queue table"
 	@echo "  make queue-reset  - Delete the SQLite queue file"
+	@echo ""
+	@echo "Queue (SQS driver — QUEUE_DRIVER=sqs):"
+	@echo "  make sqs-setup    - Create the five queues in AWS (idempotent)"
+	@echo "  make sqs-status   - Show each queue's URL, depth and in-flight count"
+	@echo "  make sqs-teardown - Delete them (prompts for confirmation)"
 	@echo ""
 	@echo "Checks:"
 	@echo "  make verify       - Check AWS credentials, buckets and table"
@@ -89,6 +98,26 @@ queue-peek:
 queue-reset:
 	@rm -f "$(QUEUE_DB_PATH)" "$(QUEUE_DB_PATH)-wal" "$(QUEUE_DB_PATH)-shm"
 	@echo "Removed $(QUEUE_DB_PATH)."
+
+# The SQS driver's equivalents of the two targets above. They shell out rather
+# than inline the aws calls: creating a queue set means a redrive policy that
+# has to be built after the DLQ exists, which is a script, not a recipe line.
+#
+# The environment is loaded the same way the run targets load it, so the
+# visibility timeout and delivery budget written onto the queues are the ones
+# the workers will be started with. Setting them in two places is how a queue
+# ends up enforcing a five minute lease against workers that believe they have
+# ten.
+sqs-setup:
+	@$(LOAD_ENV) ./scripts/aws-sqs-setup.sh create
+
+sqs-status:
+	@$(LOAD_ENV) ./scripts/aws-sqs-setup.sh status
+
+# Not chained into anything: it destroys messages, and it needs a human at the
+# keyboard to confirm the region.
+sqs-teardown:
+	@$(LOAD_ENV) ./scripts/aws-sqs-setup.sh teardown
 
 # Confirm the real AWS resources this project needs actually exist.
 verify:
