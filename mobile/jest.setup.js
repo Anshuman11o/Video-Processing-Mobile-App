@@ -40,3 +40,24 @@ jest.mock('react-native-blob-util', () => {
     },
   };
 });
+
+// react-native-video renders a native view, so any test that actually mounted
+// PlayerScreen would fail on the real component. It currently passes only
+// because no test mounts that screen — which is a fact about the test suite,
+// not a property worth relying on. Stubbing it keeps the day someone writes
+// that test an ordinary day.
+//
+// SelectedTrackType is a real enum in the library and PlayerScreen reads
+// LANGUAGE off it at module scope, so the mock has to supply it or the import
+// crashes before any test body runs.
+jest.mock('react-native-video', () => ({
+  __esModule: true,
+  default: 'Video',
+  SelectedTrackType: {
+    SYSTEM: 'system',
+    DISABLED: 'disabled',
+    TITLE: 'title',
+    LANGUAGE: 'language',
+    INDEX: 'index',
+  },
+}));
