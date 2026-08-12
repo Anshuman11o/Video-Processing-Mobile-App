@@ -118,6 +118,16 @@ than inherited by luck. No real-AWS provisioning exists yet — when it is
 written, it must set Block Public Access explicitly and re-run the matrix with
 `TARGET=aws`, where the anonymous row is a hard failure instead of a known gap.
 
+**The gap cannot be closed locally, and it fails in the most misleading way.**
+Applying a `Deny`-anonymous bucket policy and a full
+`put-public-access-block` both **succeed** against LocalStack — the calls
+return cleanly and the configuration reads back — and an unsigned `PUT`
+still returns 200 afterwards. LocalStack stores the security configuration
+and ignores it. So provisioning code that sets Block Public Access will look
+correct here while proving nothing, and neither setting is applied in
+`init-aws.sh` precisely because doing so would manufacture that false
+assurance. This one is only verifiable against real S3.
+
 The `dayreel-hls-output` bucket is the deliberate exception: it is public by
 design locally, because HLS playlists reference segments by relative path and
 cannot be presigned. Its real-AWS access model is still an open question — see
