@@ -9,7 +9,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -32,30 +31,14 @@ type S3Client struct {
 
 // NewS3Client creates a new S3Client configured for the given bucket.
 func NewS3Client(ctx context.Context, cfg *config.Config) (*S3Client, error) {
-	var opts []func(*awsconfig.LoadOptions) error
-
-	opts = append(opts, awsconfig.WithRegion(cfg.AWSRegion))
-
-	if cfg.UseLocalStack && cfg.AWSEndpoint != "" {
-		opts = append(opts,
-			awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
-		)
-	}
-
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+	// Credentials come from the default chain: environment, shared config file,
+	// or the instance/task role. There is no emulator to special-case any more.
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.AWSRegion))
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
 	}
 
-	var s3Opts []func(*s3.Options)
-	if cfg.UseLocalStack && cfg.AWSEndpoint != "" {
-		s3Opts = append(s3Opts, func(o *s3.Options) {
-			o.BaseEndpoint = aws.String(cfg.AWSEndpoint)
-			o.UsePathStyle = true
-		})
-	}
-
-	client := s3.NewFromConfig(awsCfg, s3Opts...)
+	client := s3.NewFromConfig(awsCfg)
 	presignClient := s3.NewPresignClient(client)
 
 	return &S3Client{

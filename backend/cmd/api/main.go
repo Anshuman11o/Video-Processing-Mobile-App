@@ -25,7 +25,8 @@ func main() {
 	ctx := context.Background()
 
 	log.Printf("Starting DayReel API on port %s", cfg.Port)
-	log.Printf("LocalStack: %v, Endpoint: %s", cfg.UseLocalStack, cfg.AWSEndpoint)
+	log.Printf("AWS region %s, buckets %s/%s/%s, table %s",
+		cfg.AWSRegion, cfg.S3RawBucket, cfg.S3ProcessedBucket, cfg.S3HLSBucket, cfg.DynamoDBTable)
 
 	// Initialize S3 client
 	s3Client, err := storage.NewS3Client(ctx, cfg)

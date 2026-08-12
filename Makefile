@@ -52,7 +52,10 @@ queue-peek:
 	@echo "Queue: $(QUEUE_DB_PATH)"
 	@echo ""
 	@sqlite3 -header -column "$(QUEUE_DB_PATH)" \
-		"SELECT id, queue, deliveries, visible_at, created_at FROM messages ORDER BY queue, id;"
+		"SELECT id, queue, receive_count, \
+		        datetime(visible_at/1000, 'unixepoch') AS visible_at, \
+		        CASE WHEN receipt IS NULL THEN '' ELSE 'leased' END AS state \
+		   FROM messages ORDER BY queue, id;"
 	@echo ""
 	@echo "Depth by queue:"
 	@sqlite3 -header -column "$(QUEUE_DB_PATH)" \
