@@ -367,7 +367,7 @@ Expected: `stages.validate.status == "completed"` with a non-empty `output_key`;
 
 ## Verification
 
-Run against LocalStack on 2026-08-12.
+Run against LocalStack on 2026-08-12. All 11 checks pass.
 
 - [x] `worker-validate` starts and long-polls without busy-spinning the CPU
 - [x] A completed upload triggers validate with no manual SQS publish
@@ -384,12 +384,50 @@ Run against LocalStack on 2026-08-12.
       with a readable error (`moov atom not found`), flips the job to `failed`,
       deletes the message, and does **not** reach the DLQ. `attempts == 1`
       confirms it was not retried.
-- [ ] **Transient failure:** with LocalStack stopped mid-job, the message returns
-      to the queue and succeeds on retry once LocalStack is back — **not yet run**
-- [ ] After 3 genuine transient failures the message lands in `dayreel-dlq`
-      — **not yet run**
-- [ ] Worker exits cleanly on SIGTERM without orphaning an in-flight ffmpeg
-      — **not yet run**
+- [x] **Transient failure:** the message returns to the queue and succeeds on
+      retry once the fault clears. Run with a *missing input object* rather than
+      by stopping LocalStack: `PERSISTENCE=1` is Pro-gated in Community, so a
+      restart would have wiped the queues and job rows the test depends on.
+      A missing object is transient under the current classification, which
+      makes it a precise and reversible fault. Failed with `NoSuchKey`, the
+      object was then uploaded, and the redelivery 16s later succeeded.
+- [x] After 3 genuine transient failures the message lands in `dayreel-dlq`
+      (verified with an object that never appears; validate queue drains to 0)
+- [x] Worker exits cleanly on SIGTERM: 0s shutdown, exit code 0, logging
+      `shutting down` → `worker exited`, with no SIGKILL fallback. The
+      no-orphaned-ffmpeg half rests on `exec.CommandContext` in
+      `media/ffmpeg.go:23` and `media/ffprobe.go:45` — cancelling the context
+      kills the child. Confirmed in code; not separately raced at runtime.
+
+### Second bug found in verification
+
+Every redelivery logged `attempt=1` and published that same `1` downstream,
+however many times the message had actually been received.
+
+The count was requested via `MessageSystemAttributeNames`, which supersedes
+`AttributeNames`. LocalStack 3.0 ignores the newer field and returns no system
+attributes, so the parse never matched and the code fell back to its hardcoded
+`1`. Nothing errored — which is exactly why unit tests and the happy path
+stayed green through the whole of 3A.
+
+Redrive was never affected: SQS counts receives server-side, so messages reached
+the DLQ correctly regardless. The damage was confined to observability.
+
+Fixed by using `AttributeNames` (deprecated but honoured by real SQS; the two
+fields cannot both be set). Re-verified: redeliveries now report `attempt=2`,
+`attempt=3`, and still reach the DLQ on the third.
+
+Note the pattern shared with the idempotency bug: both were silent. Neither
+produced an error, a failed test, or a broken happy path. Both surfaced only by
+driving real messages through real infrastructure and reading what came out.
+
+### Test-environment notes
+
+- `VisibilityTimeout` on `dayreel-validate` was temporarily lowered from 300s to
+  15s so redeliveries took seconds rather than five minutes, then restored to
+  300s. This changes retry *timing* only, not retry semantics.
+- Two test messages are left sitting in `dayreel-dlq` from the DLQ runs. They
+  are inert; purge them before trusting a future DLQ-depth assertion.
 
 ### Bug found in verification
 
