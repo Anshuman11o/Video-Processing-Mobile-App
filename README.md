@@ -173,8 +173,9 @@ Interrupted anywhere in step 7, the lease expires and the message is redelivered
 - **Byte-exact upload resume** across app kill, process death and network loss
 - **Direct-to-S3 transfer** — the API is never in the data path
 - **Four-stage processing pipeline** with per-stage state and failure isolation
-- **Self-hosted queue** implementing SQS's semantics — visibility timeouts,
-  delivery counts, dead-letter queues — in a single file with no server
+- **Pluggable queue** — a self-hosted SQLite broker implementing SQS's semantics
+  (visibility timeouts, delivery counts, dead-letter queues) in a single file
+  with no server, and real SQS behind the same interface, chosen by one env var
 - **Adaptive-bitrate HLS** with a three-rung ladder and a selectable caption track
 - **Speech-to-text** via whisper.cpp, with a mock mode for fast iteration
 - **Idempotent by construction** — every stage is safe to run twice
@@ -243,7 +244,7 @@ Each of these is written up with symptom, cause and fix in
 | Layer | Choice | Reasoning |
 |---|---|---|
 | Backend | **Go** | Static binaries with no runtime; goroutines match the consume-process-publish shape; first-class AWS SDK |
-| Queue | **SQLite** | A queue is a table with a "hidden until" timestamp. Zero infrastructure, single file, and the semantics are explicit rather than hidden behind a service |
+| Queue | **SQLite** (default) or **Amazon SQS** | A queue is a table with a "hidden until" timestamp. The self-hosted default needs no infrastructure and makes the semantics explicit rather than hiding them behind a service; SQS is selectable via `QUEUE_DRIVER` for when workers must run on more than one machine |
 | SQLite driver | **`modernc.org/sqlite`** | Pure Go — a cgo binding will not link in a `CGO_ENABLED=0` static build |
 | Storage | **S3** | The multipart API *is* the resume primitive: an upload ID, per-part ETags, and parts that can be retried individually |
 | Database | **DynamoDB** | Single-table access by job ID; on-demand billing means idle costs nothing |
@@ -314,6 +315,15 @@ make queue-peek           # inspect the queue
 make queue-reset          # delete it
 make test                 # backend test suite
 make verify               # check AWS resources exist
+```
+
+The queue defaults to the local SQLite file. To run the pipeline on real SQS
+instead, create the queues once and set the driver:
+
+```bash
+make sqs-setup            # create the five queues (idempotent)
+QUEUE_DRIVER=sqs make api
+make sqs-teardown         # delete them when finished
 ```
 
 ```bash
