@@ -28,7 +28,7 @@ torn down after the run that needed it.
 
 The mobile app keeps its list of jobs in a file on the device, written when each
 job is created. **Reinstalling the app, clearing its data, or switching
-simulators loses the entire visible job history.**
+emulators loses the entire visible job history.**
 
 The jobs themselves are not lost. They still exist in DynamoDB, their output is
 still in S3, and any one of them is still reachable by ID:
@@ -82,21 +82,49 @@ on the `api` service determines which client can upload**, and only one at a tim
 
 | Client | `S3_PUBLIC_ENDPOINT` |
 |---|---|
+| **Android Emulator (committed)** | `http://10.0.2.2:4566` |
 | iOS Simulator | `http://localhost:4566` |
-| Android Emulator | `http://10.0.2.2:4566` |
 | Physical device | `http://<your-lan-ip>:4566` |
+
+`10.0.2.2` is the Android emulator's alias for the host's loopback interface.
 
 Switching targets means editing compose and restarting `api`. A URL signed for
 one host returns `SignatureDoesNotMatch` to another — the signature covers the
 `Host` header, so it cannot simply be rewritten.
 
-The committed target is the **iOS Simulator**.
+The committed target is the **Android Emulator**. Set on both `api` (which signs
+the upload URLs) and `worker-package` (which formats the `hls_url` the client is
+handed); the two must name the same client environment or upload and playback
+will disagree about who the client is.
 
-To prove this rather than assume it:
+#### Consequence: `verify-presign.sh` no longer runs from the host as-is
+
+`scripts/verify-presign.sh` runs the presigned-URL negative-test matrix from the
+**host**. With the committed value, URLs are signed for `10.0.2.2:4566` — an
+address this machine does not route to — so the script cannot reach them and
+cannot run unchanged. This is a real regression from the platform switch, not a
+bug in the script.
+
+To run the matrix, point the `api` service back at the host loopback
+temporarily:
 
 ```bash
+# edit infra/docker-compose.yml: api -> S3_PUBLIC_ENDPOINT=http://localhost:4566
+cd infra && docker compose up -d api
 ./scripts/verify-presign.sh
+# then restore 10.0.2.2 and restart api before running the app
 ```
+
+The alternative — untested here, and left to you because it needs `sudo` and
+changes machine-level network state — is to make the address host-routable by
+aliasing it onto the loopback interface:
+
+```bash
+sudo ifconfig lo0 alias 10.0.2.2      # not run for you; your call
+```
+
+That would let both the emulator and the host reach the same signed host, and
+would remove the need to flip compose back and forth.
 
 ### LocalStack does not enforce bucket authorization
 
@@ -147,13 +175,37 @@ A known defect from stage 6A: subtitle cues are offset against the MPEG-TS start
 PTS, landing roughly 112 ms early, and a cue starting at t=0 is dropped entirely.
 See `docs/stage-plans/stage-6a-package-worker.md` for the full diagnosis.
 
-## iOS app
+## Android app
 
-CocoaPods has never been run in this repo — there is no `Podfile.lock` and no
-`Pods/`. The first setup will need:
+**The Android SDK is not installed on this machine.** Verified: `ANDROID_HOME`
+is unset, `~/Library/Android/sdk` does not exist, and neither `adb` nor
+`emulator` is on `PATH`. Nothing in `mobile/android/` can build until that is
+fixed. Java 21 is present, which is the one prerequisite already satisfied.
 
-```bash
-cd mobile/ios && pod install
-```
+`ANDROID_HOME` must be set (and `$ANDROID_HOME/platform-tools` on `PATH`) before
+`npx react-native run-android` will do anything. Gradle also reads
+`mobile/android/local.properties` for `sdk.dir` if you prefer that over the
+environment.
 
-Budget real time for this; it is the most likely place a first run stalls.
+What `mobile/android/build.gradle` pins, and therefore what the SDK install must
+provide:
+
+| Component | Required |
+|---|---|
+| SDK platform | 37 (`compileSdk`) and 36 (`targetSdk`) |
+| Build-tools | 37.0.0 |
+| NDK | 27.1.12297006 |
+| Min SDK | 24 |
+| Emulator system image | any API 24+; API 36 matches `targetSdk` |
+
+Gradle 9.4.1 (via the wrapper), Kotlin 2.2.0, and `newArchEnabled=true` — the
+New Architecture is on, which matters for any native dependency added later.
+
+**Blocked on disk, not on effort.** Host disk is critically low — **2.8 GB
+free**. A usable SDK platform plus build-tools plus the NDK plus one emulator
+system image runs well past that before Gradle caches or a build output are
+counted. Clear space first; installing into 2.8 GB will fail partway through and
+leave a half-populated SDK, which is worse than none.
+
+Budget real time for the first build regardless. It is the most likely place a
+first run stalls, and the toolchain has never been exercised in this repo.

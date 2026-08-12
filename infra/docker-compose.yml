@@ -60,13 +60,18 @@ services:
       - LOCALSTACK_ENDPOINT=http://localstack:4566
       # The host presigned upload URLs are SIGNED against. SigV4 covers the Host
       # header, so this must be an address the CLIENT can reach — the in-cluster
-      # name above is unreachable from a simulator or device, and rewriting a
+      # name above is unreachable from an emulator or device, and rewriting a
       # signed URL's host invalidates it.
       #
-      # One value serves one client environment. iOS Simulator: localhost.
-      # Android emulator: 10.0.2.2. Physical device: this machine's LAN IP.
+      # One value serves one client environment. Android emulator: 10.0.2.2
+      # (the emulator's alias for the host loopback). iOS Simulator: localhost.
+      # Physical device: this machine's LAN IP.
+      #
+      # The committed target is the ANDROID EMULATOR, so this is 10.0.2.2.
+      # Note the consequence: the host itself cannot route to 10.0.2.2, so
+      # scripts/verify-presign.sh cannot run from the host against this value.
       # Changing target means restarting this service. See docs/SETUP.md.
-      - S3_PUBLIC_ENDPOINT=http://localhost:4566
+      - S3_PUBLIC_ENDPOINT=http://10.0.2.2:4566
       - USE_LOCALSTACK=true
       - S3_RAW_BUCKET=dayreel-raw-videos
       - S3_PROCESSED_BUCKET=dayreel-processed
@@ -178,7 +183,9 @@ services:
       # Where a player reaches the HLS output from OUTSIDE the compose network.
       # The internal hostname does not resolve on the host, and HLS playlists
       # reference segments by relative path, so presigning cannot substitute.
-      - S3_PUBLIC_ENDPOINT=http://localhost:4566
+      # This is the value that ends up in the hls_url handed to the client, so
+      # it must name the same client environment as the api service above.
+      - S3_PUBLIC_ENDPOINT=http://10.0.2.2:4566
       - USE_LOCALSTACK=true
       - S3_RAW_BUCKET=dayreel-raw-videos
       - S3_PROCESSED_BUCKET=dayreel-processed
