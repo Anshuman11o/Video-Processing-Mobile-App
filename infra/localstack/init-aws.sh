@@ -47,6 +47,30 @@ awslocal s3api put-bucket-cors --bucket dayreel-hls-output --cors-configuration 
   ]
 }'
 
+# Public read on the HLS bucket.
+#
+# LOCAL DEVELOPMENT ONLY. HLS playlists reference their segments by relative
+# path, so a presigned master playlist is followed by 403s on every segment —
+# presigning cannot work for HLS without rewriting every URI, which defeats the
+# format. A readable bucket is what CloudFront would sit in front of in
+# production.
+#
+# The real-AWS access model is deliberately an OPEN QUESTION and must be decided
+# before anything deploys. A public bucket on a real account is both a cost and
+# an exposure; see config/free-tier.md.
+awslocal s3api put-bucket-policy --bucket dayreel-hls-output --policy '{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PublicReadLocalDevOnly",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::dayreel-hls-output/*"
+    }
+  ]
+}' || true
+
 echo "S3 buckets created."
 
 # ============================================================================
@@ -65,13 +89,26 @@ awslocal sqs create-queue --queue-name dayreel-dlq --attributes '{
 DLQ_ARN="arn:aws:sqs:${AWS_REGION}:${ACCOUNT_ID}:dayreel-dlq"
 
 # Create worker queues with DLQ redrive policy (maxReceiveCount=3)
+#
+# Transcribe gets a longer visibility timeout than the rest. Every other stage
+# finishes in about a second, but speech recognition runs for minutes on CPU. If
+# the message becomes visible again while the first worker is still transcribing,
+# SQS redelivers and a second worker starts the same job — and the runner's
+# idempotency guard cannot catch that, because it checks whether the output
+# exists and the output does not exist until the work finishes.
 for QUEUE in dayreel-validate dayreel-extract dayreel-transcribe dayreel-package; do
+  if [ "$QUEUE" = "dayreel-transcribe" ]; then
+    VISIBILITY="900"
+  else
+    VISIBILITY="300"
+  fi
+
   awslocal sqs create-queue --queue-name "$QUEUE" --attributes '{
-    "VisibilityTimeout": "300",
+    "VisibilityTimeout": "'"${VISIBILITY}"'",
     "MessageRetentionPeriod": "86400",
     "RedrivePolicy": "{\"deadLetterTargetArn\":\"'"${DLQ_ARN}"'\",\"maxReceiveCount\":\"3\"}"
   }' || true
-  echo "  Created queue: $QUEUE"
+  echo "  Created queue: $QUEUE (visibility ${VISIBILITY}s)"
 done
 
 echo "SQS queues created."
@@ -108,20 +145,22 @@ echo "Configuring S3 event notifications..."
 
 VALIDATE_QUEUE_ARN="arn:aws:sqs:${AWS_REGION}:${ACCOUNT_ID}:dayreel-validate"
 
+# No key filter, deliberately. The API issues presigned URLs for any filename
+# and writes the key as <job_id>/<original_filename>, so a suffix filter on
+# ".mp4" silently dropped every .mov/.webm upload: the job completed its upload
+# and then sat in "processing" forever with no error and no DLQ entry.
+#
+# The validate worker gates on content via ffprobe instead, which is what a
+# stage named "validate" should be doing anyway. The cost is that any other
+# object written to this bucket also enqueues a validate attempt; the worker
+# rejects those permanently when the key has no UUID job-id prefix.
 awslocal s3api put-bucket-notification-configuration \
   --bucket dayreel-raw-videos \
   --notification-configuration '{
     "QueueConfigurations": [
       {
         "QueueArn": "'"${VALIDATE_QUEUE_ARN}"'",
-        "Events": ["s3:ObjectCreated:CompleteMultipartUpload", "s3:ObjectCreated:Put"],
-        "Filter": {
-          "Key": {
-            "FilterRules": [
-              {"Name": "suffix", "Value": ".mp4"}
-            ]
-          }
-        }
+        "Events": ["s3:ObjectCreated:CompleteMultipartUpload", "s3:ObjectCreated:Put"]
       }
     ]
   }'

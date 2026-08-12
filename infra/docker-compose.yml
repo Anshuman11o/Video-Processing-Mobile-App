@@ -66,9 +66,121 @@ services:
     networks:
       - dayreel-network
 
+  worker-validate:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile.worker
+    container_name: dayreel-worker-validate
+    environment:
+      - WORKER_STAGE=validate
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - LOCALSTACK_ENDPOINT=http://localstack:4566
+      - USE_LOCALSTACK=true
+      - S3_RAW_BUCKET=dayreel-raw-videos
+      - S3_PROCESSED_BUCKET=dayreel-processed
+      - S3_HLS_BUCKET=dayreel-hls-output
+      - DYNAMODB_TABLE=dayreel-jobs
+      - REDIS_URL=redis:6379
+    depends_on:
+      localstack:
+        condition: service_healthy
+    networks:
+      - dayreel-network
+    restart: unless-stopped
+
+  worker-extract:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile.worker
+    container_name: dayreel-worker-extract
+    environment:
+      - WORKER_STAGE=extract
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - LOCALSTACK_ENDPOINT=http://localstack:4566
+      - USE_LOCALSTACK=true
+      - S3_RAW_BUCKET=dayreel-raw-videos
+      - S3_PROCESSED_BUCKET=dayreel-processed
+      - S3_HLS_BUCKET=dayreel-hls-output
+      - DYNAMODB_TABLE=dayreel-jobs
+      - REDIS_URL=redis:6379
+    depends_on:
+      localstack:
+        condition: service_healthy
+    networks:
+      - dayreel-network
+    restart: unless-stopped
+
+  worker-transcribe:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile.worker
+    container_name: dayreel-worker-transcribe
+    environment:
+      - WORKER_STAGE=transcribe
+      # Mock is the default. The budget rules in config/free-tier.md allow only
+      # a handful of real runs, so every stage downstream of this one is
+      # developed against synthetic cues. Set to false only for a deliberate run.
+      - MOCK_TRANSCRIBE=true
+      - WHISPER_MODEL_PATH=/models/ggml-base.bin
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - LOCALSTACK_ENDPOINT=http://localstack:4566
+      - USE_LOCALSTACK=true
+      - S3_RAW_BUCKET=dayreel-raw-videos
+      - S3_PROCESSED_BUCKET=dayreel-processed
+      - S3_HLS_BUCKET=dayreel-hls-output
+      - DYNAMODB_TABLE=dayreel-jobs
+      - REDIS_URL=redis:6379
+    volumes:
+      # The model is downloaded at runtime rather than baked into the image, to
+      # keep the image small against an 8GB Docker ceiling. That makes this mount
+      # load-bearing, not an optimisation: without it the model re-downloads on
+      # every fresh container and on every rebuild.
+      - whisper-models:/models
+    depends_on:
+      localstack:
+        condition: service_healthy
+    networks:
+      - dayreel-network
+    restart: unless-stopped
+
+  worker-package:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile.worker
+    container_name: dayreel-worker-package
+    environment:
+      - WORKER_STAGE=package
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - LOCALSTACK_ENDPOINT=http://localstack:4566
+      # Where a player reaches the HLS output from OUTSIDE the compose network.
+      # The internal hostname does not resolve on the host, and HLS playlists
+      # reference segments by relative path, so presigning cannot substitute.
+      - S3_PUBLIC_ENDPOINT=http://localhost:4566
+      - USE_LOCALSTACK=true
+      - S3_RAW_BUCKET=dayreel-raw-videos
+      - S3_PROCESSED_BUCKET=dayreel-processed
+      - S3_HLS_BUCKET=dayreel-hls-output
+      - DYNAMODB_TABLE=dayreel-jobs
+      - REDIS_URL=redis:6379
+    depends_on:
+      localstack:
+        condition: service_healthy
+    networks:
+      - dayreel-network
+    restart: unless-stopped
+
 networks:
   dayreel-network:
     driver: bridge
 
 volumes:
   localstack-data:
+  whisper-models:

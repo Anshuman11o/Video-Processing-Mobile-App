@@ -7,7 +7,7 @@ Reference documentation for external service constraints that affect this projec
 | File | Purpose |
 |------|---------|
 | `aws-limits.md` | Hard limits from S3, SQS, DynamoDB, Lambda, Fargate, CloudFront, Redis |
-| `free-tier.md` | AWS free tier quotas, cost traps (NAT Gateway!), budget alerts |
+| `free-tier.md` | Cost constraints and the $20 budget. **There is no free tier on this account** — everything bills from the first request |
 
 ## Why This Exists
 
@@ -23,8 +23,14 @@ Rather than discover these mid-implementation, we document them upfront.
 
 Before implementing anything that touches AWS:
 1. Check the relevant limits in `aws-limits.md`
-2. Verify we're within free tier in `free-tier.md`
+2. Check the cost impact in `free-tier.md`. There is **no free tier** — the
+   question is not "are we within the allowance" but "what does this cost, and
+   is it billed per request or per hour?"
 3. Update these files if you discover new constraints
+
+Per-hour charges are the risk; per-request charges are almost free at this
+scale. Anything that bills while idle needs a decided teardown time before it is
+created.
 
 ## Non-Obvious Decisions
 

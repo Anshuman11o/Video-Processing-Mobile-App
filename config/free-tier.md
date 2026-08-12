@@ -1,113 +1,157 @@
-# AWS Free Tier Quotas and Cost Traps
+# AWS Cost Constraints
 
-Reference for staying within free tier during development. Updated as we discover
-constraints.
-
----
-
-## Free Tier Allowances (12-month)
-
-| Service | Free Tier | Expected Usage | Status |
-|---------|-----------|----------------|--------|
-| **S3** | 5 GB storage, 20,000 GET, 2,000 PUT | ~1GB for demo | OK |
-| **DynamoDB** | 25 RCU, 25 WCU, 25 GB | Minimal | OK |
-| **SQS** | 1M requests/month | ~1000 for demo | OK |
-| **Lambda** | 1M requests, 400,000 GB-sec | Not using | N/A |
-| **CloudFront** | 1 TB transfer, 10M requests | ~1GB for demo | OK |
-| **ECR** | 500 MB storage | ~200MB images | OK |
-
-## Always-Free Tier
-
-| Service | Free Tier | Notes |
-|---------|-----------|-------|
-| **DynamoDB** | 25 RCU/WCU perpetual | On-demand mode may cost more |
-| **Lambda** | 1M requests/month perpetual | — |
-| **CloudWatch** | 10 custom metrics, 5GB logs | — |
+> **There is no free tier on this account.** Confirmed 2026-08-12. Every request,
+> every GB-hour and every byte stored is billed from the first one. This document
+> previously assumed a 12-month free tier; that assumption was wrong and has been
+> removed rather than annotated, because a stale allowance table is worse than no
+> table.
 
 ---
 
-## COST TRAPS
+## The budget
 
-### NAT Gateway (~$32/month)
+| Constraint | Value |
+|---|---|
+| **Hard ceiling** | **$20 total** — not per month, total |
+| Test clip length | **≤ 10 seconds** |
+| Expected AWS runs | **1–5 total, then the project closes** |
+| Default posture | **Everything runs on LocalStack.** AWS spend is opt-in, never incidental |
 
-**The biggest trap.** NAT Gateway costs ~$0.045/hour + data processing fees.
-Running 24/7 = ~$32/month minimum.
+## Everything is on-demand — nothing stays up
 
-**Mitigation:**
-- Place Fargate tasks in **public subnets** with public IPs
-- Use **VPC Gateway Endpoints** for S3 and DynamoDB (free)
-- Use tight security groups instead of relying on private subnet isolation
+This project has a **finite life**: a handful of runs for development and
+testing, then it is closed. Nothing here is a service that needs to keep running,
+so **no AWS resource should outlive the run that needed it.**
 
-```hcl
-# VPC Endpoints (FREE)
-resource "aws_vpc_endpoint" "s3" {
-  vpc_id       = aws_vpc.main.id
-  service_name = "com.amazonaws.${var.region}.s3"
-  vpc_endpoint_type = "Gateway"
-  route_table_ids = [aws_route_table.public.id]
-}
+That single rule is what keeps the budget safe. Per-run cost is pennies; the only
+way to overspend is to leave something switched on after the run that justified
+it. A resource forgotten for a month costs more than every run combined.
 
-resource "aws_vpc_endpoint" "dynamodb" {
-  vpc_id       = aws_vpc.main.id
-  service_name = "com.amazonaws.${var.region}.dynamodb"
-  vpc_endpoint_type = "Gateway"
-  route_table_ids = [aws_route_table.public.id]
-}
-```
+**Obligation when anything is provisioned:** whoever (or whatever) brings up an
+AWS resource must say so explicitly at the end of that run — name the resource
+and state that it needs switching off or disconnecting. Not "consider tearing
+down"; an explicit reminder naming what is still live. A resource that was
+created silently will be forgotten silently.
 
-### Fargate (~$0.04/hour per task)
+This applies to anything billed by time — Fargate tasks, NAT Gateways,
+ElastiCache, load balancers, provisioned DynamoDB capacity, EBS volumes, Elastic
+IPs left unattached. It does not apply to S3 objects or DynamoDB items, which
+bill by size and are trivial at this scale, though they are still worth deleting
+at the end.
 
-Fargate is not free tier. Running 4 workers 24/7 = ~$115/month.
-
-**Mitigation:**
-- Scale to zero when idle (SQS-triggered scaling)
-- For demo, run tasks on-demand, not always-on
-- Or use Lambda for lighter workers (validate)
-
-### EBS/EFS Storage
-
-Not used in this architecture, but watch for accidental creation.
-
-### Data Transfer
-
-- **Into AWS:** Free
-- **Out of AWS:** First 100GB/month free, then $0.09/GB
-- **Cross-region:** $0.02/GB
-
-**Mitigation:** Keep everything in one region. Use CloudFront for HLS delivery
-(cheaper egress).
-
-### CloudWatch Logs
-
-- First 5GB/month free
-- Then $0.50/GB ingested
-
-**Mitigation:** Set log retention to 7 days. Don't log video bytes.
-
----
-
-## Budget Alerts
-
-Set up billing alerts before deploying to AWS:
+**Teardown check after every AWS run:**
 
 ```bash
-# Via AWS CLI
+aws ec2 describe-nat-gateways --filter Name=state,Values=available
+aws ecs list-tasks --cluster <cluster>            # expect none running
+aws elasticache describe-cache-clusters           # expect none
+aws ec2 describe-addresses                        # unattached Elastic IPs still bill
+```
+
+$20 is small enough that a single misconfiguration can consume it in a day. The
+controls below are ordered by how much damage they can do, not by how likely they
+are.
+
+---
+
+## What actually costs money here
+
+Per-request pricing is close to irrelevant at this scale. **Time-based charges
+are the entire risk.** A resource billed per hour spends money while you sleep;
+a resource billed per request spends money only when you use it.
+
+### Tier 1 — can consume the whole budget unattended
+
+| Trap | Cost if left running | Control |
+|---|---|---|
+| **NAT Gateway** | ~$32/month | Never create one. Public subnets + VPC Gateway Endpoints for S3/DynamoDB (endpoints are free) |
+| **Fargate, 4 workers 24/7** | ~$115/month | Never run workers always-on. On-demand only, scale to zero |
+| **ElastiCache Redis** | ~$12/month (smallest node) | Do not deploy. Redis stays a local container; the API's cache is not load-bearing |
+| **Idle anything** | varies | Anything billed per hour must be torn down after use, not stopped |
+
+Any single item in this table exceeds the total budget within one month. **All
+three of the named services are currently local-only, and should stay that way.**
+
+### Tier 2 — bounded, but worth not being stupid about
+
+| Service | Rough rate | Realistic exposure at ≤10s clips |
+|---|---|---|
+| S3 PUT | ~$0.005 / 1,000 | 22 objects/job (1 manifest + 1 audio + ≤20 frames) → ~$0.0001/job |
+| S3 GET | ~$0.0004 / 1,000 | negligible |
+| S3 storage | ~$0.023 / GB-month | A 10s clip is a few MB; hundreds of jobs ≈ pennies |
+| DynamoDB on-demand | ~$1.25 / M writes | ~8 writes/job → negligible |
+| SQS | ~$0.40 / M requests | see below — this is the one with a failure mode |
+| Data egress | $0.09/GB after 100GB | Keep one region. Do not pull processed video back down repeatedly |
+
+At ≤10s clips, **processing cost per job is a fraction of a cent.** The budget is
+not threatened by throughput. It is threatened by leaving something switched on.
+
+---
+
+## SQS: the one request-based risk
+
+Workers long-poll continuously. That is the correct design — it is what keeps an
+idle worker from spinning — but it means an *idle* worker still issues requests
+forever.
+
+Idle cost, per worker: `WaitTimeSeconds = 20` → 3 requests/min → ~130k/month →
+**~$0.05/month**. Four workers ≈ $0.21/month. Acceptable.
+
+**The failure mode is a failed receive.** A successful receive blocks for the
+full 20s; a *failing* one returns immediately. Looping straight back round turns
+any persistent error — expired credentials, a throttle, a deleted queue — into a
+hot loop issuing requests as fast as the network allows. At a few hundred
+requests/second that is millions per day, and it bills while also flooding
+CloudWatch Logs.
+
+**Controlled** in `internal/worker/runner.go` — failed receives back off from 1s
+to a 30s ceiling, resetting on the first success. Added 2026-08-12 specifically
+because of this budget. Do not remove it, and preserve the equivalent in any new
+consume loop.
+
+---
+
+## Levers if spend needs tightening further
+
+Not applied, because they change product behaviour rather than infrastructure —
+listed so the choice is available and costed.
+
+| Lever | Where | Effect |
+|---|---|---|
+| Lower the duration ceiling | `internal/worker/validate/validate.go` → `DefaultLimits.MaxDurationSeconds` (currently **600s**) | Test clips are ≤10s but the pipeline still accepts 10 minutes. Dropping this to e.g. 60s makes an accidental large upload fail fast instead of processing |
+| Lower the frame cap | `internal/worker/extract` → `DefaultOptions.MaxFrames` (**20**) | Fewer S3 PUTs. Marginal at this scale |
+| Shorten log retention | CloudWatch, if deployed | 7 days. Never log video bytes |
+
+The duration ceiling is the meaningful one: it is the only guard between a
+mis-selected 4K movie and a long, billed ffmpeg run.
+
+---
+
+## Before any AWS deployment
+
+1. **Set billing alerts first**, not after — alerts are free and are the only
+   thing that catches a mistake while it is still small.
+2. Deploy nothing that bills per hour without deciding when it gets torn down.
+3. Prefer running the whole pipeline locally. LocalStack Community covers S3,
+   SQS and DynamoDB, which is everything stages 1A–6A touch.
+
+```bash
 aws budgets create-budget \
   --account-id $AWS_ACCOUNT_ID \
   --budget file://budget.json \
   --notifications-with-subscribers file://notifications.json
 ```
 
-**Recommended thresholds:**
-- Alert at $5 (something's wrong)
-- Alert at $10 (stop and investigate)
-- Hard limit at $20 (paranoid safety)
+Thresholds, against a $20 total:
+
+- **$2** — something is running that should not be
+- **$5** — stop and investigate before doing anything else
+- **$10** — half the budget is gone; tear down and reassess
+- **$20** — hard ceiling
 
 ---
 
-## LocalStack Parity Notes
-
-LocalStack Pro vs Community:
+## LocalStack Parity
 
 | Feature | Community (Free) | Pro |
 |---------|------------------|-----|
@@ -117,21 +161,28 @@ LocalStack Pro vs Community:
 | Lambda | Basic | Full |
 | ECS | No | Yes |
 | CloudFront | No | Yes |
+| Transcribe | No | Yes |
+| Persistence (`PERSISTENCE=1`) | No — silently ignored | Yes |
 
-**For local dev:** Community edition covers S3, SQS, DynamoDB. Run workers as
-Docker containers directly (not ECS). CloudFront not needed locally.
+Two things this table has already cost us:
+
+- **Transcribe is Pro-only**, which is part of why 5A uses local Whisper. That
+  choice now also saves money: it is compute on hardware already paid for.
+- **`PERSISTENCE=1` is silently ignored in Community.** It is set in
+  `docker-compose.yml` and does nothing. A LocalStack restart wipes queues,
+  buckets and job rows — this changed how 3A's transient-failure test had to be
+  written.
 
 ---
 
-## Estimated Demo Costs (if deploying to AWS)
+## Estimated cost, current plan
 
 | Activity | Cost |
 |----------|------|
-| Process 10 demo clips | ~$0.50 |
-| Run Fargate for 2 hours | ~$0.32 |
-| S3 storage (100MB) | ~$0.01 |
-| SQS (1000 messages) | Free tier |
-| CloudFront (1GB) | Free tier |
-| **Total for demo** | **~$1** |
+| All local development (LocalStack) | **$0** |
+| Process 100 clips at ≤10s, if deployed | ~$0.05 |
+| Fargate, on-demand, 2 hours | ~$0.32 |
+| S3 storage, ~1 GB for a month | ~$0.02 |
+| **One NAT Gateway left up for a month** | **~$32 — over budget on its own** |
 
-Safe to demo without NAT Gateway and with on-demand Fargate.
+The pipeline is cheap. The infrastructure around it is not.

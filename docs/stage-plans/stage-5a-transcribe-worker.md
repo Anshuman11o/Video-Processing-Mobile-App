@@ -1,661 +1,697 @@
 # Stage 5A: Transcribe Worker
 
-> **Depends on:** Stage 4A (Extract Worker), Stage 3A (worker harness)
-> **Run in parallel with:** Stage 2B (Mobile Shell)
-> **Estimated time:** 25–35 minutes (mock path ~15 min; faster-whisper sidecar adds ~20 min)
-> **Blocks:** Stage 6A (Package Worker)
-
-## Status of This Plan
-
-**Initial plan — written ahead of Stages 3A and 4A.** The worker runtime
-assumptions carry over from Stage 4A's plan; see
-[Open Items](#open-items-to-confirm-after-stages-3a-and-4a) at the bottom for
-what must be reconciled once those stages land.
-
-The transcription-specific design here — the `Transcriber` interface, the WebVTT
-writer, the mock mode, the sidecar contract — is self-contained and should be
-stable.
-
----
+> Status: **approved — ready to implement.** Decisions settled 2026-08-12.
+> The four **[DECIDE]** items below record what was chosen and why. Two went
+> against the recommendation, and those are the interesting ones: whisper.cpp
+> over a sidecar, and a runtime-downloaded model over a baked one.
 
 ## Aim
 
-Turn `audio.wav` into a **timestamped WebVTT transcript**, with two
-interchangeable backends: a deterministic mock (default, fast) and a real
-faster-whisper sidecar. Both paths produce byte-identical output *format*, so
-Stage 6A never has to care which ran.
+Consume `dayreel-transcribe`, turn the extracted audio into timed text with
+Whisper, write `{job_id}/transcript.vtt` to `dayreel-processed`, and hand off to
+`dayreel-package`.
 
----
+**This stage is not like 3A or 4A.** Those shell out to a binary that was already
+in the image and finish in about a second. This one introduces a **machine
+learning runtime, a model file, and a non-Go toolchain** into a project that has
+so far been one static Go binary plus ffmpeg. The transcription code itself is
+small. Everything expensive is in packaging and runtime shape, which is why the
+open decisions are about images and process boundaries rather than about
+transcription.
 
-## Design Decision: Sidecar, Not In-Process
+Two things are already settled and are not reopened here:
 
-faster-whisper is Python. The Go worker cannot call it in-process. Three options
-were considered:
+- **Whisper, not AWS Transcribe.** LocalStack Community does not emulate
+  Transcribe, and there is no free tier on this account. Local inference is
+  compute on hardware already paid for.
+- **`MOCK_TRANSCRIBE=true`** must exist, per `PROJECT_PLAN.md:341`. Given the
+  budget rules in `config/free-tier.md` — 1–5 real runs, then the project closes
+  — mock mode is not a convenience, it is the **default** way this stage runs
+  during development.
 
-| Option | Verdict |
-|--------|---------|
-| Python sidecar HTTP service | **Chosen** |
-| Bundle Python + model into the Go worker image, shell out per message | Rejected: ~1.5 GB image, and the model reloads (5–10 s) on *every* message |
-| whisper.cpp binary shelled out | Rejected: another toolchain to build; revisit if the sidecar proves heavy |
+## Components
 
-The sidecar loads the model **once** at startup and holds it in memory. It also
-mirrors how this deploys on AWS — a separate ECS task that can be sized and
-scaled independently of the Go workers, which is the difference between paying
-for CPU-heavy tasks across the whole pipeline versus just this stage.
-
-Cost: one more service, one more network hop, one more failure mode. Worth it.
-
-**`MOCK_TRANSCRIBE=true` is the default for local development** and is the path
-the 3-hour E2E demo runs on. The sidecar is built in the same stage but is not
-on the critical path.
-
----
-
-## Components Touched
-
-| Component | Action | Files |
-|-----------|--------|-------|
-| `backend/internal/worker/transcribe/` | Create | `transcribe.go`, `mock.go`, `whisper.go`, `*_test.go`, `CONTEXT.md` |
-| `backend/internal/vtt/` | Create | `vtt.go`, `vtt_test.go` — WebVTT writer |
-| `backend/internal/config/config.go` | Modify | Transcription config |
-| `backend/cmd/worker/main.go` | Modify | Register the transcribe handler |
-| `infra/transcriber/` | Create | `Dockerfile`, `app.py`, `requirements.txt` |
-| `infra/docker-compose.yml` | Modify | `worker-transcribe` + `transcriber` services |
-| `.env.example` | Modify | New env vars |
-
----
+| Component | Action |
+|-----------|--------|
+| `backend/internal/worker/transcribe/` | Create — the `Stage` implementation |
+| `backend/internal/transcribe/` | Create — Whisper invocation + VTT writing, behind an interface |
+| `backend/Dockerfile.worker` | Modify — add whisper.cpp (**[DECIDE 1]** = one image, no Python) |
+| `infra/docker-compose.yml` | Modify — `worker-transcribe` + a **persistent model volume** (**[DECIDE 2]**) |
+| `backend/cmd/worker/main.go` | Modify — one `case models.StageTranscribe` |
+| `backend/internal/worker/runner.go` | **Modify** — visibility heartbeating (**[DECIDE 3]**), in its own commit |
+| `backend/internal/worker/validate/validate.go` | Modify — `MaxDuration` 600s → 60s (**[DECIDE 3]**) |
+| `backend/internal/events/` | **No change** — the manifest type already carries what is needed |
+| `infra/localstack/init-aws.sh` | Modify — transcribe visibility timeout → 900s (**[DECIDE 3]**) |
 
 ## Boundaries
 
-### Input: SQS message on `dayreel-transcribe`
+### Inbound: the manifest, not the audio
+
+`stage-1a-data-schemas.md:171` says transcribe's input is
+`processed/{job_id}/audio.wav`. **That is now out of date.** Stage 4A resolved
+its multi-artifact problem by declaring `extract.json` the canonical output, so
+what actually arrives is:
 
 ```json
 {
-  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "job_id": "550e8400-...",
   "stage": "transcribe",
-  "input": {
-    "bucket": "dayreel-processed",
-    "key": "550e8400-e29b-41d4-a716-446655440000/audio.wav"
-  },
+  "input": {"bucket": "dayreel-processed", "key": "550e8400-.../extract.json"},
   "attempt": 1,
-  "timestamp": "2026-01-15T10:31:24Z",
-  "trace_id": "abc123"
+  "timestamp": "2026-08-12T10:32:11Z",
+  "trace_id": "<inherited from extract>"
 }
 ```
 
-### Derived input: `extract.json`
+This drift is mine, introduced in 4A, and this plan is where it gets reconciled
+rather than discovered. **Stage 5A must fetch and parse the manifest first**,
+then read `audio.key` from it. `stage-1a` should be corrected as part of this
+stage's work, not left to contradict the code.
 
-Read from `dayreel-processed/{job_id}/extract.json` (Stage 4A). Two fields
-matter:
+The upside of the indirection: the manifest carries `duration_seconds` and the
+audio's sample rate and channel count, so this stage never re-probes the media
+to learn things extract already knew.
 
-- `has_audio` — `false` means skip transcription entirely (see
-  [No-Audio Path](#no-audio-path))
-- `duration_seconds` — used to clamp segment end times and to size mock output
+### The silent-clip obligation, inherited from 4A
 
-### Output: S3 objects
+4A's **[DECIDE 4]** is a debt this stage now owes. A clip with no audio produces
+**no `audio.wav` object at all** and records:
 
-| Bucket | Key | Content Type | Content |
-|--------|-----|--------------|---------|
-| `dayreel-processed` | `{job_id}/transcript.vtt` | `text/vtt` | WebVTT — **the contract with 6A** |
-| `dayreel-processed` | `{job_id}/transcript.json` | `application/json` | Raw segments + metadata |
-
-`transcript.vtt` is written **last** and is the idempotency sentinel.
-
-### `transcript.vtt` shape
-
-```
-WEBVTT
-
-1
-00:00:00.000 --> 00:00:04.120
-Alright, so this is the beach at sunset.
-
-2
-00:00:04.120 --> 00:00:08.900
-You can just about hear the waves behind me.
+```json
+"audio": {"present": false}
 ```
 
-### `transcript.json` shape
+**If `audio.present` is false, this stage must not invoke the model.** It writes
+a valid empty WebVTT and completes normally. Treating a silent clip as a failure
+would contradict a decision validate made deliberately (`validate.go:117`, "a
+silent clip is legitimate") and fail a job the pipeline explicitly accepted.
+
+This is roughly six lines. It is called out here because 4A predicted it would
+otherwise be *discovered* in 5A, most likely as a crash on a missing S3 key.
+
+### Outbound: `StageMessage` to `dayreel-package`
 
 ```json
 {
-  "job_id": "550e8400-e29b-41d4-a716-446655440000",
-  "engine": "mock",
-  "model": "mock-v1",
-  "language": "en",
-  "duration_seconds": 42.517,
-  "segment_count": 9,
-  "transcribe_duration_ms": 84,
-  "realtime_factor": 0.002,
-  "segments": [
-    { "start": 0.0, "end": 4.12, "text": "Alright, so this is the beach at sunset." }
-  ],
-  "generated_at": "2026-01-15T10:31:29Z"
-}
-```
-
-`engine` is `mock` | `faster-whisper`. Kept because it is the only durable
-record of which path produced a given transcript — invaluable when a demo
-transcript looks suspiciously tidy.
-
-### Output: SQS message to `dayreel-package`
-
-```json
-{
-  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "job_id": "550e8400-...",
   "stage": "package",
-  "input": {
-    "bucket": "dayreel-processed",
-    "key": "550e8400-e29b-41d4-a716-446655440000/validated.mp4"
-  },
+  "input": {"bucket": "dayreel-processed", "key": "550e8400-.../transcript.vtt"},
   "attempt": 1,
-  "timestamp": "2026-01-15T10:31:29Z",
-  "trace_id": "abc123"
+  "timestamp": "2026-08-12T10:34:02Z",
+  "trace_id": "<inherited>"
 }
 ```
 
-**Note the input flips back to the video.** Packaging's primary input is
-`validated.mp4`; the transcript is a derived key. This is consistent with the
-one-primary-input convention from Stage 4A.
+Single output, so 4A's manifest problem does not recur — `transcript.vtt` is the
+whole product of this stage.
 
-### DynamoDB writes
+Note 6A needs **both** `validated.mp4` and `transcript.vtt`
+(`stage-1a-data-schemas.md:175-178`). It derives the former from `job_id`, the
+same way this stage could have derived the audio key. Pointing at the transcript
+is the more informative choice and matches the "input.key is what this stage
+produced" convention.
 
-| When | Update |
-|------|--------|
-| Handler start | `stages.transcribe.status = running`, `started_at`, `attempts += 1` |
-| Success | `status = completed`, `completed_at`, `output_key = {job_id}/transcript.vtt` |
-| Permanent failure | `status = failed`, `error`, job `status = failed` |
-| Success | `metrics.transcribe_duration_ms` |
+### S3 Objects
+
+| Bucket | Key | Content |
+|--------|-----|---------|
+| `dayreel-processed` | `{job_id}/extract.json` | Manifest from 4A (input) |
+| `dayreel-processed` | `{job_id}/audio.wav` | 16 kHz mono PCM (input, via the manifest) |
+| `dayreel-processed` | `{job_id}/transcript.vtt` | WebVTT transcript (output) |
+
+### DynamoDB
+
+`stages.transcribe` through the existing runner methods. No schema change.
+`Metrics.TranscribeDurationMs` (`job.go:79`) already exists and is currently
+never written — worth populating here, since this is the first stage where
+duration varies enough to be interesting.
 
 ---
 
-## Go Design
+### [DECIDE 1] — how a Go worker invokes Whisper
 
-### The interface both backends satisfy
+**RESOLVED: option (B), whisper.cpp in the image.** Not the recommended sidecar.
+
+The deciding factor was keeping everything in one Alpine image with no Python
+anywhere — whisper.cpp is "another binary next to ffmpeg", which is a shape this
+codebase already handles well. The accepted cost is that **the model reloads on
+every invocation**, which the sidecar would have avoided.
+
+**This is an explicit deviation from `PROJECT_PLAN.md:340`, which names
+faster-whisper.** Recorded here so it is a decision rather than drift; the plan
+document should be updated to match.
+
+The `Transcriber` interface still stands, so this remains revisitable — if
+per-job model load proves painful, the sidecar is the escape hatch and only the
+implementation behind the interface changes.
+
+Every prior stage shells out to a binary baked into the image. Whisper does not
+fit that shape cleanly: `faster-whisper` is a **Python** library, and the worker
+is a static Go binary built with `CGO_ENABLED=0` on Alpine
+(`Dockerfile.worker:7`).
+
+#### Options
+
+**(A) `faster-whisper` via a Python CLI script, exec'd like ffmpeg.**
+A small `transcribe.py` in the image; Go runs it with `exec.CommandContext` and
+reads JSON from stdout. Matches the existing `media` package shape exactly.
+- Model loads on **every invocation** — several seconds of startup per job on
+  top of inference.
+- Alpine is a real problem: CTranslate2 wheels are `manylinux`/glibc, and musl
+  builds are not officially published. This likely forces a `python:3.11-slim`
+  (Debian) base for this image.
+
+**(B) `whisper.cpp` binary, exec'd like ffmpeg.**
+A C++ binary and a GGML model file. No Python at all, and it builds against musl,
+so **Alpine survives**.
+- Closest possible fit to the existing pattern — it is literally "another
+  binary in the image", exactly like ffmpeg.
+- Contradicts `PROJECT_PLAN.md:340`, which names faster-whisper.
+- Requires compiling it in a builder stage, or vendoring a prebuilt binary.
+
+**(C) A Whisper HTTP sidecar service.**
+A separate container holding Python, the model, and a tiny HTTP server; the Go
+worker POSTs the audio and gets VTT or JSON back.
+- **Model loads once at container start**, not per job. For a stage that may run
+  repeatedly this is the difference between seconds and tens of seconds per job.
+- The worker image stays exactly as it is — no Python, no model, no bloat, and
+  validate/extract are untouched.
+- Costs a new service, a network hop, a health check, and a second failure mode
+  (sidecar down = transient failure, which is correct but must be classified).
+
+**(D) Managed API (OpenAI Whisper API or similar).**
+- Rejected. It needs credentials that do not exist, spends real money against a
+  $20 ceiling, and breaks the offline-by-default posture. Listed only to record
+  that it was considered and why it lost.
+
+#### Recommendation: **(C), the sidecar — with (B) as the fallback.**
+
+The deciding argument is not elegance, it is **where the model lives**. Options A
+and B put a model file inside the image that *every* worker pulls, and reload it
+on every single job. C loads it once per container and leaves the Go image
+untouched.
+
+It also keeps the ML runtime behind a boundary this project already understands —
+an address and a timeout — rather than a Python toolchain wired into a Go build.
+And it makes `MOCK_TRANSCRIBE` trivially honest: mock mode simply never dials the
+sidecar, so the mock path exercises the same code up to the network call.
+
+**(B) is the better answer if the sidecar's operational weight proves annoying
+in practice** — it is the only option that keeps everything in one Alpine image
+with no Python anywhere, and "another binary next to ffmpeg" is a genuinely good
+fit for this codebase. It is a fallback rather than the recommendation only
+because of per-job model reload.
+
+Whichever is chosen, **the Go side is an interface**:
 
 ```go
-package transcribe
-
-type Segment struct {
-    Start float64 `json:"start"`
-    End   float64 `json:"end"`
-    Text  string  `json:"text"`
-}
-
-type Result struct {
-    Engine   string    `json:"engine"`
-    Model    string    `json:"model"`
-    Language string    `json:"language"`
-    Segments []Segment `json:"segments"`
-}
-
 type Transcriber interface {
-    Transcribe(ctx context.Context, audioPath string, durationSeconds float64) (*Result, error)
+    Transcribe(ctx context.Context, audioPath string) ([]Segment, error)
 }
 ```
 
-Selected at worker startup:
-
-```go
-var t Transcriber
-if cfg.MockTranscribe {
-    t = NewMockTranscriber(cfg)
-} else {
-    t = NewWhisperTranscriber(cfg) // HTTP client for the sidecar
-}
-```
-
-One `Transcriber`, one VTT writer, one code path through the handler. The mock
-is not a test double bolted on the side — it is a first-class backend, which is
-what keeps the mock path honest as a demo path.
-
-### Mock transcriber
-
-Deterministic, seeded by `job_id` so the same job always yields the same text
-(makes assertions possible and demos reproducible):
-
-- One cue every `MOCK_SEGMENT_SECONDS` (default 5 s), covering the full duration
-- Text drawn round-robin from a fixed phrase pool, prefixed with the cue index
-- Final cue is clamped to `duration_seconds`
-- Language reported as `en`, model as `mock-v1`
-- Sleeps `MOCK_TRANSCRIBE_DELAY_MS` (default 0) so pipeline timing can be
-  exercised without real inference
-
-### WebVTT writer — `internal/vtt/vtt.go`
-
-```go
-func Write(w io.Writer, segments []Segment, opts Options) error
-func FormatTimestamp(seconds float64) string // "HH:MM:SS.mmm"
-```
-
-Normalization applied before writing (Whisper output is not always well-formed):
-
-1. Sort by `start`
-2. Drop segments with empty text after trimming
-3. Clamp `end` to `duration_seconds`
-4. Force `end > start` (minimum 0.1 s cue)
-5. Clip overlaps: if `segments[i].end > segments[i+1].start`, truncate the
-   earlier cue
-6. Collapse internal newlines and runs of whitespace to single spaces
-7. Escape `&` → `&amp;`, `<` → `&lt;`, `>` → `&gt;`
-8. Guard against a literal `-->` inside cue text
-
-`Options` carries `TimestampMap` — see the HLS note in Stage 6A; the copy of the
-VTT that lands in the HLS bucket needs an `X-TIMESTAMP-MAP` header, and it is
-cheaper to support that here than to string-munge the file in 6A.
-
-### faster-whisper sidecar contract
-
-**`POST /transcribe`** — `multipart/form-data`, field `audio` = the WAV file.
-
-The Go worker already has the file on local disk after downloading it, so
-uploading the bytes is simpler than handing the sidecar S3 credentials and an
-endpoint. Keeps the Python service completely AWS-unaware.
-
-**Response 200:**
-
-```json
-{
-  "language": "en",
-  "language_probability": 0.98,
-  "duration": 42.517,
-  "model": "tiny.en",
-  "segments": [
-    { "start": 0.0, "end": 4.12, "text": " Alright, so this is the beach at sunset." }
-  ]
-}
-```
-
-**`GET /health`** — returns 200 only once the model is loaded; 503 while
-loading. Compose healthcheck depends on this.
-
-**Errors:** 400 for undecodable audio (permanent), 500 for inference failure
-(transient), 503 while loading (transient).
-
-### `infra/transcriber/app.py` (sketch)
-
-```python
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from faster_whisper import WhisperModel
-import os, tempfile
-
-MODEL_SIZE   = os.getenv("WHISPER_MODEL", "tiny.en")
-DEVICE       = os.getenv("WHISPER_DEVICE", "cpu")
-COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
-
-app = FastAPI()
-model = None
-
-@app.on_event("startup")
-def load_model():
-    global model
-    model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
-
-@app.get("/health")
-def health():
-    if model is None:
-        raise HTTPException(status_code=503, detail="model loading")
-    return {"status": "ok", "model": MODEL_SIZE}
-
-@app.post("/transcribe")
-async def transcribe(audio: UploadFile = File(...)):
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
-        f.write(await audio.read())
-        f.flush()
-        segments, info = model.transcribe(f.name, beam_size=1, vad_filter=True)
-        out = [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
-    return {
-        "language": info.language,
-        "language_probability": info.language_probability,
-        "duration": info.duration,
-        "model": MODEL_SIZE,
-        "segments": out,
-    }
-```
-
-`beam_size=1` and `int8` are chosen for CPU speed over accuracy — this is a demo
-pipeline, not a captioning product. `vad_filter=True` suppresses the
-hallucinated text Whisper produces over silence, which is the single most
-visible quality problem on phone-recorded clips.
+with a `mockTranscriber` and a real one. The stage depends on the interface, so
+[DECIDE 1] can be revisited without touching the stage.
 
 ---
 
-## Processing Logic
+### [DECIDE 2] — which image carries the model (8 GB Docker ceiling)
 
-1. **Idempotency:** `HeadObject` on `{job_id}/transcript.vtt` → skip, forward,
-   delete message.
-2. **Read `extract.json`.** Missing ⇒ permanent error (4A must have run).
-3. **No-audio short-circuit** (see below).
-4. **Download** `audio.wav` to `{WORKER_TMP_DIR}/{job_id}/`.
-5. **Transcribe** via the selected backend, under
-   `TRANSCRIBE_TIMEOUT_SECONDS` (default 300).
-6. **Normalize + write VTT** and the JSON sidecar file.
-7. **Upload** `transcript.json`, then `transcript.vtt` **last**.
-8. **Finalize:** DynamoDB, Redis invalidation, send to `dayreel-package`,
-   delete the message, remove the temp directory.
+**RESOLVED: the `base` model, downloaded at runtime** rather than baked in.
 
-### No-Audio Path
+Keeps the image small, which matters against the 8 GB ceiling. The accepted cost
+is a network dependency on first run.
 
-When `extract.json` has `has_audio: false`:
+**This makes the volume mount load-bearing, not optional.** Without a persistent
+mount the model re-downloads on every fresh container, which is slow, repeats on
+every rebuild, and breaks the offline-by-default posture the rest of the stack
+has. The model path must be volume-mounted, and a missing model must be a
+*transient* failure — a download that failed can succeed on retry.
 
-- Write a valid header-only VTT: `WEBVTT\n\n`
-- Write `transcript.json` with `segments: []` and `engine: "none"`
-- Mark the stage **completed** (not failed — a silent video is a legitimate reel)
-- Forward to `dayreel-package` as normal
+Docker's disk allowance on this machine is **8 GB and cannot be raised without
+restarting the container**. Current usage is ~2.6 GB of images plus build cache.
+This is a hard constraint on model choice, not a theoretical one.
 
-Stage 6A must then handle a cue-less VTT by omitting the subtitle rendition
-entirely — a subtitle track advertised in the master playlist that resolves to
-nothing is worse than no track at all in most players. **This is a hard
-dependency to carry into 6A.**
+Approximate costs:
 
-### Visibility Timeout
+| Model | Size | Notes |
+|---|---|---|
+| `tiny` | ~75 MB | Poor accuracy; fine for pipeline plumbing |
+| `base` | ~145 MB | Reasonable for short English clips |
+| `small` | ~485 MB | Noticeably better |
+| `medium` | ~1.5 GB | Slow on CPU |
+| `large-v3` | ~3 GB | **Would not fit** alongside existing images |
 
-Queues are created with a 300 s visibility timeout. `tiny.en` at int8 on CPU
-runs roughly 5–10× faster than realtime, so a 60 s clip is ~10 s — comfortable.
-But cold start is not: the first request after container start also pays model
-download (~75 MB for `tiny.en`) and load.
+Plus the runtime: Python + CTranslate2 + deps is roughly **0.8–1.2 GB** on a
+Debian slim base; whisper.cpp is a few MB plus the model.
 
-The handler must use the harness's **visibility heartbeat** (extend by 60 s
-every 30 s while the call is in flight) rather than relying on headroom. Confirm
-that helper exists in 3A.
+**Recommendation: a separate image for transcribe, and `base` as the default
+model.**
 
----
+One shared worker image was right while every stage needed exactly ffmpeg. It
+stops being right the moment one stage needs a gigabyte the others never touch —
+validate and extract would each carry a Whisper runtime they never invoke, and
+every rebuild of any worker would push that layer around.
 
-## Failure Model
+`base` because the pipeline is what is being proven here, not transcription
+quality, and because test clips are **≤10 seconds** under the budget rules. Model
+choice is one environment variable; it can be raised for a real run if the output
+is visibly poor.
 
-| Condition | Classification | Behavior |
-|-----------|----------------|----------|
-| `extract.json` missing | Permanent | Fail stage |
-| `audio.wav` missing but `has_audio: true` | Permanent | Fail stage (4A contract violated) |
-| Sidecar returns 400 | Permanent | Fail stage |
-| Sidecar returns 503 (model loading) | Transient | Redeliver; backoff |
-| Sidecar timeout / connection refused | Transient | Redeliver |
-| Zero segments returned from real engine | Success | Write header-only VTT — genuinely silent audio |
-| S3 / DynamoDB errors | Transient | Redeliver (3 receives → DLQ) |
+**Open sub-question:** bake the model into the image, or download on first run
+into a mounted volume? Baking makes the image bigger but keeps runs offline and
+repeatable; downloading keeps the image small but adds a network dependency and a
+cold-start delay, and would re-download on every fresh container unless
+volume-mounted. Leaning **baked**, for the same offline-determinism reason the
+rest of the stack runs on LocalStack.
 
 ---
 
-## Docker Compose Additions
+### [DECIDE 3] — the 300s visibility timeout becomes a real risk
 
-```yaml
-  transcriber:
-    build:
-      context: ./transcriber
-      dockerfile: Dockerfile
-    container_name: dayreel-transcriber
-    ports:
-      - "8090:8090"
-    environment:
-      - WHISPER_MODEL=tiny.en
-      - WHISPER_DEVICE=cpu
-      - WHISPER_COMPUTE_TYPE=int8
-    volumes:
-      - whisper-models:/root/.cache/huggingface
-    networks:
-      - dayreel-network
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8090/health')"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 180s
+**RESOLVED: all three measures — (a), (b) and (c).**
 
-  worker-transcribe:
-    build:
-      context: ../backend
-      dockerfile: Dockerfile.worker
-    container_name: dayreel-worker-transcribe
-    environment:
-      - STAGE=transcribe
-      - AWS_REGION=us-east-1
-      - AWS_ACCESS_KEY_ID=test
-      - AWS_SECRET_ACCESS_KEY=test
-      - LOCALSTACK_ENDPOINT=http://localstack:4566
-      - USE_LOCALSTACK=true
-      - S3_PROCESSED_BUCKET=dayreel-processed
-      - DYNAMODB_TABLE=dayreel-jobs
-      - REDIS_URL=redis:6379
-      - MOCK_TRANSCRIBE=true
-      - TRANSCRIBER_URL=http://transcriber:8090
-      - TRANSCRIBE_TIMEOUT_SECONDS=300
-      - WORKER_CONCURRENCY=1
-    depends_on:
-      localstack:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - dayreel-network
+- Raise `dayreel-transcribe`'s visibility timeout to **900s**.
+- Lower `validate.DefaultLimits.MaxDuration` from 600s to **60s**, which is also
+  the cost lever `config/free-tier.md` flags.
+- **Add heartbeating to the shared runner.**
 
-volumes:
-  whisper-models:
-```
+The plan argued against heartbeating as a side effect of this stage, since it
+changes shared code every stage depends on and two silent bugs have already been
+found in that runner. That concern was heard and overruled deliberately: it is
+the correct general fix, and the other two measures are mitigations rather than
+solutions. It is therefore built **with its own tests**, and as a separate commit
+from the transcribe stage, so it can be reverted independently.
 
-**`transcriber` is deliberately not in `worker-transcribe`'s `depends_on`.** With
-`MOCK_TRANSCRIBE=true` the sidecar is unnecessary, and a 180 s model-load start
-period must not block the pipeline coming up. Put the sidecar behind a compose
-profile (`profiles: ["whisper"]`) so `docker compose up` skips it by default and
-`docker compose --profile whisper up` pulls it in.
+Validate takes ~1s. Extract took ~1s on a 6s clip. **Transcription does not
+behave like this.** On CPU, `base` runs roughly 2–5× faster than realtime, so a
+10-minute clip — which `validate.DefaultLimits.MaxDuration` still permits — could
+take **2–5 minutes**, against a **300s visibility timeout**.
 
-`WORKER_CONCURRENCY=1` for this stage: transcription is CPU-bound and the
-sidecar serializes anyway.
+When that timeout is exceeded, SQS redelivers while the first worker is still
+running. Two workers then transcribe the same job concurrently, and the runner's
+idempotency guard does not help: it checks whether the *output* exists, and the
+output does not exist until the work finishes.
 
-### Config additions
+This is the first stage where that gap is reachable. Options:
 
-```go
-MockTranscribe           bool   // MOCK_TRANSCRIBE, default true locally
-MockSegmentSeconds       int    // MOCK_SEGMENT_SECONDS, default 5
-MockTranscribeDelayMs    int    // MOCK_TRANSCRIBE_DELAY_MS, default 0
-TranscriberURL           string // TRANSCRIBER_URL, default "http://transcriber:8090"
-TranscribeTimeoutSeconds int    // TRANSCRIBE_TIMEOUT_SECONDS, default 300
-```
+- **(a) Raise the visibility timeout** for `dayreel-transcribe` specifically —
+  one line in `init-aws.sh`. Blunt but effective, and honest about the fact that
+  this stage is slower than the others.
+- **(b) Heartbeat the visibility timeout** from the runner during long work
+  (`ChangeMessageVisibility` on a ticker). Correct, general, and a **shared
+  runner change** — which every stage then inherits, right after two silent bugs
+  were found in that same runner.
+- **(c) Lower `MaxDuration`** so long clips never reach this stage. Cheapest, and
+  aligned with the ≤10s test-clip rule, but it changes product behaviour.
+
+**Recommendation: (a) now, (c) alongside it, (b) only if needed.** Raise the
+transcribe queue's timeout to 900s, and separately consider dropping
+`MaxDuration` — `config/free-tier.md` already flags that ceiling as the only
+guard between a mis-selected large file and a long billed run. Heartbeating is
+the right long-term answer but is a shared-runner change, and this stage should
+not be the reason one is made.
 
 ---
+
+### [DECIDE 4] — what `MOCK_TRANSCRIBE=true` actually produces
+
+**RESOLVED: option (b), duration-aware synthetic cues.**
+
+Mock mode is the default development path, so what it emits matters more than it
+sounds.
+
+- **(a) A fixed stub** — one cue, "This is a mock transcript." Trivial, but the
+  VTT is structurally unlike a real one, so it exercises nothing about timing.
+- **(b) Duration-aware synthetic cues** — read `duration_seconds` from the
+  manifest and emit a cue every ~3 seconds with plausible text. The output has
+  realistic shape and cue count, so 6A and the mobile client get something
+  representative to render.
+- **(c) A recorded fixture** — a real Whisper output committed to the repo and
+  replayed. Realistic, but tied to one specific clip and stale the moment it
+  drifts.
+
+**Recommendation: (b).** The point of mock mode here is to let 6A and Stage 7 be
+built and demoed without spending model compute, and a single-cue transcript
+would not exercise cue rendering, seeking, or overlap at all. It costs a few more
+lines than (a) and is honest about being synthetic.
+
+---
+
+## Files
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `backend/internal/transcribe/transcribe.go` | Create | `Transcriber` interface, `Segment` type |
+| `backend/internal/transcribe/mock.go` | Create | Duration-aware synthetic cues (**[DECIDE 4]**) |
+| `backend/internal/transcribe/whisper.go` | Create | Real implementation (**[DECIDE 1]**) |
+| `backend/internal/transcribe/vtt.go` | Create | `Segment` → WebVTT, with timestamp formatting |
+| `backend/internal/transcribe/vtt_test.go` | Create | Formatting and edge cases; pure, no model |
+| `backend/internal/worker/transcribe/transcribe.go` | Create | The `Stage`: manifest → audio → transcribe → VTT |
+| `backend/internal/worker/transcribe/transcribe_test.go` | Create | Silent-clip short-circuit, manifest parsing |
+| `backend/internal/worker/transcribe/CONTEXT.md` | Create | Per repo convention |
+| `backend/cmd/worker/main.go` | Modify | `case models.StageTranscribe` |
+| `backend/Dockerfile.worker-transcribe` | Create | **[DECIDE 2]** |
+| `infra/docker-compose.yml` | Modify | `worker-transcribe` (+ sidecar, if **[DECIDE 1]** = C) |
+| `infra/localstack/init-aws.sh` | Modify | Raise transcribe visibility timeout (**[DECIDE 3]**) |
+| `docs/stage-plans/stage-1a-data-schemas.md` | Modify | Correct transcribe's input to `extract.json` |
 
 ## Tasks
 
-1. [ ] Create `internal/vtt/vtt.go` — writer, timestamp formatter, normalization
-2. [ ] Write `internal/vtt/vtt_test.go` — table tests for overlap clipping, clamping, escaping, timestamp formatting
-3. [ ] Create `internal/worker/transcribe/transcribe.go` — `Transcriber` interface, `Segment`, `Result`
-4. [ ] Create `mock.go` — deterministic mock backend
-5. [ ] Create `whisper.go` — HTTP client for the sidecar (multipart upload, timeout, error classification)
-6. [ ] Create the stage handler, including the `has_audio: false` short-circuit
-7. [ ] Add transcription config to `config.go` and `.env.example`
-8. [ ] Register the handler in `cmd/worker/main.go`
-9. [ ] Create `infra/transcriber/{Dockerfile,app.py,requirements.txt}`
-10. [ ] Add `transcriber` (profile `whisper`) and `worker-transcribe` to `docker-compose.yml`
-11. [ ] Test the mock path E2E
-12. [ ] Test the real path E2E (`--profile whisper`, `MOCK_TRANSCRIBE=false`)
-13. [ ] Create `internal/worker/transcribe/CONTEXT.md`
+1. [ ] `internal/transcribe`: `Transcriber` interface + `Segment`. Pure types.
+2. [ ] `internal/transcribe/vtt.go`: `Segment` → WebVTT. Pure, fully unit-testable.
+3. [ ] `internal/transcribe/mock.go`: duration-aware cues (**[DECIDE 4]**).
+4. [ ] `internal/worker/transcribe`: the `Stage` — fetch manifest, short-circuit
+       on `audio.present == false`, download audio, transcribe, write VTT, upload.
+5. [ ] Unit tests: VTT formatting, silent-clip short-circuit, manifest parsing.
+6. [ ] `cmd/worker/main.go`: wire it, defaulting to mock when `MOCK_TRANSCRIBE=true`.
+7. [ ] Compose service + `MOCK_TRANSCRIBE=true` as the **default** in compose.
+8. [ ] **End-to-end in mock mode first** — prove the pipeline wiring with zero
+       model compute.
+9. [ ] Real Whisper implementation (**[DECIDE 1]**) + its image (**[DECIDE 2]**).
+10. [ ] One real transcription run, then back to mock.
+11. [ ] Correct `stage-1a-data-schemas.md`; `CONTEXT.md` for the new packages.
 
----
+**The ordering is deliberate:** steps 1–8 need no model, no Python, and no extra
+image, and they cover every line of pipeline wiring. If the stage is going to
+break the way 3A and 4A broke — silently, in the plumbing — it will break there,
+where the feedback loop is seconds rather than minutes.
 
 ## Test
 
-### Mock path (the one that must pass)
-
 ```bash
-cd infra && docker compose up -d --build worker-transcribe
+cd infra && docker compose up -d --build
 
-JOB_ID="test-transcribe-$(date +%s)"
-AWS="aws --endpoint-url=http://localhost:4566"
+# Mock mode: full pipeline, no model compute.
+JOB=$(./upload.sh clip.mp4 clip.mp4)
 
-# Seed Stage 4A's outputs
-ffmpeg -f lavfi -i sine=frequency=440:duration=30 -ar 16000 -ac 1 /tmp/audio.wav -y
-$AWS s3 cp /tmp/audio.wav "s3://dayreel-processed/${JOB_ID}/audio.wav"
-cat > /tmp/extract.json <<EOF
-{"job_id":"${JOB_ID}","duration_seconds":30.0,"width":1280,"height":720,
- "has_audio":true,"audio_key":"${JOB_ID}/audio.wav","frame_count":1,
- "frames":[{"key":"${JOB_ID}/frames/frame_001.jpg","timestamp_seconds":0.0}]}
-EOF
-$AWS s3 cp /tmp/extract.json "s3://dayreel-processed/${JOB_ID}/extract.json"
+# Expect validate -> extract -> transcribe, each completed
+curl -s localhost:8080/jobs/$JOB | jq '.stages'
 
-$AWS sqs send-message \
-  --queue-url http://localhost:4566/000000000000/dayreel-transcribe \
-  --message-body "{\"job_id\":\"${JOB_ID}\",\"stage\":\"transcribe\",\"input\":{\"bucket\":\"dayreel-processed\",\"key\":\"${JOB_ID}/audio.wav\"},\"attempt\":1,\"timestamp\":\"$(date -u +%FT%TZ)\",\"trace_id\":\"manual\"}"
+# transcript.vtt exists and is valid WebVTT
+awslocal s3 cp s3://dayreel-processed/$JOB/transcript.vtt -
 
-sleep 10
-
-$AWS s3 cp "s3://dayreel-processed/${JOB_ID}/transcript.vtt" -
-$AWS s3 cp "s3://dayreel-processed/${JOB_ID}/transcript.json" - | jq '.engine, .segment_count'
-
-# Validate the VTT parses (ffmpeg is a good-enough validator)
-$AWS s3 cp "s3://dayreel-processed/${JOB_ID}/transcript.vtt" /tmp/t.vtt
-ffprobe -v error -show_entries format=format_name -of default=nw=1 /tmp/t.vtt
-# Expect: format_name=webvtt
-
-# Next stage was triggered
-$AWS sqs receive-message \
-  --queue-url http://localhost:4566/000000000000/dayreel-package | jq -r '.Messages[0].Body'
+# A message reaches dayreel-package pointing at the transcript
+awslocal sqs receive-message --queue-url .../dayreel-package
 ```
 
-### Real path
+## Verification
 
-```bash
-cd infra && docker compose --profile whisper up -d --build transcriber
-# First run downloads the model — wait for healthy
-docker compose ps transcriber
+_To be run against LocalStack. Nothing is checked off until observed._
 
-curl -sf http://localhost:8090/health | jq .
+**Happy path (mock mode)** — verified 2026-08-12
 
-# Direct sidecar check, no pipeline involved
-curl -s -F "audio=@/tmp/audio.wav" http://localhost:8090/transcribe | jq '.model, .language, (.segments|length)'
+- [x] `worker-transcribe` starts and long-polls without busy-spinning, and
+      announces `MOCK_TRANSCRIBE=true — no model will be run` at startup
+- [x] Full chain upload → validate → extract → transcribe with **no manual SQS
+      publish**, completing in about a second end to end
+- [x] `stages.transcribe` goes `pending → running → completed`, `attempts == 1`
+- [x] `transcript.vtt` exists, begins with `WEBVTT`, and parses
+- [x] Cue timestamps are monotonic and non-overlapping, and the final cue is
+      **clipped to the clip** — a 6.023s video ends its last cue at 6.023, not
+      at 9
+- [x] Exactly one message on `dayreel-package` pointing at `transcript.vtt`,
+      carrying the **inherited** `trace_id`. `c5b00919` and `d4340573` survive
+      validate → extract → transcribe → package, so a trace now spans **three
+      hops**
+- [ ] `Metrics.TranscribeDurationMs` is populated — **NOT DONE.** The field
+      exists on the model and is still never written. Recorded as outstanding
+      rather than quietly dropped; it needs a timing hook in the runner, which
+      is a shared-runner change and did not belong in the same pass as
+      heartbeating.
 
-# Then flip the worker and replay
-docker compose stop worker-transcribe
-MOCK_TRANSCRIBE=false docker compose up -d worker-transcribe
-```
+**Failure and edge paths**
 
-### No-audio path
+- [x] **Silent clip:** the job whose manifest carries `audio.present: false`
+      produced an 8-byte `WEBVTT\n\n` document with zero cues, never fetched
+      audio (none exists in S3), and still published to package. The 4A
+      obligation is discharged and observed, not merely coded.
+- [ ] **Idempotency (duplicate):** **not run for this stage.** The mechanism is
+      in the shared runner and was verified in both 3A and 4A.
+- [ ] **Idempotency (crash-resume):** **still unexercised**, now across three
+      stages. See the note below — this should stop being deferred.
+- [ ] **Missing manifest:** not run.
+- [ ] **Malformed manifest:** covered by a unit test asserting
+      `worker.Permanent`, but not observed end to end.
+- [ ] **Sidecar down:** not applicable — **[DECIDE 1]** chose whisper.cpp in the
+      image, so there is no sidecar.
+- [ ] **SIGTERM mid-transcription:** not run. Mock transcription is
+      instantaneous, so this only becomes meaningful once the real model is in.
 
-Re-run the mock test with `"has_audio": false` in `extract.json` and no
-`audio.wav` uploaded. Expect a header-only `transcript.vtt`,
-`stages.transcribe.status = completed`, and a message on `dayreel-package`.
+### The crash-resume branch has now been deferred three times
 
----
+`output exists but stage unrecorded, resuming` (`runner.go`) has not executed in
+3A, 4A, or 5A. It is real code in the shared runner, on the path every stage
+takes, and it has never run.
 
-## Verification Checklist
+Deferring it a fourth time is not reasonable. Either it gets exercised during 6A
+— it is cheap to force: hand-write the output object while the stage row still
+says `running`, then publish — or it should be covered by a unit test against a
+faked storage layer. A branch that is never verified is worse than one that does
+not exist, because it reads as tested.
 
-- [ ] Mock path produces `transcript.vtt` in under 2 s
-- [ ] VTT starts with `WEBVTT`, cues are monotonic and non-overlapping
-- [ ] `ffprobe` identifies the file as `webvtt`
-- [ ] Final cue end time does not exceed `duration_seconds`
-- [ ] Mock output is identical across two runs of the same `job_id`
-- [ ] `has_audio: false` yields a header-only VTT and a **completed** stage
-- [ ] Zero-segment real transcription also yields a header-only VTT
-- [ ] `transcript.json` records the correct `engine`
-- [ ] `GET /jobs/{id}` shows `stages.transcribe.status = "completed"`
-- [ ] `metrics.transcribe_duration_ms` is populated
-- [ ] Message lands on `dayreel-package`
-- [ ] Replaying the message skips reprocessing
-- [ ] `docker compose up` (no profile) does **not** start the transcriber
-- [ ] With `--profile whisper`: `/health` goes 503 → 200, and real transcription of a speech clip returns plausible text
-- [ ] Sidecar down + `MOCK_TRANSCRIBE=false` ⇒ message redelivers, does not fail permanently
+**Real model** — verified 2026-08-12
 
----
+- [x] A real transcription of a 6.4s spoken clip produces accurate text.
+      Source: *"The quick brown fox jumps over the lazy dog. This is a test of
+      the DayReel transcription pipeline."* Output: two correctly timed cues,
+      verbatim apart from "DayReel" → "day real", which is expected for a coined
+      brand name at the `base` model.
+- [x] Wall clock recorded. **72s** on the first job (including the one-time
+      141 MB model download) and **7s** on the second, with the model served
+      from the volume. Roughly 0.1× realtime.
+- [x] Image size measured: **184 MB**, against 180 MB for the other workers.
+      whisper-cli adds ~4 MB. Docker total sits well inside the 8 GB ceiling.
+- [x] The model volume works: 141.1 MB persisted at `/models/ggml-base.bin`,
+      and the second run did not re-download it.
+
+**The visibility-timeout worry was overstated.** At ~0.1× realtime, a 60s clip
+transcribes in 5–8s against a 900s timeout — a margin of more than 100×. It
+would take a roughly two-hour input to threaten it. All three **[DECIDE 3]**
+measures still stand and none is wasted: heartbeating is correctness rather than
+tuning, and `MaxDuration` was a cost lever independent of this. But the ranking
+was wrong — this was predicted as the stage's main operational risk, and it is
+not one.
+
+### Traps found by verifying the real invocation
+
+Empirical research inside the container turned up three things that would have
+been wrong if the invocation had been written from documentation:
+
+1. **A corrupt or empty input exits 0 and writes no output file.** This is the
+   important one. Exit-code-only checking would have produced a silent, empty
+   transcript indistinguishable from a clip with no speech — the same class of
+   failure as `pkt_pts_time` in 4A. The code therefore stats the expected JSON
+   and treats "exited 0 but wrote nothing" as `ErrUnreadableAudio`, classified
+   permanent.
+2. **Silence produces a literal `[BLANK_AUDIO]` segment**, not an empty result.
+   Unfiltered, a quiet clip would render that string as a subtitle. It is a
+   deterministic sentinel rather than a hallucination, so filtering is reliable —
+   though only synthetic silence was tested, and real room tone is where Whisper
+   models are known to hallucinate stock phrases.
+3. **`libstdc++` and `libgomp` are required at runtime.** `BUILD_SHARED_LIBS=OFF`
+   statics only whisper and ggml's own libraries. Omitting them fails at exec
+   time, not at build time.
+
+Also recorded, not acted on: **the default build is not portable across arm64
+CPUs.** CMake bakes in the build host's CPU features, so an image built on Apple
+Silicon will SIGILL on Graviton2 (Graviton3+ is fine). The mitigation —
+`-DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8-a+crc+simd` — was verified to
+produce identical transcripts about 15% slower. Not applied, because this image
+is currently built and run on the same machine. **It must be applied before this
+ever ships to Graviton or a mixed fleet.**
+
+### The crash-resume branch has now been deferred three times
+
+`output exists but stage unrecorded, resuming` (`runner.go`) has not executed in
+3A, 4A, or 5A. It is real code in the shared runner, on the path every stage
+takes, and it has never run.
+
+Deferring it a fourth time is not reasonable. Either it gets exercised during 6A
+— it is cheap to force: hand-write the output object while the stage row still
+says `running`, then publish — or it should be covered by a unit test against a
+faked storage layer. A branch that is never verified is worse than one that does
+not exist, because it reads as tested.
+
+**Real model (budgeted — run once)**
+
+- [ ] One real transcription of a ≤10s spoken clip produces recognisable text
+- [ ] Wall-clock recorded, and compared against the visibility timeout
+      (**[DECIDE 3]**)
+- [ ] Image size measured and recorded against the **8 GB** ceiling
 
 ## Claude Code Implementation Plan
 
-### Approach: single agent, VTT-writer first
+### Recommended Approach: Mock-First, Sequential, with a Parallel Image Track
 
-Build `internal/vtt` and its tests before anything else — it is pure, fully
-unit-testable without Docker, and it is where the fiddly correctness lives
-(timestamp formatting, overlap clipping). Everything downstream is plumbing.
+The pipeline work and the ML packaging work are genuinely independent and have
+very different failure modes and feedback loops. Build the pipeline against the
+mock transcriber first — it needs no model, no Python and no new image — and
+treat the real Whisper runtime as a separate track that plugs into an interface
+already proven end to end.
 
-### Execution order
+This is also the cheapest ordering under an 8 GB Docker ceiling: nothing large is
+built until the wiring is known to work.
+
+### Pre-Flight Check
 
 ```
-1. internal/vtt/vtt.go + vtt_test.go   (Write) — go test, fast loop
-2. transcribe.go (types + interface)   (Write)
-3. mock.go                             (Write) — parallel with 2
-4. whisper.go (HTTP client)            (Write) — parallel with 2
-5. handler + no-audio short-circuit    (Write)
-6. config.go, .env.example             (Edit)  — parallel with 5
-7. cmd/worker/main.go registration     (Edit)
-8. infra/transcriber/*                 (Write) — independent, can go anytime
-9. docker-compose.yml                  (Edit)
-10. Mock E2E                           (Bash)
-11. Real E2E (--profile whisper)       (Bash)  — slow; do last
-12. CONTEXT.md                         (Write)
+0a. docker system df                    # ~2.6GB used of an 8GB ceiling;
+                                        # DECIDE 2 could add ~1GB
+0b. docker builder prune -f             # reclaim before any large build
+0c. df -h /System/Volumes/Data          # host disk hit 96% during 4A
+0d. docker compose ps                   # 5 containers healthy
+0e. awslocal sqs purge-queue --queue-url .../dayreel-dlq
+                                        # 4A left one transcribe message there,
+                                        # redriven by verification probes
+0f. Confirm DECIDE 1 and DECIDE 2 are settled. Do NOT start step 9 before
+    they are — that is the step that spends disk and build time.
 ```
 
-Steps 2/3/4 and 5/6 are independent writes and can be issued together. Step 8 is
-fully independent of the Go work.
+### Execution Steps
 
-### Subagent consideration
+```
+Phase 1: Pure types and formatting (no I/O, no model)
+1.  Write backend/internal/transcribe/transcribe.go   (interface + Segment)
+2.  Write backend/internal/transcribe/vtt.go
+3.  Write backend/internal/transcribe/vtt_test.go
+    - HH:MM:SS.mmm formatting, including >1h and sub-second
+    - empty segment list -> a valid, cue-less WEBVTT file
+    - cue ordering preserved
+4.  go test ./internal/transcribe/     <-- fast loop, no containers
 
-The Python sidecar (step 8) is genuinely independent — different language,
-different container, contract already fixed above. It is the one piece in this
-stage worth handing off in parallel if the Go side is taking a while. Everything
-else shares Go types and is faster in one context.
+Phase 2: Mock transcriber
+5.  Write backend/internal/transcribe/mock.go   (duration-aware cues)
+6.  go test ./internal/transcribe/
 
-### Potential blockers
+Phase 3: The stage (parallel writes)
+7a. Write backend/internal/worker/transcribe/transcribe.go
+7b. Write backend/internal/worker/transcribe/transcribe_test.go
+    - audio.present == false -> empty VTT, transcriber never called
+      (assert with a spy: the silent path must not reach the model)
+    - malformed manifest -> worker.Permanent
+8.  go test ./internal/worker/transcribe/
+
+Phase 4: Wiring (parallel writes)
+9a. Modify backend/cmd/worker/main.go        -- case models.StageTranscribe
+9b. Modify infra/docker-compose.yml          -- worker-transcribe,
+                                                MOCK_TRANSCRIBE=true default
+9c. Modify infra/localstack/init-aws.sh      -- transcribe visibility timeout
+9d. Write backend/internal/worker/transcribe/CONTEXT.md
+10. go build ./... && go vet ./...
+
+Phase 5: End-to-end in MOCK mode  <-- the whole pipeline, zero model compute
+11. docker compose up -d --build worker-transcribe    (ONE build at a time)
+12. Recreate localstack if init-aws.sh changed, or set the queue attribute
+    directly on the running stack
+13. Run the Test block; work the mock-mode verification items
+14. COMMIT. The pipeline is provably correct before any ML enters the repo.
+
+Phase 6: Real Whisper  (only after DECIDE 1 + DECIDE 2 are settled)
+15. Write backend/internal/transcribe/whisper.go
+16. Write backend/Dockerfile.worker-transcribe (+ sidecar service if C)
+17. Build. Measure image size against the 8GB ceiling BEFORE building anything
+    else. Prune first.
+18. One real transcription of a <=10s clip. Record wall-clock and output.
+19. Switch compose back to MOCK_TRANSCRIBE=true as the default.
+20. Record results in this file; correct stage-1a-data-schemas.md.
+```
+
+### Parallel Opportunities
+
+| Phase | Parallel Files |
+|-------|----------------|
+| 1 | `transcribe.go`, `vtt.go`, `vtt_test.go` |
+| 3 | `worker/transcribe/transcribe.go`, `transcribe_test.go` |
+| 4 | `main.go`, `docker-compose.yml`, `init-aws.sh`, `CONTEXT.md` |
+| 6 | `whisper.go` and `Dockerfile.worker-transcribe` are independent tracks |
+
+### Subagents
+
+Unlike 3A and 4A, this stage has work genuinely worth delegating — but only in
+Phase 6, and only the parts that are research rather than authoring:
+
+- **Worth an agent:** determining the working Whisper invocation inside a
+  container — exact flags, exact output shape, musl-vs-glibc viability, actual
+  on-disk model and image sizes. This is empirical, container-bound, slow, and
+  independent of the Go code. It is exactly the shape of work that found the
+  `pkt_pts_time` bug in 4A, where the documented command was silently wrong.
+- **Not worth an agent:** the Go code. It mirrors `validate.go` and
+  `extract.go`, and consistency with those is the point.
+
+Give any such agent an explicit file boundary (as in 4A: it owned
+`docker-compose.yml`, and touched nothing under `backend/`), and require it to
+report exact commands and exact output rather than conclusions.
+
+### Potential Blockers
 
 | Blocker | Resolution |
-|---------|------------|
-| faster-whisper model download slow/blocked | Ship the mock path; add the sidecar behind the profile and treat it as optional for the demo |
-| `ctranslate2` wheel unavailable for the base image arch (ARM Macs) | Use `python:3.11-slim` on `linux/amd64` via `platform:` in compose, or fall back to `openai-whisper` CPU |
-| Sidecar OOM on larger models | `tiny.en` at int8 needs ~200 MB; do not move past `base.en` without checking container limits |
-| Whisper hallucinates text over silence | `vad_filter=True` (already specified); if it persists, drop segments with `no_speech_prob > 0.6` |
-| Captions appear offset in the player | Not a 5A bug — see the `X-TIMESTAMP-MAP` note in Stage 6A |
+|---|---|
+| **8 GB Docker ceiling** | Cannot be raised without restarting Docker. Prune before Phase 6, measure image size immediately after, and prefer the `base` model. If it will not fit, say so before building rather than after |
+| Alpine + `faster-whisper` | CTranslate2 ships glibc wheels; musl is not officially supported. Either use a Debian-slim base for this image, or choose whisper.cpp (**[DECIDE 1]** B) |
+| Model reload per invocation | Seconds of startup on every job under options A/B. The sidecar (C) loads once per container |
+| Transcription exceeds 300s visibility | Duplicate concurrent processing, which the idempotency guard cannot catch because the output does not exist yet (**[DECIDE 3]**) |
+| Sidecar startup race | The worker may long-poll and pick up a job before the sidecar has loaded its model. Needs a health check in `depends_on`, or transient-failure classification on connection refused |
+| First-run model download | Slow, and repeats on every fresh container unless baked or volume-mounted |
+| Real runs cost time, not money | Whisper is local, so a run costs no AWS spend. The budget rules still apply to anything provisioned, per `config/free-tier.md` |
 
-### Time estimate
+### Time Estimate
 
-- `internal/vtt` + tests: ~10 min
-- Backends + handler: ~10 min
-- Sidecar: ~10 min (plus model download wall-time)
-- Wiring + E2E: ~8 min
-- **Total: ~30 min mock-only, ~40 min including the real path**
+- Phases 1–2 (types, VTT, mock): ~20 minutes
+- Phase 3 (stage + tests): ~20 minutes
+- Phase 4 (wiring): ~10 minutes
+- Phase 5 (mock end-to-end + verification): ~20 minutes
+- **Subtotal to a working, verified pipeline in mock mode: ~70 minutes**
+- Phase 6 (real Whisper, image, one real run): **~45–90 minutes, high variance**
 
----
-
-## Open Items to Confirm After Stages 3A and 4A
-
-Everything in Stage 4A's "Open Items" applies here too (handler interface, error
-classification, `internal/queue/sqs.go`, multi-bucket `S3Client`, stage-level
-DynamoDB updates, Redis invalidation from workers). Additionally:
-
-1. **`extract.json` field names.** This plan reads `has_audio` and
-   `duration_seconds`. If 4A's manifest lands with different names or moves
-   these into DynamoDB, update the handler's read path.
-
-2. **Visibility heartbeat helper.** 5A is the first stage where a single message
-   can plausibly run for minutes (cold model load + a long clip). Confirm 3A
-   provides `ChangeMessageVisibility` extension, or add it in this stage.
-
-3. **Where `has_audio` should live.** Manifest-in-S3 is assumed. If 3A/4A end up
-   putting stage outputs into DynamoDB instead, reading it from there saves an
-   S3 GET per message. Decide once, apply to 6A as well.
-
-4. **Whether the transcript belongs in the HLS bucket too.** 6A copies it to
-   `dayreel-hls-output` with an `X-TIMESTAMP-MAP` header. Alternative: write
-   both copies here. Left in 6A because only the packager knows the MPEG-TS
-   offset it produced.
-
-5. **Model choice.** `tiny.en` is assumed for speed. If transcript quality
-   visibly hurts the demo, `base.en` is ~2× slower and ~145 MB — still viable on
-   CPU. English-only models are assumed; drop the `.en` suffix if multilingual
-   clips matter.
+The variance is entirely in Phase 6 and is honest: it depends on **[DECIDE 1]**,
+on whether the runtime cooperates with the base image, and on how long one real
+transcription takes on this machine. Phases 1–5 are predictable because they are
+the same shape of work as 3A and 4A.
 
 ---
 
 ## Notes
 
-- **The mock is a backend, not a stub.** Same interface, same VTT writer, same
-  handler path. The only difference is where segments come from — which means
-  the mock path exercises everything except inference itself.
+### Risks and inherited tensions
 
-- **Deterministic mock output** (seeded by `job_id`) makes the E2E test
-  assertable and demos repeatable. Random filler text would make both worse.
+**This stage inherits the runner, and one branch of it is still untested.**
+`output exists but stage unrecorded, resuming` has not been exercised in 3A or
+4A. It is listed again here. If it is not verified in this stage, it should stop
+being listed and instead be either deleted or covered by a unit test — a branch
+that is never verified is worse than one that does not exist.
 
-- **Zero segments is a success, not a failure.** Silent audio, a music-only
-  clip, and a failed transcription all look similar from here; only the first
-  two are common, and failing the job for them would break the pipeline for
-  perfectly good videos.
+**Concurrency becomes real here.** Every earlier stage finished well inside the
+visibility timeout, so redelivery-during-work was theoretical. At transcription
+speeds it is not (**[DECIDE 3]**).
 
-- **`transcript.json` is kept** even though nothing reads it today. It is the
-  raw material for keyword search, chaptering, or a highlight-picker later, and
-  it costs a few KB.
+**Mock mode can hide integration bugs.** Building and verifying entirely in mock
+mode proves the *pipeline*, not the *transcription*. The single budgeted real run
+is what closes that gap, and it must actually be run — a stage verified only in
+mock mode is a stage whose real path has never executed.
 
-- **Deferred:** speaker diarization, word-level timestamps, translation,
-  multi-language detection, and punctuation restoration.
+### Deliberately not in scope
+
+- **Language detection, translation, diarization, word-level timestamps.** The
+  deliverable is timed text.
+- **Transcript quality tuning.** `base` is a starting point; model choice is one
+  environment variable.
+- **Runner heartbeating** (**[DECIDE 3]** option b) — a shared-runner change that
+  should not be made as a side effect of this stage.
+- **Correcting `MaxDuration`** — flagged in `config/free-tier.md` as a cost lever
+  and left as the user's product decision.
+
+### Uncertain, flagged rather than smoothed over
+
+- **Transcription speed on this machine is unmeasured.** The 2–5× realtime figure
+  for `base` on CPU is a general expectation, not a measurement, and
+  **[DECIDE 3]** rests on it. Measure during the one real run.
+- **Model and image sizes above are approximate.** They decide whether this fits
+  in 8 GB, so measure before committing to a model.
+- **Whether 6A wants the transcript key or the manifest** — this plan predicts
+  the transcript, mirroring 4A's reasoning, but 6A is not planned yet. Same class
+  of prediction 4A made about this stage, and that one turned out to need
+  correcting in `stage-1a`.
+- **`faster-whisper` vs `whisper.cpp` is not settled**, and `PROJECT_PLAN.md`
+  names faster-whisper. Deviating is defensible on packaging grounds, but it is a
+  deviation and should be an explicit decision rather than a silent one.

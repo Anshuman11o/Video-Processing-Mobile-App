@@ -1,0 +1,40 @@
+FROM golang:1.24-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /worker ./cmd/worker
+
+# whisper.cpp for the transcribe stage. Compiled from source because there is no
+# musl build available: Alpine ships no whisper/ggml package on any branch
+# including edge, and upstream's prebuilt Linux binaries are glibc-linked. The
+# compile takes about a minute and the resulting binary is ~3MB.
+#
+# --target whisper-cli is load-bearing. Without it CMake builds ~20 example
+# binaries (stream, talk-llama, bench) and the build takes several times longer.
+FROM alpine:3.19 AS whisper-builder
+ARG WHISPER_VERSION=1.9.2
+RUN apk --no-cache add build-base cmake
+WORKDIR /src
+ADD https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v${WHISPER_VERSION}.tar.gz /src/whisper.tar.gz
+RUN tar xzf whisper.tar.gz && mv whisper.cpp-${WHISPER_VERSION} whisper.cpp
+WORKDIR /src/whisper.cpp
+RUN cmake -B build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_SHARED_LIBS=OFF \
+      -DWHISPER_BUILD_TESTS=OFF \
+      -DWHISPER_BUILD_SERVER=OFF \
+      -DWHISPER_BUILD_EXAMPLES=ON \
+ && cmake --build build --target whisper-cli -j "$(nproc)"
+
+FROM alpine:3.19
+# Unlike the API image, workers shell out to ffmpeg/ffprobe. The ffmpeg package
+# provides both binaries.
+#
+# libstdc++ and libgomp are for whisper-cli: BUILD_SHARED_LIBS=OFF statics only
+# whisper and ggml's own libraries, leaving the binary dynamically linked against
+# both. Omitting them fails at exec time, not at build time.
+RUN apk --no-cache add ca-certificates ffmpeg libstdc++ libgomp
+COPY --from=builder /worker /worker
+COPY --from=whisper-builder /src/whisper.cpp/build/bin/whisper-cli /usr/local/bin/whisper-cli
+CMD ["/worker"]

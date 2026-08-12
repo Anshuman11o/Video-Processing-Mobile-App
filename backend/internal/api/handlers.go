@@ -18,8 +18,8 @@ import (
 )
 
 const (
-	partSize       = 5 * 1024 * 1024 // 5MB per part
-	presignExpiry  = 1 * time.Hour
+	partSize      = 5 * 1024 * 1024 // 5MB per part
+	presignExpiry = 1 * time.Hour
 )
 
 // Handler holds dependencies for all HTTP handlers.
