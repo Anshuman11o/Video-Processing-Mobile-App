@@ -450,6 +450,69 @@ says `running`, then publish — or it should be covered by a unit test against 
 faked storage layer. A branch that is never verified is worse than one that does
 not exist, because it reads as tested.
 
+**Real model** — verified 2026-08-12
+
+- [x] A real transcription of a 6.4s spoken clip produces accurate text.
+      Source: *"The quick brown fox jumps over the lazy dog. This is a test of
+      the DayReel transcription pipeline."* Output: two correctly timed cues,
+      verbatim apart from "DayReel" → "day real", which is expected for a coined
+      brand name at the `base` model.
+- [x] Wall clock recorded. **72s** on the first job (including the one-time
+      141 MB model download) and **7s** on the second, with the model served
+      from the volume. Roughly 0.1× realtime.
+- [x] Image size measured: **184 MB**, against 180 MB for the other workers.
+      whisper-cli adds ~4 MB. Docker total sits well inside the 8 GB ceiling.
+- [x] The model volume works: 141.1 MB persisted at `/models/ggml-base.bin`,
+      and the second run did not re-download it.
+
+**The visibility-timeout worry was overstated.** At ~0.1× realtime, a 60s clip
+transcribes in 5–8s against a 900s timeout — a margin of more than 100×. It
+would take a roughly two-hour input to threaten it. All three **[DECIDE 3]**
+measures still stand and none is wasted: heartbeating is correctness rather than
+tuning, and `MaxDuration` was a cost lever independent of this. But the ranking
+was wrong — this was predicted as the stage's main operational risk, and it is
+not one.
+
+### Traps found by verifying the real invocation
+
+Empirical research inside the container turned up three things that would have
+been wrong if the invocation had been written from documentation:
+
+1. **A corrupt or empty input exits 0 and writes no output file.** This is the
+   important one. Exit-code-only checking would have produced a silent, empty
+   transcript indistinguishable from a clip with no speech — the same class of
+   failure as `pkt_pts_time` in 4A. The code therefore stats the expected JSON
+   and treats "exited 0 but wrote nothing" as `ErrUnreadableAudio`, classified
+   permanent.
+2. **Silence produces a literal `[BLANK_AUDIO]` segment**, not an empty result.
+   Unfiltered, a quiet clip would render that string as a subtitle. It is a
+   deterministic sentinel rather than a hallucination, so filtering is reliable —
+   though only synthetic silence was tested, and real room tone is where Whisper
+   models are known to hallucinate stock phrases.
+3. **`libstdc++` and `libgomp` are required at runtime.** `BUILD_SHARED_LIBS=OFF`
+   statics only whisper and ggml's own libraries. Omitting them fails at exec
+   time, not at build time.
+
+Also recorded, not acted on: **the default build is not portable across arm64
+CPUs.** CMake bakes in the build host's CPU features, so an image built on Apple
+Silicon will SIGILL on Graviton2 (Graviton3+ is fine). The mitigation —
+`-DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8-a+crc+simd` — was verified to
+produce identical transcripts about 15% slower. Not applied, because this image
+is currently built and run on the same machine. **It must be applied before this
+ever ships to Graviton or a mixed fleet.**
+
+### The crash-resume branch has now been deferred three times
+
+`output exists but stage unrecorded, resuming` (`runner.go`) has not executed in
+3A, 4A, or 5A. It is real code in the shared runner, on the path every stage
+takes, and it has never run.
+
+Deferring it a fourth time is not reasonable. Either it gets exercised during 6A
+— it is cheap to force: hand-write the output object while the stage row still
+says `running`, then publish — or it should be covered by a unit test against a
+faked storage layer. A branch that is never verified is worse than one that does
+not exist, because it reads as tested.
+
 **Real model (budgeted — run once)**
 
 - [ ] One real transcription of a ≤10s spoken clip produces recognisable text

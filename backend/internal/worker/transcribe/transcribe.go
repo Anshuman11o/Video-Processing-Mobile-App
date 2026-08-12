@@ -5,6 +5,7 @@ package transcribe
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -130,10 +131,16 @@ func (s *Stage) transcribeAudio(
 
 	segments, err := s.newDecoder(manifest).Transcribe(ctx, audioPath)
 	if err != nil {
-		// Deliberately transient. Transcription failures are dominated by
+		if errors.Is(err, transcribe.ErrUnreadableAudio) {
+			// The decoder could not read the bytes at all. Retrying reads the
+			// same bytes. Worth classifying explicitly, because whisper.cpp
+			// reports this by exiting 0 and writing nothing — without the
+			// sentinel it would look like a successful empty transcript.
+			return nil, worker.Permanent("audio could not be decoded for transcription", err)
+		}
+		// Otherwise transient. Transcription failures are dominated by
 		// environmental causes — a model still downloading, memory pressure, a
-		// process killed mid-run — which retrying does fix. A genuinely corrupt
-		// input would have failed extract's own ffmpeg pass first.
+		// process killed mid-run — which retrying does fix.
 		return nil, fmt.Errorf("transcribe audio: %w", err)
 	}
 
