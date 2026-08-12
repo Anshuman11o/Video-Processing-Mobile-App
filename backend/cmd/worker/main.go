@@ -16,6 +16,7 @@ import (
 	"github.com/anshumanagarwal/dayreel/internal/queue"
 	"github.com/anshumanagarwal/dayreel/internal/storage"
 	"github.com/anshumanagarwal/dayreel/internal/worker"
+	"github.com/anshumanagarwal/dayreel/internal/worker/extract"
 	"github.com/anshumanagarwal/dayreel/internal/worker/validate"
 )
 
@@ -67,7 +68,12 @@ func buildStage(name models.StageName, cfg *config.Config, s3Client *storage.S3C
 	switch name {
 	case models.StageValidate:
 		return validate.New(s3Client, cfg.S3ProcessedBucket, validate.DefaultLimits), nil
-	case models.StageExtract, models.StageTranscribe, models.StagePackage:
+	case models.StageExtract:
+		// Extract reads and writes the same bucket: its input is validate's
+		// output. OutputKey is derived from the job ID rather than from the
+		// input key, so a bad input cannot cause a write outside its own prefix.
+		return extract.New(s3Client, cfg.S3ProcessedBucket, extract.DefaultOptions), nil
+	case models.StageTranscribe, models.StagePackage:
 		return nil, unimplementedStageError(name)
 	default:
 		return nil, unknownStageError(name)

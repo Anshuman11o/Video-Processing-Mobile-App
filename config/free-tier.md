@@ -14,7 +14,39 @@
 |---|---|
 | **Hard ceiling** | **$20 total** — not per month, total |
 | Test clip length | **≤ 10 seconds** |
+| Expected AWS runs | **1–5 total, then the project closes** |
 | Default posture | **Everything runs on LocalStack.** AWS spend is opt-in, never incidental |
+
+## Everything is on-demand — nothing stays up
+
+This project has a **finite life**: a handful of runs for development and
+testing, then it is closed. Nothing here is a service that needs to keep running,
+so **no AWS resource should outlive the run that needed it.**
+
+That single rule is what keeps the budget safe. Per-run cost is pennies; the only
+way to overspend is to leave something switched on after the run that justified
+it. A resource forgotten for a month costs more than every run combined.
+
+**Obligation when anything is provisioned:** whoever (or whatever) brings up an
+AWS resource must say so explicitly at the end of that run — name the resource
+and state that it needs switching off or disconnecting. Not "consider tearing
+down"; an explicit reminder naming what is still live. A resource that was
+created silently will be forgotten silently.
+
+This applies to anything billed by time — Fargate tasks, NAT Gateways,
+ElastiCache, load balancers, provisioned DynamoDB capacity, EBS volumes, Elastic
+IPs left unattached. It does not apply to S3 objects or DynamoDB items, which
+bill by size and are trivial at this scale, though they are still worth deleting
+at the end.
+
+**Teardown check after every AWS run:**
+
+```bash
+aws ec2 describe-nat-gateways --filter Name=state,Values=available
+aws ecs list-tasks --cluster <cluster>            # expect none running
+aws elasticache describe-cache-clusters           # expect none
+aws ec2 describe-addresses                        # unattached Elastic IPs still bill
+```
 
 $20 is small enough that a single misconfiguration can consume it in a day. The
 controls below are ordered by how much damage they can do, not by how likely they
