@@ -65,14 +65,18 @@ const defaultSleep = (ms: number) =>
  * Upload every part in order and return the ETags, ready for
  * `POST /jobs/{id}/complete`.
  *
- * Parts go up sequentially. That is deliberate for now: a phone on a mobile
- * connection gains little from parallel PUTs, and sequential order means the
- * ETags collected so far are always a contiguous prefix — which is the shape
- * Stage 8A needs in order to resume.
+ * Parts go up sequentially. That is deliberate: a phone on a mobile connection
+ * gains little from parallel PUTs, and sequential order keeps progress
+ * monotonic.
  *
- * The returned array is the complete record of what landed. Callers should
- * persist it as they go rather than keeping it in a closure, for the same
- * reason.
+ * **Do not persist the returned ETags as resume state.** An earlier version of
+ * this comment said to, on the grounds that a contiguous prefix of ETags is
+ * "the shape Stage 8A needs". Stage 8A **[DECIDE 2]** settled the opposite:
+ * resume is server-authoritative. `POST /jobs/{id}/upload-urls` asks S3's
+ * `ListParts` what actually landed and re-issues URLs for only what is missing,
+ * so a client-persisted ETag array is at best redundant and at worst a second
+ * source of truth that can disagree with S3. The client persists identifiers —
+ * job id, upload id, source file — and nothing about progress.
  */
 export async function uploadParts(opts: UploadOptions): Promise<CompletedPart[]> {
   const {
