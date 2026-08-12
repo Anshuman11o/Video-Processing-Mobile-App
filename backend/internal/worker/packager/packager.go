@@ -130,7 +130,11 @@ func (s *Stage) Process(ctx context.Context, msg *events.StageMessage) (string, 
 		return "", worker.Permanent("hls transcode failed", err)
 	}
 
-	subs, err := s.writeSubtitles(ctx, dir, outDir, msg, probe.DurationSec)
+	// The anchor comes from the encode, so subtitles cannot be written until it
+	// has run: cue times are meaningless until the stream's own zero is known.
+	anchor := media.SubtitleTimestampAnchor(encoded)
+
+	subs, err := s.writeSubtitles(ctx, dir, outDir, msg, probe.DurationSec, anchor)
 	if err != nil {
 		return "", err
 	}
@@ -160,7 +164,8 @@ func (s *Stage) Process(ctx context.Context, msg *events.StageMessage) (string, 
 // Returns nil when there is no transcript, in which case the master advertises
 // no subtitle track and the video still plays.
 func (s *Stage) writeSubtitles(
-	ctx context.Context, dir, outDir string, msg *events.StageMessage, duration float64,
+	ctx context.Context, dir, outDir string, msg *events.StageMessage,
+	duration float64, anchor int64,
 ) (*media.SubtitleRendition, error) {
 	vttPath := filepath.Join(dir, "transcript.vtt")
 	if err := s.s3.DownloadToFile(ctx, msg.Input.Bucket, msg.Input.Key, vttPath); err != nil {
@@ -179,7 +184,13 @@ func (s *Stage) writeSubtitles(
 	if err != nil {
 		return nil, fmt.Errorf("read transcript: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(subsDir, "subs_000.vtt"), body, 0o644); err != nil {
+
+	// The transcript's cue times are relative to the media; the MPEG-TS segments
+	// are not, so the two need tying together explicitly. Measured through
+	// AVFoundation: without this every cue plays 66.7 ms early on a 30fps source.
+	doc := media.WithTimestampMap(string(body), anchor)
+
+	if err := os.WriteFile(filepath.Join(subsDir, "subs_000.vtt"), []byte(doc), 0o644); err != nil {
 		return nil, fmt.Errorf("write subtitle segment: %w", err)
 	}
 
