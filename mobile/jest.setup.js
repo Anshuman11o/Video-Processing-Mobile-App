@@ -1,9 +1,12 @@
 // Native modules are not linked in the Jest environment, so stub the ones the
 // app imports at module load. Without this, importing HomeScreen throws
 // "TurboModuleRegistry.getEnforcing(...): 'RNDocumentPicker' could not be found".
-jest.mock('react-native-document-picker', () => ({
+jest.mock('@react-native-documents/picker', () => ({
   pick: jest.fn(() => Promise.resolve([])),
+  keepLocalCopy: jest.fn(() => Promise.resolve([])),
   types: {video: 'video/*'},
+  errorCodes: {OPERATION_CANCELED: 'OPERATION_CANCELED'},
+  isErrorWithCode: jest.fn(() => false),
 }));
 
 // react-native-blob-util ships untranspiled ESM AND needs a linked native

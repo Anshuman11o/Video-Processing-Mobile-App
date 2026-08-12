@@ -7,7 +7,12 @@ import {
   Alert,
   ActivityIndicator,
 } from 'react-native';
-import {pick} from 'react-native-document-picker';
+import {
+  errorCodes,
+  isErrorWithCode,
+  keepLocalCopy,
+  pick,
+} from '@react-native-documents/picker';
 import type {NativeStackNavigationProp} from '@react-navigation/native-stack';
 import type {RootStackParamList} from '../navigation/AppNavigator';
 import {blobTransport} from '../upload/blobTransport';
@@ -57,39 +62,54 @@ export default function HomeScreen({navigation}: HomeScreenProps) {
 
   const handleSelectVideo = useCallback(async () => {
     try {
-      const [result] = await pick({
-        type: ['video/*'],
-        // Without this the picker returns a content:// URI that the native
-        // uploader cannot read, and that Android may revoke access to once the
-        // grant lapses. copyTo populates fileCopyUri with a readable file://
-        // path instead.
-        copyTo: 'cachesDirectory',
-      });
+      const [result] = await pick({type: ['video/*']});
       if (!result) {
         return;
       }
 
-      const fileUri = result.fileCopyUri ?? result.uri;
+      const filename = result.name ?? 'video.mp4';
       const sizeBytes = result.size ?? 0;
       // POST /jobs rejects an empty filename, a non-positive size or an empty
       // content type with a 400. The picker types all three as nullable, so
       // they are checked here rather than discovered as a failed request.
-      if (!fileUri || sizeBytes <= 0) {
+      if (sizeBytes <= 0) {
         Alert.alert('Cannot upload', 'That file has no readable contents.');
+        return;
+      }
+
+      // On Android `result.uri` is a `content://` URI, which is not a path the
+      // native uploader can slice, and whose permission grant Android can
+      // revoke. keepLocalCopy turns it into a real local file.
+      //
+      // documentDirectory, not cachesDirectory: Android reclaims cache
+      // directories under storage pressure, and an upload that has to survive
+      // the app being killed must not have its source file vanish underneath
+      // it. That is Stage 8A [DECIDE 5], settled here because the picker is
+      // where the choice is actually made.
+      const [copy] = await keepLocalCopy({
+        files: [{uri: result.uri, fileName: filename}],
+        destination: 'documentDirectory',
+      });
+
+      // keepLocalCopy resolves even when it failed — the failure is reported
+      // in `status`, not thrown. Checking it is not optional: a missing check
+      // would read `localUri` off an error result and upload nothing.
+      if (copy.status !== 'success') {
+        Alert.alert('Cannot upload', `Could not read that file: ${copy.copyError}`);
         return;
       }
 
       Alert.alert(
         'Video selected',
-        `${result.name}\nSize: ${(sizeBytes / 1024 / 1024).toFixed(1)} MB`,
+        `${filename}\nSize: ${(sizeBytes / 1024 / 1024).toFixed(1)} MB`,
         [
           {text: 'Cancel', style: 'cancel'},
           {
             text: 'Upload',
             onPress: () => {
               startUpload({
-                fileUri,
-                filename: result.name ?? 'video.mp4',
+                fileUri: copy.localUri,
+                filename,
                 sizeBytes,
                 contentType: result.type ?? 'video/mp4',
               });
@@ -97,10 +117,11 @@ export default function HomeScreen({navigation}: HomeScreenProps) {
           },
         ],
       );
-    } catch (err: any) {
-      if (err?.code !== 'DOCUMENT_PICKER_CANCELED') {
-        Alert.alert('Could not open the picker', String(err?.message ?? err));
+    } catch (err) {
+      if (isErrorWithCode(err) && err.code === errorCodes.OPERATION_CANCELED) {
+        return;
       }
+      Alert.alert('Could not open the picker', String(err));
     }
   }, [startUpload]);
 
