@@ -15,7 +15,7 @@
 | **Hard ceiling** | **$20 total** — not per month, total |
 | Test clip length | **≤ 10 seconds** |
 | Expected AWS runs | **1–5 total, then the project closes** |
-| Default posture | **Everything runs on LocalStack.** AWS spend is opt-in, never incidental |
+| Default posture | **S3 and DynamoDB are real from the first run.** There is no emulator any more; the queue and the status cache are local and free |
 
 ## Everything is on-demand — nothing stays up
 
@@ -33,11 +33,11 @@ and state that it needs switching off or disconnecting. Not "consider tearing
 down"; an explicit reminder naming what is still live. A resource that was
 created silently will be forgotten silently.
 
-This applies to anything billed by time — Fargate tasks, NAT Gateways,
-ElastiCache, load balancers, provisioned DynamoDB capacity, EBS volumes, Elastic
-IPs left unattached. It does not apply to S3 objects or DynamoDB items, which
-bill by size and are trivial at this scale, though they are still worth deleting
-at the end.
+This applies to anything billed by time — VMs, NAT Gateways, managed container
+tasks, managed cache nodes, load balancers, provisioned DynamoDB capacity, EBS
+volumes, Elastic IPs left unattached. It does not apply to S3 objects or
+DynamoDB items, which bill by size and are trivial at this scale, though they
+are still worth deleting at the end.
 
 **One thing that bills nothing per hour and still belongs on this list: a
 public-read policy on the HLS bucket.** `scripts/aws-hls-public.sh enable` is
@@ -51,9 +51,10 @@ enabling it removes that guardrail from *every* bucket in the account. Run
 **Teardown check after every AWS run:**
 
 ```bash
+aws ec2 describe-instances --filters Name=instance-state-name,Values=running
 aws ec2 describe-nat-gateways --filter Name=state,Values=available
-aws ecs list-tasks --cluster <cluster>            # expect none running
-aws elasticache describe-cache-clusters           # expect none
+aws ecs list-tasks --cluster <cluster>            # expect none — no container hosting
+aws elasticache describe-cache-clusters           # expect none — the cache is in-process
 aws ec2 describe-addresses                        # unattached Elastic IPs still bill
 ```
 
@@ -74,12 +75,14 @@ a resource billed per request spends money only when you use it.
 | Trap | Cost if left running | Control |
 |---|---|---|
 | **NAT Gateway** | ~$32/month | Never create one. Public subnets + VPC Gateway Endpoints for S3/DynamoDB (endpoints are free) |
-| **Fargate, 4 workers 24/7** | ~$115/month | Never run workers always-on. On-demand only, scale to zero |
-| **ElastiCache Redis** | ~$12/month (smallest node) | Do not deploy. Redis stays a local container; the API's cache is not load-bearing |
+| **Managed containers (Fargate), 4 workers 24/7** | ~$115/month | Not in the architecture. The four stages are four processes on one host; if that host is ever a VM, it is stopped when the demo ends |
+| **ElastiCache Redis** | ~$12/month (smallest node) | Not in the architecture. Job status is cached in a map inside the API process |
 | **Idle anything** | varies | Anything billed per hour must be torn down after use, not stopped |
 
-Any single item in this table exceeds the total budget within one month. **All
-three of the named services are currently local-only, and should stay that way.**
+Any single item in this table exceeds the total budget within one month. **None
+of them is in the architecture.** The container fleet and the cache server were
+removed outright along with the emulator (see `infra/CONTEXT.md`); a NAT Gateway
+was never created. None should arrive without a decided teardown time.
 
 ### Tier 2 — bounded, but worth not being stupid about
 
@@ -89,34 +92,34 @@ three of the named services are currently local-only, and should stay that way.*
 | S3 GET | ~$0.0004 / 1,000 | negligible |
 | S3 storage | ~$0.023 / GB-month | A 10s clip is a few MB; hundreds of jobs ≈ pennies |
 | DynamoDB on-demand | ~$1.25 / M writes | ~8 writes/job → negligible |
-| SQS | ~$0.40 / M requests | see below — this is the one with a failure mode |
-| Data egress | $0.09/GB after 100GB | Keep one region. Do not pull processed video back down repeatedly |
+| Queue operations | **$0** | A SQLite file on local disk. No service, no requests, no bill |
+| Status cache | **$0** | A map in the API process |
+| Data egress | $0.09/GB after 100GB | Keep one region. HLS is served straight from S3, so viewer traffic is egress — there is no CDN absorbing it |
 
 At ≤10s clips, **processing cost per job is a fraction of a cent.** The budget is
 not threatened by throughput. It is threatened by leaving something switched on.
 
 ---
 
-## SQS: the one request-based risk
+## The polling loop: no longer a billing risk, still a bug risk
 
-Workers long-poll continuously. That is the correct design — it is what keeps an
-idle worker from spinning — but it means an *idle* worker still issues requests
-forever.
+This section used to be about SQS. Polling the queue is now free — it is a
+`SELECT` against a local file — so the "idle worker bills forever" problem is
+gone with the service that caused it.
 
-Idle cost, per worker: `WaitTimeSeconds = 20` → 3 requests/min → ~130k/month →
-**~$0.05/month**. Four workers ≈ $0.21/month. Acceptable.
-
-**The failure mode is a failed receive.** A successful receive blocks for the
-full 20s; a *failing* one returns immediately. Looping straight back round turns
-any persistent error — expired credentials, a throttle, a deleted queue — into a
-hot loop issuing requests as fast as the network allows. At a few hundred
-requests/second that is millions per day, and it bills while also flooding
-CloudWatch Logs.
+**The failure mode survives the migration.** A poll that fails returns
+immediately rather than waiting out its interval, so looping straight back round
+turns any persistent error — a locked database, a corrupt file, a revoked
+credential on the S3 call that follows — into a hot loop. It no longer costs
+money; it costs a pegged core and a log file that fills the disk. And the same
+loop shape does still touch billed services: every claimed message leads to S3
+and DynamoDB calls, so a redelivery storm is a request-billed storm.
 
 **Controlled** in `internal/worker/runner.go` — failed receives back off from 1s
 to a 30s ceiling, resetting on the first success. Added 2026-08-12 specifically
 because of this budget. Do not remove it, and preserve the equivalent in any new
-consume loop.
+consume loop. `QUEUE_MAX_DELIVERIES=3` and the DLQ are the second half of the
+same guard: a message that cannot succeed stops being retried.
 
 ---
 
@@ -141,8 +144,9 @@ mis-selected 4K movie and a long, billed ffmpeg run.
 1. **Set billing alerts first**, not after — alerts are free and are the only
    thing that catches a mistake while it is still small.
 2. Deploy nothing that bills per hour without deciding when it gets torn down.
-3. Prefer running the whole pipeline locally. LocalStack Community covers S3,
-   SQS and DynamoDB, which is everything stages 1A–6A touch.
+3. The pipeline already runs locally against real S3 and DynamoDB, so there is
+   nothing to "move to AWS" except the compute. Deployment means one small VM
+   running the two binaries — see `PROJECT_PLAN.md` Stage 10.
 
 ```bash
 aws budgets create-budget \
@@ -160,27 +164,42 @@ Thresholds, against a $20 total:
 
 ---
 
-## LocalStack Parity
+## Local development costs
 
-| Feature | Community (Free) | Pro |
-|---------|------------------|-----|
-| S3 | Full | Full |
-| SQS | Full | Full |
-| DynamoDB | Full | Full |
-| Lambda | Basic | Full |
-| ECS | No | Yes |
-| CloudFront | No | Yes |
-| Transcribe | No | Yes |
-| Persistence (`PERSISTENCE=1`) | No — silently ignored | Yes |
+There is no emulator. Local development talks to the same real buckets and table
+as everything else, so development traffic bills alongside demo traffic. It is
+still pennies, because both services bill per request.
 
-Two things this table has already cost us:
+| Local activity | Cost |
+|----------------|------|
+| Iterating on the pipeline (a few dozen clips) | ~22 PUTs and a handful of GETs per job → cents |
+| Job status polling during dev | Reads, mostly absorbed by the in-process cache |
+| Queue operations | **$0** — SQLite file on local disk |
+| Status cache | **$0** — in-process map |
+| ffmpeg and Whisper | **$0** — compute on hardware already paid for |
 
-- **Transcribe is Pro-only**, which is part of why 5A uses local Whisper. That
-  choice now also saves money: it is compute on hardware already paid for.
-- **`PERSISTENCE=1` is silently ignored in Community.** It is set in
-  `docker-compose.yml` and does nothing. A LocalStack restart wipes queues,
-  buckets and job rows — this changed how 3A's transient-failure test had to be
-  written.
+**Watch for:** an unbounded retry that re-uploads or re-processes. That is the
+only local activity that can generate real request volume, which is part of why
+`QUEUE_MAX_DELIVERIES=3` and the DLQ exist.
+
+### Why there is no emulator
+
+LocalStack was dropped for two reasons: the ~1 GB of RAM it cost, and the fact
+that its divergences from real S3 hid a genuine bug (`TROUBLESHOOTING.md`, the
+CORS `ExposeHeaders` entry). Developing against real AWS is cheaper than
+debugging the difference.
+
+Two constraints from the emulator era are kept because they still explain
+decisions in the code:
+
+- **Transcription was never emulated** (Pro-only), which is part of why 5A uses
+  local Whisper. That choice also saves money: it is compute on hardware already
+  paid for, and `MOCK_TRANSCRIBE=true` is the default besides.
+- **The emulator did not persist state between restarts** on the free tier,
+  which is why 3A's transient-failure test was written not to depend on
+  surviving a restart. The test is still correct; the reason has changed from
+  "the emulator forgets" to "the queue file is disposable and `make queue-reset`
+  is a normal thing to do".
 
 ---
 
@@ -188,10 +207,12 @@ Two things this table has already cost us:
 
 | Activity | Cost |
 |----------|------|
-| All local development (LocalStack) | **$0** |
-| Process 100 clips at ≤10s, if deployed | ~$0.05 |
-| Fargate, on-demand, 2 hours | ~$0.32 |
+| Local development against real S3 + DynamoDB | pennies per session |
+| Process 100 clips at ≤10s | ~$0.05 |
+| One small VM running both binaries, 2 hours | ~$0.02 |
 | S3 storage, ~1 GB for a month | ~$0.02 |
+| HLS egress, ~1 GB (no CDN in front) | ~$0.09 |
 | **One NAT Gateway left up for a month** | **~$32 — over budget on its own** |
 
-The pipeline is cheap. The infrastructure around it is not.
+The pipeline is cheap. The infrastructure around it is not — which is most of
+why there is so little of it left.

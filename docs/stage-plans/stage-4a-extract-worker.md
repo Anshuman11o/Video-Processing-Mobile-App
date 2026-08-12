@@ -4,6 +4,14 @@
 > four **[DECIDE]** items below now record the choice that was made and why.
 > Every recommendation was accepted as written.
 
+> **Substrate superseded.** This plan was written and verified against Docker
+> Compose, LocalStack, SQS and Redis. All four are gone: S3 and DynamoDB are
+> real AWS, the queue is a local SQLite file (`stage-3b-local-queue.md`), the
+> status cache is in-process, and the worker runs as `make worker STAGE=extract`.
+> The stage logic below is unchanged and still current — read the
+> `--endpoint-url`, `docker compose` and SQS references as a record of how it
+> was run at the time. See `infra/CONTEXT.md`.
+
 ## Aim
 
 Consume `dayreel-extract`, pull the transcription audio and a set of keyframes

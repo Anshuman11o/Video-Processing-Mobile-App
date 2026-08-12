@@ -3,10 +3,12 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"time"
 
+	"github.com/anshumanagarwal/dayreel/internal/config"
 	"github.com/anshumanagarwal/dayreel/internal/db"
 	"github.com/anshumanagarwal/dayreel/internal/events"
 	"github.com/anshumanagarwal/dayreel/internal/models"
@@ -16,21 +18,44 @@ import (
 
 const (
 	// initialReceiveBackoff and maxReceiveBackoff bound the wait between failed
-	// receives. Every SQS request is billed, so an unattended worker must not
-	// be able to spin on a persistent error.
+	// receives. A failing receive returns immediately, so without a backoff a
+	// persistent error — a deleted queue file, a corrupt database, a disk that
+	// filled — turns the consume loop into a hot loop hammering SQLite as fast
+	// as the CPU allows. That used to be a billing problem with SQS and is now a
+	// contention problem: every claim takes SQLite's write lock, so a spinning
+	// worker starves the ones doing real work.
 	initialReceiveBackoff = 1 * time.Second
 	maxReceiveBackoff     = 30 * time.Second
 
+	// receiveMax is how many messages a single receive claims. One at a time
+	// keeps the failure story simple; parallelism comes from running more
+	// worker processes.
+	receiveMax = 1
+
 	// heartbeatInterval is how often a running stage extends its message's
-	// visibility, and heartbeatVisibilitySeconds is how far ahead each extension
-	// pushes it.
+	// lease.
 	//
-	// The interval is deliberately much shorter than the extension: a heartbeat
+	// The interval is deliberately much shorter than the extension it asks for
+	// (the configured visibility timeout, five minutes by default): a heartbeat
 	// that fails or is delayed still leaves several minutes of headroom before
-	// SQS redelivers. The extension is deliberately short enough that a crashed
-	// worker's message returns in minutes rather than being held hostage.
-	heartbeatInterval          = 30 * time.Second
-	heartbeatVisibilitySeconds = 300
+	// the lease expires and the message is claimable again. Extending on a
+	// ticker rather than asking for one enormous lease up front is what makes a
+	// crashed worker recover quickly — heartbeats stop the moment the process
+	// dies, so the message returns after one visibility timeout instead of
+	// being held hostage for hours.
+	heartbeatInterval = 30 * time.Second
+
+	// initialNackBackoff and maxNackBackoff bound how long a transiently failed
+	// message stays invisible before its next delivery.
+	//
+	// SQS had no equivalent knob: a message that was simply not deleted came
+	// back after the queue's visibility timeout, always the same delay. Nack
+	// takes an explicit backoff, so the retry can grow with the attempt number —
+	// a dependency that is restarting is retried in seconds, and one that is
+	// genuinely down is not hammered every ten seconds until the delivery budget
+	// runs out.
+	initialNackBackoff = 10 * time.Second
+	maxNackBackoff     = 5 * time.Minute
 )
 
 // Stage is one step of the pipeline. Implementations do the media work and
@@ -67,27 +92,47 @@ type Finalizer interface {
 // Runner consumes a queue and applies a Stage to each message.
 type Runner struct {
 	stage   Stage
-	queue   *queue.Client
+	queue   queue.Queue
 	db      *db.DynamoDBClient
 	storage *storage.S3Client
 
 	queueName string
+
+	// pollWait is how long one Receive blocks before returning empty, and
+	// maxDeliveries is the redelivery budget a message gets before this runner
+	// dead-letters it. Both come from config so every stage agrees with the
+	// broker about them.
+	pollWait      time.Duration
+	maxDeliveries int
+
+	// leaseExtension is how far ahead each heartbeat pushes the lease. It is the
+	// broker's own visibility timeout, so a heartbeat buys exactly as much time
+	// as a fresh delivery would.
+	leaseExtension time.Duration
 }
 
 // NewRunner wires a Runner for the given stage.
-func NewRunner(stage Stage, q *queue.Client, database *db.DynamoDBClient, s3 *storage.S3Client) *Runner {
+func NewRunner(
+	stage Stage, q queue.Queue,
+	database *db.DynamoDBClient, s3 *storage.S3Client,
+	cfg *config.Config,
+) *Runner {
 	return &Runner{
-		stage:     stage,
-		queue:     q,
-		db:        database,
-		storage:   s3,
-		queueName: events.QueueForStage(stage.Name()),
+		stage:          stage,
+		queue:          q,
+		db:             database,
+		storage:        s3,
+		queueName:      events.QueueForStage(stage.Name()),
+		pollWait:       cfg.QueuePollInterval,
+		maxDeliveries:  cfg.QueueMaxDeliveries,
+		leaseExtension: cfg.QueueVisibilityTimeout,
 	}
 }
 
 // Run consumes until ctx is cancelled.
 func (r *Runner) Run(ctx context.Context) error {
-	log.Printf("worker[%s] consuming %s", r.stage.Name(), r.queueName)
+	log.Printf("worker[%s] consuming %s (max %d deliveries, %s lease)",
+		r.stage.Name(), r.queueName, r.maxDeliveries, r.leaseExtension)
 
 	backoff := initialReceiveBackoff
 
@@ -97,7 +142,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			return nil
 		}
 
-		msgs, err := r.queue.Receive(ctx, r.queueName)
+		msgs, err := r.queue.Receive(ctx, r.queueName, receiveMax, r.pollWait)
 		if err != nil {
 			// A cancelled context surfaces here as a receive error; that is a
 			// clean shutdown, not a failure.
@@ -106,14 +151,10 @@ func (r *Runner) Run(ctx context.Context) error {
 				return nil
 			}
 
-			// Back off before retrying. A successful receive blocks for the
-			// long-poll duration, but a failing one returns immediately, so
-			// looping straight back round turns any persistent error — bad
-			// credentials, a throttle, a deleted queue — into a hot loop
-			// issuing SQS calls as fast as the network allows. That is billed
-			// per request and would also flood CloudWatch. The backoff grows
-			// to a ceiling so a long outage stays cheap while a blip still
-			// recovers quickly.
+			// Back off before retrying, so a persistent broker error stays cheap
+			// while a blip still recovers quickly. The backoff grows to a
+			// ceiling rather than without bound: an outage that ends must not
+			// leave the pipeline idle for an hour afterwards.
 			log.Printf("worker[%s] receive (retry in %s): %v", r.stage.Name(), backoff, err)
 			select {
 			case <-ctx.Done():
@@ -137,22 +178,48 @@ func (r *Runner) Run(ctx context.Context) error {
 
 // handle processes one message and decides its fate on the queue.
 //
-// Deleting the message is what marks it done. Anything left undeleted becomes
-// visible again when the visibility timeout expires, which is precisely how
-// transient failures get retried — so the early returns below that skip the
-// delete are deliberate, not oversights.
+// Acking the message is what marks it done. Anything left un-acked becomes
+// claimable again when the lease expires, which is precisely how transient
+// failures get retried — so the early returns below that skip the ack are
+// deliberate, not oversights. The delivery-budget check at the top is what stops
+// those paths retrying forever: a message that keeps coming back eventually
+// arrives with its budget spent and is dead-lettered before any work is done.
 func (r *Runner) handle(ctx context.Context, m queue.Message) {
 	stageName := r.stage.Name()
 
-	msg, err := events.NormalizeMessage([]byte(m.Body), stageName, m.ReceiveCount)
-	if err != nil {
-		// An unparseable message will never parse. Retrying it three times to
-		// reach the DLQ tells us nothing extra, and with the S3 suffix filter
-		// removed this is the expected fate of any stray object written to the
-		// raw bucket.
-		log.Printf("worker[%s] discarding unusable message: %v", stageName, err)
-		r.delete(ctx, m)
+	msg := m.Stage
+	if msg == nil {
+		// The broker decodes the payload before handing the envelope over, so
+		// this cannot happen with the SQLite driver. It is guarded anyway
+		// because Queue is an interface: a driver that returned an empty
+		// envelope would otherwise take the whole worker down on a nil deref.
+		log.Printf("worker[%s] discarding message %d with no payload", stageName, m.ID)
+		r.deadLetter(ctx, m, "message carried no stage payload")
 		return
+	}
+
+	// Redrive used to belong to the queue: SQS moved a message to the DLQ once
+	// its receive count passed the redrive policy's maxReceiveCount, and the
+	// runner never had to think about it. The SQLite broker deliberately does
+	// not do that — only the worker knows whether a failure is worth another
+	// attempt — so the budget is enforced here instead.
+	//
+	// The check runs on pickup rather than only on failure because most of the
+	// ways this stage gives up do not go through fail() at all: a failed
+	// SetStageRunning, a failed Finalize, a worker killed mid-stage. Those
+	// simply let the lease expire, and without this they would retry forever.
+	if m.ReceiveCount > r.maxDeliveries {
+		log.Printf("worker[%s] job=%s delivery %d exceeds the budget of %d, dead-lettering",
+			stageName, msg.JobID, m.ReceiveCount, r.maxDeliveries)
+		r.giveUp(ctx, m, msg.JobID, fmt.Sprintf(
+			"exceeded %d deliveries without completing stage %s", r.maxDeliveries, stageName))
+		return
+	}
+
+	// The delivery count is the attempt number, not whatever the producer wrote
+	// in the body: the producer only ever knows about its own first attempt.
+	if m.ReceiveCount > 0 {
+		msg.Attempt = m.ReceiveCount
 	}
 
 	log.Printf("worker[%s] job=%s attempt=%d key=%s", stageName, msg.JobID, msg.Attempt, msg.Input.Key)
@@ -185,7 +252,7 @@ func (r *Runner) handle(ctx context.Context, m queue.Message) {
 		}
 		if alreadyDone {
 			log.Printf("worker[%s] job=%s already completed, dropping duplicate", stageName, msg.JobID)
-			r.delete(ctx, m)
+			r.ack(ctx, m, msg)
 			return
 		}
 		log.Printf("worker[%s] job=%s output exists but stage unrecorded, resuming", stageName, msg.JobID)
@@ -200,11 +267,11 @@ func (r *Runner) handle(ctx context.Context, m queue.Message) {
 	}
 
 	if !done {
-		// Keep the message invisible for as long as the work actually takes.
-		// Without this, a stage slower than the queue's visibility timeout gets
-		// its message redelivered mid-flight and a second worker starts the same
-		// job. The idempotency guard above cannot catch that: it asks whether the
-		// output exists, and the output does not exist until Process returns.
+		// Keep the lease alive for as long as the work actually takes. Without
+		// this, a stage slower than the visibility timeout has its message
+		// re-claimed mid-flight and a second worker starts the same job. The
+		// idempotency guard above cannot catch that: it asks whether the output
+		// exists, and the output does not exist until Process returns.
 		stopHeartbeat := r.heartbeat(ctx, m)
 		started := time.Now()
 		outputKey, err = r.stage.Process(ctx, msg)
@@ -232,7 +299,7 @@ func (r *Runner) handle(ctx context.Context, m queue.Message) {
 	// order would let a job claim completion while its own stage still said
 	// running — permanently, if the process died in between.
 	//
-	// Not deleting the message on failure is deliberate: a job whose final state
+	// Not acking the message on failure is deliberate: a job whose final state
 	// was never recorded should be retried, and the idempotency guard makes the
 	// retry cheap.
 	if f, ok := r.stage.(Finalizer); ok {
@@ -249,30 +316,31 @@ func (r *Runner) handle(ctx context.Context, m queue.Message) {
 		return
 	}
 
-	r.delete(ctx, m)
+	r.ack(ctx, m, msg)
 	log.Printf("worker[%s] job=%s done output=%s", stageName, msg.JobID, outputKey)
 }
 
-// heartbeat keeps a message invisible while Process runs, and returns a function
-// that stops it. The returned stop is safe to call exactly once, and callers
-// must call it — leaving the goroutine running would keep extending a message
-// that is already finished.
-//
-// Extending on a ticker rather than setting one long timeout up front is what
-// makes a crashed worker recover quickly: heartbeats stop the moment the process
-// dies, so the message becomes visible again after one interval instead of after
-// the full extension.
+// heartbeat keeps a message's lease alive while Process runs, and returns a
+// function that stops it. The returned stop is safe to call exactly once, and
+// callers must call it — leaving the goroutine running would keep extending a
+// message that is already finished.
 func (r *Runner) heartbeat(ctx context.Context, m queue.Message) func() {
 	return heartbeatLoop(ctx, heartbeatInterval, func() {
 		// Deliberately uses ctx, not the loop's own context: this call must not
 		// be cancelled by the stop that happens the instant Process returns.
-		if err := r.queue.ExtendVisibility(
-			ctx, r.queueName, m.ReceiptHandle, heartbeatVisibilitySeconds,
-		); err != nil {
-			// Not fatal on its own. The message may simply have been deleted
-			// already, and if the extension genuinely failed the worst case is a
-			// redelivery the idempotency guard handles.
-			log.Printf("worker[%s] heartbeat: %v", r.stage.Name(), err)
+		err := r.queue.Heartbeat(ctx, m, r.leaseExtension)
+		switch {
+		case errors.Is(err, queue.ErrLeaseLost):
+			// The lease is already gone, so another worker owns this message and
+			// is redoing the job. Nothing here can reclaim it; the ack at the end
+			// of the stage will report the same thing. Logged separately because
+			// it means the heartbeat was too slow, which is a tuning problem and
+			// not a queue fault.
+			log.Printf("worker[%s] msg=%d heartbeat: lease already lost", r.stage.Name(), m.ID)
+		case err != nil:
+			// Not fatal on its own: if the extension genuinely failed the worst
+			// case is a redelivery the idempotency guard handles.
+			log.Printf("worker[%s] msg=%d heartbeat: %v", r.stage.Name(), m.ID, err)
 		}
 	})
 }
@@ -280,9 +348,9 @@ func (r *Runner) heartbeat(ctx context.Context, m queue.Message) func() {
 // heartbeatLoop calls beat every interval until the returned stop is called.
 //
 // Split from the queue call so the lifecycle — which is the part with the
-// concurrency bugs in it — can be tested without an SQS client. stop blocks
-// until the goroutine has exited, so no beat can land after Process has
-// returned and the message has been deleted.
+// concurrency bugs in it — can be tested without a broker. stop blocks until the
+// goroutine has exited, so no beat can land after Process has returned and the
+// message has been acked.
 func heartbeatLoop(ctx context.Context, interval time.Duration, beat func()) func() {
 	beatCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
@@ -332,28 +400,111 @@ func (r *Runner) stageAlreadyCompleted(ctx context.Context, jobID string) (bool,
 	return state.Status == models.StageStatusCompleted, nil
 }
 
+// retryAction is what the runner does with the message behind a failed stage.
+type retryAction int
+
+const (
+	// retryLater releases the lease so the message comes back after a backoff.
+	retryLater retryAction = iota
+
+	// giveUp records the failure and parks the message on the DLQ.
+	giveUp
+)
+
+// retryActionFor applies the retry policy to one failure.
+//
+// It is a pure function, separate from the queue calls, because it is the part
+// of the port that is easy to get wrong and impossible to notice: an off-by-one
+// here either burns a delivery that should have retried or retries a video that
+// can never succeed, and neither shows up as an error anywhere.
+//
+// The permanent-versus-transient split now chooses between two queue operations,
+// where under SQS it chose between deleting the message and doing nothing:
+//
+//   - Permanent — a corrupt file, a disallowed codec — cannot succeed on retry,
+//     so it gives up regardless of how many deliveries are left. The remaining
+//     attempts would fail identically and land on the DLQ anyway, several
+//     visibility timeouts later, carrying nothing the first attempt did not.
+//   - Transient — a throttle, a network blip, a restarting dependency — retries
+//     until the delivery budget is spent. Giving up on the last delivery of the
+//     budget rather than nacking one more time is deliberate: that extra
+//     delivery would be rejected on sight by the budget check in handle, so it
+//     would cost a redelivery and lose the failure that is actually worth
+//     reading off the DLQ.
+func retryActionFor(err error, receiveCount, maxDeliveries int) retryAction {
+	if IsPermanent(err) {
+		return giveUp
+	}
+	if receiveCount >= maxDeliveries {
+		return giveUp
+	}
+	return retryLater
+}
+
 // fail records a stage failure and decides whether the message should retry.
 func (r *Runner) fail(ctx context.Context, m queue.Message, msg *events.StageMessage, err error) {
 	stageName := r.stage.Name()
 
-	if !IsPermanent(err) {
-		// Transient: leave the message alone so SQS redelivers it after the
-		// visibility timeout. The stage stays "running" in DynamoDB, which is
-		// accurate — it will be retried.
-		log.Printf("worker[%s] job=%s transient failure, will retry: %v", stageName, msg.JobID, err)
+	if retryActionFor(err, m.ReceiveCount, r.maxDeliveries) == retryLater {
+		// The stage stays "running" in DynamoDB, which is accurate — it will be
+		// retried.
+		backoff := nackBackoff(m.ReceiveCount)
+		log.Printf("worker[%s] job=%s transient failure on delivery %d of %d, retry in %s: %v",
+			stageName, msg.JobID, m.ReceiveCount, r.maxDeliveries, backoff, err)
+		r.nack(ctx, m, backoff)
 		return
 	}
 
-	log.Printf("worker[%s] job=%s permanent failure: %v", stageName, msg.JobID, err)
+	if IsPermanent(err) {
+		log.Printf("worker[%s] job=%s permanent failure: %v", stageName, msg.JobID, err)
+	} else {
+		log.Printf("worker[%s] job=%s transient failure exhausted %d deliveries: %v",
+			stageName, msg.JobID, r.maxDeliveries, err)
+	}
+	r.giveUp(ctx, m, msg.JobID, err.Error())
+}
 
-	if dbErr := r.db.SetStageFailed(ctx, msg.JobID, stageName, err.Error()); dbErr != nil {
-		// Could not record the failure. Retry rather than delete, otherwise the
-		// job is stuck "running" forever with nothing left to move it.
-		log.Printf("worker[%s] job=%s mark failed: %v", stageName, msg.JobID, dbErr)
-		return
+// giveUp records the stage as failed and dead-letters the message.
+//
+// The database write comes first, and its failure changes the outcome: a job
+// left "running" with its message on the DLQ is a job nothing will ever move
+// again, and the recorded stage state is the only way the API can tell the
+// client it is over. So a failed write nacks instead — the message comes back,
+// this runs again, and DynamoDB may well be answering by then. It cannot loop
+// forever: the delivery budget check in handle dead-letters the message on
+// sight once the budget is spent, having made one last attempt to record it.
+func (r *Runner) giveUp(ctx context.Context, m queue.Message, jobID, reason string) {
+	stageName := r.stage.Name()
+
+	if err := r.db.SetStageFailed(ctx, jobID, stageName, reason); err != nil {
+		log.Printf("worker[%s] job=%s mark failed: %v", stageName, jobID, err)
+		if m.ReceiveCount <= r.maxDeliveries {
+			r.nack(ctx, m, nackBackoff(m.ReceiveCount))
+			return
+		}
+		// Out of deliveries. The message has to leave the queue even though the
+		// job's own state is now wrong, because the alternative is redelivering
+		// it forever.
+		log.Printf("worker[%s] job=%s dead-lettering with the stage still marked running",
+			stageName, jobID)
 	}
 
-	r.delete(ctx, m)
+	r.deadLetter(ctx, m, reason)
+}
+
+// nackBackoff doubles the delay with each delivery, to a ceiling.
+func nackBackoff(receiveCount int) time.Duration {
+	backoff := initialNackBackoff
+	for i := 1; i < receiveCount; i++ {
+		if backoff >= maxNackBackoff {
+			return maxNackBackoff
+		}
+		backoff *= 2
+	}
+	if backoff > maxNackBackoff {
+		return maxNackBackoff
+	}
+	return backoff
 }
 
 func (r *Runner) publishNext(ctx context.Context, msg *events.StageMessage, outputKey string) error {
@@ -367,19 +518,67 @@ func (r *Runner) publishNext(ctx context.Context, msg *events.StageMessage, outp
 		return errors.New("next stage has no queue")
 	}
 
-	return r.queue.Publish(ctx, nextQueue, events.NewStageMessage(
+	return r.queue.Send(ctx, nextQueue, events.NewStageMessage(
 		msg.JobID,
 		next,
 		events.S3Ref{Bucket: r.stage.OutputBucket(), Key: outputKey},
 		1, // attempt resets for the next stage
 		msg.TraceID,
-	))
+	), 0)
 }
 
-func (r *Runner) delete(ctx context.Context, m queue.Message) {
-	if err := r.queue.Delete(ctx, r.queueName, m.ReceiptHandle); err != nil {
-		// The work is done; a failed delete just means one redelivery, which
-		// the idempotency guard absorbs.
-		log.Printf("worker[%s] delete message: %v", r.stage.Name(), err)
+// ack marks the message done.
+//
+// Ack is not the fire-and-forget that SQS DeleteMessage was: it matches on the
+// receipt, so a worker whose lease expired mid-stage cannot delete a message
+// another worker now owns, and gets ErrLeaseLost instead. That is not a stage
+// failure — the output is written and the job state is recorded — but the other
+// worker is redoing (or has redone) the same job, so it is worth seeing rather
+// than swallowing. There is nothing to retry: the message is no longer ours.
+func (r *Runner) ack(ctx context.Context, m queue.Message, msg *events.StageMessage) {
+	jobID := "?"
+	if msg != nil {
+		jobID = msg.JobID
+	}
+
+	err := r.queue.Ack(ctx, m)
+	switch {
+	case errors.Is(err, queue.ErrLeaseLost):
+		log.Printf("worker[%s] job=%s msg=%d lease lost before ack: this stage ran longer "+
+			"than the lease and another worker has claimed the message; its work is the one that counts",
+			r.stage.Name(), jobID, m.ID)
+	case err != nil:
+		// The work is done; a failed ack just means one redelivery, which the
+		// idempotency guard absorbs.
+		log.Printf("worker[%s] job=%s ack message %d: %v", r.stage.Name(), jobID, m.ID, err)
+	}
+}
+
+// nack releases the lease early so the message is redelivered after backoff,
+// rather than after the whole visibility timeout.
+func (r *Runner) nack(ctx context.Context, m queue.Message, backoff time.Duration) {
+	err := r.queue.Nack(ctx, m, backoff)
+	switch {
+	case errors.Is(err, queue.ErrLeaseLost):
+		log.Printf("worker[%s] msg=%d lease lost before nack; another worker is already retrying it",
+			r.stage.Name(), m.ID)
+	case err != nil:
+		// Harmless in isolation: the lease expires on its own and the message
+		// comes back anyway, just later than the backoff asked for.
+		log.Printf("worker[%s] nack message %d: %v", r.stage.Name(), m.ID, err)
+	}
+}
+
+// deadLetter parks a message on the DLQ with the reason it got there.
+func (r *Runner) deadLetter(ctx context.Context, m queue.Message, reason string) {
+	err := r.queue.DeadLetter(ctx, m, reason)
+	switch {
+	case errors.Is(err, queue.ErrLeaseLost):
+		log.Printf("worker[%s] msg=%d lease lost before dead-letter; another worker owns it now",
+			r.stage.Name(), m.ID)
+	case err != nil:
+		// The message stays on its own queue and will be delivered again, where
+		// the budget check rejects it on sight and tries this again.
+		log.Printf("worker[%s] dead-letter message %d: %v", r.stage.Name(), m.ID, err)
 	}
 }

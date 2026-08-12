@@ -6,8 +6,10 @@ package main
 import (
 	"context"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/anshumanagarwal/dayreel/internal/config"
@@ -47,24 +49,63 @@ func main() {
 		log.Fatalf("create dynamodb client: %v", err)
 	}
 
-	queueClient, err := queue.New(ctx, cfg)
+	// The same queue database the API writes to, and the same one every other
+	// stage runner opens. Nothing coordinates them in this process: SQLite's own
+	// write lock is what makes a claim safe across processes, which is why the
+	// four stages can be four separate binaries on one box.
+	queueClient, err := openQueue(cfg)
 	if err != nil {
-		log.Fatalf("create sqs client: %v", err)
+		log.Fatalf("open queue: %v", err)
 	}
+	defer func() {
+		if err := queueClient.Close(); err != nil {
+			log.Printf("worker[%s] close queue: %v", stageName, err)
+		}
+	}()
 
 	stage, err := buildStage(stageName, cfg, s3Client, dbClient)
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
 
-	log.Printf("worker starting: stage=%s localstack=%v endpoint=%s",
-		stageName, cfg.UseLocalStack, cfg.AWSEndpoint)
+	log.Printf("worker starting: stage=%s region=%s queue=%s",
+		stageName, cfg.AWSRegion, cfg.QueueDBPath)
 
-	if err := worker.NewRunner(stage, queueClient, dbClient, s3Client).Run(ctx); err != nil {
+	if err := worker.NewRunner(stage, queueClient, dbClient, s3Client, cfg).Run(ctx); err != nil {
 		log.Fatalf("worker: %v", err)
 	}
 
 	log.Println("worker exited")
+}
+
+// openQueue creates the queue database directory and opens the broker, wrapped
+// in structured logging.
+//
+// Duplicated from cmd/api rather than shared: the two binaries are deployed
+// independently and the only thing they must agree on is the configuration,
+// which they already read from the same place.
+func openQueue(cfg *config.Config) (queue.Queue, error) {
+	// SQLite will not create missing parent directories. A worker started before
+	// the API on a fresh checkout would otherwise fail on a path that is only
+	// missing its directory.
+	if dir := filepath.Dir(cfg.QueueDBPath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, err
+		}
+	}
+
+	q, err := queue.Open(queue.Options{
+		Path:              cfg.QueueDBPath,
+		VisibilityTimeout: cfg.QueueVisibilityTimeout,
+		MaxDeliveries:     cfg.QueueMaxDeliveries,
+		PollInterval:      cfg.QueuePollInterval,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	return queue.WithLogging(q, logger), nil
 }
 
 // buildStage maps a stage name to its implementation. Stages 4A-6A land here.
