@@ -14,7 +14,7 @@ _Exact services, modules, or directories this stage touches._
 | Component | Action |
 |-----------|--------|
 | `backend/cmd/api/` | Create |
-| `infra/docker-compose.yml` | Modify |
+| `backend/internal/queue/` | Modify |
 
 ## Boundaries
 
@@ -43,7 +43,7 @@ Content-Type: application/json
 }
 ```
 
-### SQS Message (if applicable)
+### Queue Message (if applicable)
 
 ```json
 {
@@ -91,18 +91,18 @@ _Files to create or modify, with brief description._
 |------|--------|---------|
 | `backend/internal/api/handlers.go` | Create | HTTP handlers |
 | `backend/internal/models/job.go` | Create | Job struct and DynamoDB ops |
-| `infra/docker-compose.yml` | Modify | Add API service |
+| `Makefile` | Modify | Add a target to run it |
 
 ## Tasks
 
 _Ordered implementation steps. Check off as you complete._
 
-1. [ ] Define DynamoDB table schema in `init-aws.sh`
+1. [ ] Confirm the DynamoDB table schema covers the access pattern
 2. [ ] Create Job model with marshal/unmarshal
 3. [ ] Implement CreateJob handler
 4. [ ] Implement GetJob handler
 5. [ ] Wire up routes in main.go
-6. [ ] Add API service to docker-compose.yml
+6. [ ] Add a Makefile target
 7. [ ] Write integration test
 
 ## Test
@@ -110,8 +110,8 @@ _Ordered implementation steps. Check off as you complete._
 _The specific test that proves this stage works._
 
 ```bash
-# Start services
-docker-compose up -d
+# Start the API
+make api
 
 # Create a job
 JOB_ID=$(curl -s -X POST localhost:8080/jobs \
@@ -129,7 +129,7 @@ curl -s localhost:8080/jobs/$JOB_ID | jq .
 
 _What you can observe to confirm the stage works. Be specific._
 
-- [ ] `docker-compose up` starts without errors
+- [ ] `make api` starts without errors
 - [ ] `curl POST /jobs` returns 201 with job_id and presigned URLs
 - [ ] `curl GET /jobs/{id}` returns the job with pending status
 - [ ] DynamoDB scan shows the job item

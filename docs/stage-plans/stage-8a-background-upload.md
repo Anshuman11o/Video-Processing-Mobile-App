@@ -9,6 +9,13 @@
 > built. This plan is therefore written to be **revisited after Stage 7 lands**,
 > and the [WAIT] markers below record exactly what each item is waiting on.
 
+> **Substrate superseded.** Docker Compose, LocalStack, SQS and Redis are gone;
+> S3 and DynamoDB are real AWS and the queue is a local SQLite file. See
+> `infra/CONTEXT.md`. Nothing in this stage depended on the emulator except the
+> endpoints it uploads to — which is one more reason to revisit the [WAIT]
+> items after Stage 7, since the host-binding problem they inherit from Stage 7
+> no longer exists.
+
 ## Aim
 
 Make an upload survive the app being killed. Pick a clip, start uploading, force

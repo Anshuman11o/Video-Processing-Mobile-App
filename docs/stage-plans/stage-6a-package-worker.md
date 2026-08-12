@@ -5,6 +5,18 @@
 > locally only, with the real-AWS access model left as an explicit open
 > question rather than decided here.
 
+> **Substrate superseded, and [DECIDE 4] is now decided.** This plan was written
+> and verified against Docker Compose, LocalStack, SQS and Redis. All four are
+> gone: S3 and DynamoDB are real AWS, the queue is a local SQLite file
+> (`stage-3b-local-queue.md`), the status cache is in-process, and the worker
+> runs as `make worker STAGE=package`. The HLS ladder, segmenting and playlist
+> work below are unchanged and still current. See `infra/CONTEXT.md`.
+>
+> The deferred access question resolved itself when the emulator went: the HLS
+> bucket is a real bucket that must be readable by the player, with no CDN in
+> front of it, and the player URL comes from `HLS_BASE_URL`. `S3_PUBLIC_ENDPOINT`
+> stays only for the case where a proxy sits in front of S3.
+
 ## Aim
 
 Consume `dayreel-package`, transcode `validated.mp4` into an HLS ladder with a

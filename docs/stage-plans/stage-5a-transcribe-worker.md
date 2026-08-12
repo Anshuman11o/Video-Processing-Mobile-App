@@ -5,6 +5,20 @@
 > against the recommendation, and those are the interesting ones: whisper.cpp
 > over a sidecar, and a runtime-downloaded model over a baked one.
 
+> **Substrate superseded.** This plan was written and verified against Docker
+> Compose, LocalStack, SQS and Redis. All four are gone: S3 and DynamoDB are
+> real AWS, the queue is a local SQLite file (`stage-3b-local-queue.md`), the
+> status cache is in-process, and the worker runs as
+> `make worker STAGE=transcribe`. The stage logic below is unchanged and still
+> current. See `infra/CONTEXT.md`.
+>
+> One consequence for this stage specifically: the runtime-downloaded model was
+> held in a named Docker volume so it survived rebuilds. There are no containers
+> now, so `WHISPER_MODEL_PATH` is simply a path on the machine running the
+> worker (`./models/`, gitignored). The reason for not baking the model in is
+> unchanged — it is hundreds of megabytes — but the image ceiling that framed
+> the decision no longer exists.
+
 ## Aim
 
 Consume `dayreel-transcribe`, turn the extracted audio into timed text with

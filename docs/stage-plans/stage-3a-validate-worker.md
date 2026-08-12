@@ -3,6 +3,17 @@
 > Status: **approved — ready to implement.** Decisions settled 2026-08-12; the
 > four **[DECIDE]** items below now record the choice that was made and why.
 
+> **Substrate superseded.** This plan was written and verified against Docker
+> Compose, LocalStack, SQS and Redis. All four are gone: S3 and DynamoDB are
+> real AWS, the queue is a local SQLite file (`stage-3b-local-queue.md`), the
+> status cache is in-process, and the worker runs as `make worker STAGE=validate`.
+> The stage logic below is unchanged and still current — read the
+> `--endpoint-url`, `docker compose` and SQS references as a record of how it
+> was run at the time. See `infra/CONTEXT.md`.
+>
+> The 10-second cache staleness noted below still applies; it is now the API's
+> in-process TTL cache rather than Redis.
+
 ## Aim
 
 Stand up the first pipeline worker: consume from `dayreel-validate`, probe the

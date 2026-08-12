@@ -1,5 +1,10 @@
 # Stage 2B: Mobile Shell (React Native)
 
+> **Substrate superseded in one place.** The app work below is current. The
+> sample `hls_url` in the mock data points at the old emulator endpoint; reels
+> now come from the HLS bucket on real S3 (`HLS_BASE_URL`), with no CDN in
+> front. See `infra/CONTEXT.md`.
+
 > **Run in parallel with:** Stage 2A (Go API)
 > **Depends on:** Stage 1B (Infrastructure running for eventual testing)
 > **Estimated time:** 30 minutes

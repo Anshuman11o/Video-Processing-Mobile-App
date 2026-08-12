@@ -4,6 +4,20 @@
 > Written 2026-08-12, immediately after 6A landed and the pipeline first
 > produced a playable reel.
 
+> **Substrate superseded — re-read the open decisions against this.** The plan
+> assumes Docker Compose, LocalStack, SQS and Redis. All four are gone: S3 and
+> DynamoDB are real AWS, the queue is a local SQLite file
+> (`stage-3b-local-queue.md`), and the status cache is in-process. See
+> `infra/CONTEXT.md`.
+>
+> This matters more here than in the worker stages, because several open items
+> are *about* the emulator. Presigned-URL host binding — SigV4 covering the
+> `Host` header, the emulator's in-cluster hostname being unreachable from a
+> device, `S3_PUBLIC_ENDPOINT=http://10.0.2.2:4566` for the Android emulator —
+> is no longer a problem to solve: real S3 signs and serves on the same public
+> endpoint from every client. The multipart 5 MiB floor, ETag persistence and
+> resume semantics are unaffected and remain the substance of the stage.
+
 ## Aim
 
 Make the React Native app upload a real video to the real backend, watch the
