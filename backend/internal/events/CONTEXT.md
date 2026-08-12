@@ -1,15 +1,19 @@
 # Events Package
 
-This package contains SQS message types and AWS resource constants for the DayReel video processing pipeline.
+This package contains stage message types and resource constants for the DayReel video processing pipeline.
 
 ## Overview
 
 The events package defines:
 
-- **StageMessage**: The message format sent between SQS queues to trigger processing stages
+- **StageMessage**: The message format sent between queues to trigger processing stages
 - **S3Ref**: Reference to an S3 object (bucket + key)
-- **Queue constants**: SQS queue names for each processing stage
+- **Queue constants**: queue names for each processing stage
 - **Bucket constants**: S3 bucket names for different storage tiers
+
+The transport is the local SQLite queue in `backend/internal/queue/`, not SQS.
+The queue names below are values of its `queue` column, not AWS resources, and a
+`StageMessage` is stored as an opaque JSON body.
 
 ## Queue Names
 

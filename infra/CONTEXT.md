@@ -1,154 +1,89 @@
 # DayReel Infrastructure
 
-This directory contains the local development infrastructure configuration for the DayReel video processing application.
+**This directory is currently empty apart from this file.** It is a placeholder
+for the Terraform stage (`infra/terraform/`, Stage 10). Nothing in the local
+development loop lives here any more.
 
-## Overview
+## What used to be here, and why it's gone
 
-The local development environment uses Docker Compose to run:
+| Removed | Replaced by |
+|---------|-------------|
+| `docker-compose.yml` | Nothing — the API and worker run as plain `go run` processes |
+| `localstack/init-aws.sh` | Nothing — S3 and DynamoDB are real AWS, created once by hand |
 
-- **LocalStack** (v3.0) - AWS service emulator providing S3, SQS, and DynamoDB
-- **Redis** (v7 Alpine) - In-memory cache for session management and rate limiting
+The project processes a handful of 10–60 second clips. Containers, an AWS
+emulator, and a separate cache server cost 1.5–2.5 GB of RAM and buy nothing at
+that scale. Removing them means the local stack is two Go binaries and a file.
 
-## Architecture
+Component by component:
 
+- **LocalStack** emulated S3, SQS and DynamoDB. S3 and DynamoDB now point at a
+  real AWS account, which is both cheaper in RAM and more honest — LocalStack's
+  behaviour diverges from real S3 in ways that hide bugs (see
+  `TROUBLESHOOTING.md`, the CORS `ExposeHeaders` entry).
+- **SQS** is replaced by a self-hosted SQLite queue at `data/queue.db`,
+  implemented in `backend/internal/queue/`. It keeps the properties the pipeline
+  actually depends on: visibility timeout, at-least-once delivery, delivery
+  counting, and a dead-letter queue. See
+  `docs/stage-plans/stage-3b-local-queue.md`.
+- **Redis** is replaced by an in-process TTL cache inside the Go API. A separate
+  cache server for one map with a 10-second TTL, read by one process, was never
+  worth its own container.
+- **Docker Compose** had nothing left to orchestrate once those three were gone.
+- **CloudFront** and **ECS Fargate** were dropped earlier (commit `bc61001`).
+
+## Local development
+
+There is no infrastructure to start. From the project root:
+
+```bash
+./scripts/dev-setup.sh   # one-time: check toolchain, credentials, resources
+make verify              # confirm AWS credentials, buckets and table
+make api                 # run the API
+make worker              # run the pipeline worker
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Local Development                        │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  ┌─────────────────┐          ┌─────────────────┐          │
-│  │   LocalStack    │          │     Redis       │          │
-│  │   Port: 4566    │          │   Port: 6379    │          │
-│  │                 │          │                 │          │
-│  │  - S3 Buckets   │          │  - Sessions     │          │
-│  │  - SQS Queues   │          │  - Rate Limits  │          │
-│  │  - DynamoDB     │          │  - Cache        │          │
-│  └─────────────────┘          └─────────────────┘          │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
 
-## AWS Resources (LocalStack)
+## AWS resources (real account)
+
+These are created once per account, by hand or by Terraform later. They are not
+recreated on every start, so there is no init script.
 
 ### S3 Buckets
 
 | Bucket | Purpose |
 |--------|---------|
-| `dayreel-raw-uploads` | Raw video uploads from mobile clients |
-| `dayreel-processed-videos` | Processed/compiled videos |
-| `dayreel-thumbnails` | Video thumbnail images |
+| `dayreel-raw-videos` | Original uploads from mobile clients |
+| `dayreel-processed` | Intermediate artifacts (frames, audio, transcript) |
+| `dayreel-hls-output` | Final HLS output, served directly to the player |
 
-All buckets have CORS configured for web/mobile access.
+`dayreel-raw-videos` needs CORS for presigned-URL uploads; `dayreel-hls-output`
+needs CORS for player range requests and must be readable by the player, since
+there is no CDN in front of it.
 
-### SQS Queues
-
-| Queue | Purpose | DLQ |
-|-------|---------|-----|
-| `dayreel-video-processing` | Video processing job queue | Yes |
-| `dayreel-notifications` | Push notification delivery | Yes |
-
-Dead Letter Queues (DLQ) capture failed messages after 3 retry attempts.
-
-### DynamoDB Tables
+### DynamoDB Table
 
 | Table | Purpose | Keys |
 |-------|---------|------|
-| `dayreel-videos` | Video metadata and user data | PK/SK with GSI |
+| `dayreel-jobs` | Job state, one item per job | `pk` (partition) + `sk` (sort) |
 
-Single-table design with:
-- Primary Key: `pk` (partition) + `sk` (sort)
-- GSI1: `gsi1pk` + `gsi1sk` for access patterns
+Single-table design; the `stages` map holds per-stage state. DynamoDB is the
+only source of truth.
 
-## Files
+### Queues
 
-| File | Purpose |
-|------|---------|
-| `docker-compose.yml` | Container orchestration |
-| `localstack/init-aws.sh` | AWS resource initialization script |
+Not AWS. The five logical queues (`dayreel-validate`, `dayreel-extract`,
+`dayreel-transcribe`, `dayreel-package`, `dayreel-dlq`) are values of a `queue`
+column in `data/queue.db`.
 
-## Usage
+## Deferred
 
-### Quick Start
+**Terraform.** When it lands it goes in `infra/terraform/` and provisions the
+buckets, the table, and a single small VM running both Go binaries. No compose
+file returns — the VM runs the same `go run`/built binaries, not containers.
 
-```bash
-# From project root
-make dev-up
-```
-
-### Commands
-
-```bash
-# Start infrastructure
-make dev-up
-
-# Stop infrastructure
-make dev-down
-
-# View logs
-make dev-logs
-
-# Reset all data
-make dev-reset
-
-# Test connectivity
-make test-infra
-```
-
-### Manual AWS CLI Commands
-
-```bash
-# List S3 buckets
-aws --endpoint-url=http://localhost:4566 s3 ls
-
-# List SQS queues
-aws --endpoint-url=http://localhost:4566 sqs list-queues
-
-# List DynamoDB tables
-aws --endpoint-url=http://localhost:4566 dynamodb list-tables
-
-# Upload test file
-aws --endpoint-url=http://localhost:4566 s3 cp test.mp4 s3://dayreel-raw-uploads/
-
-# Send test SQS message
-aws --endpoint-url=http://localhost:4566 sqs send-message \
-  --queue-url http://localhost:4566/000000000000/dayreel-video-processing \
-  --message-body '{"test": "message"}'
-```
-
-## Configuration
-
-### Environment Variables
-
-LocalStack uses these defaults:
-- `AWS_ACCESS_KEY_ID=test`
-- `AWS_SECRET_ACCESS_KEY=test`
-- `AWS_DEFAULT_REGION=us-east-1`
-
-### Ports
-
-| Service | Port |
-|---------|------|
-| LocalStack | 4566 |
-| Redis | 6379 |
-
-## Persistence
-
-- LocalStack data persists in a Docker volume (`localstack-data`)
-- Use `make dev-reset` to clear all data
-
-## Troubleshooting
-
-### LocalStack not starting
-1. Check Docker is running: `docker info`
-2. Check port 4566 is free: `lsof -i :4566`
-3. View logs: `make dev-logs`
-
-### Redis connection refused
-1. Check container status: `docker ps`
-2. Check port 6379 is free: `lsof -i :6379`
-
-### AWS CLI errors
-Ensure you're using the LocalStack endpoint:
-```bash
-aws --endpoint-url=http://localhost:4566 <command>
-```
+**S3 event notifications.** LocalStack's init script wired
+`s3:ObjectCreated:*` → validate queue so uploads started the pipeline without
+API involvement. Real S3 cannot notify a SQLite file. The API now enqueues the
+validate message itself on `POST /jobs/{id}/complete`, which it was already
+positioned to do. Reinstating event-driven start needs a real broker and is
+deferred with the rest of the AWS deployment.
