@@ -634,12 +634,22 @@ earlier — left them 21.3 ms early.
 
 #### ExoPlayer, measured — 8B, 2026-08-13. It does NOT agree.
 
-**`+66.8 ms late` (boundary `3.0668 s` ± 1.2 ms against an authored `3.000`).**
+**`+66.8 ms late`, on two boundaries independently:**
 
-| Player | Anchor it behaves as if it used | Offset at the same cue |
+| Authored | ExoPlayer reports | Offset |
+|---|---|---|
+| `3.000` | `3.0668 s` ± 1.2 ms | **+66.8 ms** |
+| `6.000` | `6.0668 s` ± 1.2 ms | **+66.8 ms** |
+
+| Player | Anchor it behaves as if it used | Offset |
 |---|---|---|
 | AVFoundation | video start PTS (6000) | **0.333 ms late** |
 | ExoPlayer | zero | **66.8 ms late** |
+
+Two separate bisections, 9 probes each, agreeing to within the probe's
+resolution — so the error is a **constant shift**, not something specific to one
+cue. That matters: a constant is a packaging problem with a single fix, where a
+drifting error would have meant something else entirely.
 
 `6000 / 90000 = 66.667 ms` — the `MPEGTS` value in the header, to within the
 probe's resolution. ExoPlayer behaves as if it **adds** the `MPEGTS` value to
@@ -672,8 +682,9 @@ adb screencap round trips are hundreds of ms and the offsets here are tens.
 **Conditions.** `emulator-5554`, react-native-video v6 / ExoPlayer under RN
 0.87 New Architecture, job `4bd59394-a104-453b-90d0-fdd363ad1dba` — the same
 mock transcript (`3.000 / 6.000 / 9.000`) and the same `MPEGTS:6000` header the
-AVFoundation numbers above were taken against. Bracket `[2.85, 3.15]`, 9 probes,
-converging interior to the bracket rather than onto an edge.
+AVFoundation numbers above were taken against. Brackets `[2.85, 3.15]` and
+`[5.85, 6.15]`, 9 probes each, both converging interior to the bracket rather
+than onto an edge. Video track on **AUTO** both times.
 
 **A measurement defect was found and fixed to get this number, and it is worth
 recording because it is this project's usual shape.** The probe originally read
@@ -686,11 +697,12 @@ opposite way, reporting "no cue change" for a bracket that plainly straddles
 one, while the screen showed the changed cue. The probe now polls until the cue
 actually changes and treats the fixed delay as a cap, not a delay.
 
-**Not established.** One boundary, one run, one device. The `6.000` and `9.000`
-boundaries were not re-measured — the shared emulator was taken by concurrent
-work before that check ran — so "constant shift across all cues" is **ASSUMED**
-for ExoPlayer, where AVFoundation had it verified across four cues. Nothing here
-touches a physical device or real AWS.
+**Not established.** Two boundaries, not four: `0.000` cannot be bracketed from
+below, and `9.000` was not run. One device, an emulator, one source. Nothing
+here touches a physical device or real AWS. The **mechanism** remains inferred
+from arithmetic rather than read out of ExoPlayer's `WebvttExtractor`, which is
+enough to record the number and act on it but not enough to predict what a
+different `MPEGTS` value would do without measuring again.
 
 #### Residual, and what is still unknown
 
