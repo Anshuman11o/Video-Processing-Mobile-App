@@ -47,9 +47,12 @@ jest.mock('react-native-blob-util', () => {
 // not a property worth relying on. Stubbing it keeps the day someone writes
 // that test an ordinary day.
 //
-// SelectedTrackType is a real enum in the library and PlayerScreen reads
-// LANGUAGE off it at module scope, so the mock has to supply it or the import
-// crashes before any test body runs.
+// SelectedTrackType and SelectedVideoTrackType are real enums in the library
+// and PlayerScreen reads members off both at module scope, so the mock has to
+// supply them or the import crashes before any test body runs. The values are
+// copied from lib/types/video.d.ts — they are what the native side string-
+// compares against, so a typo here would make a test pass on a selection the
+// player would ignore.
 jest.mock('react-native-video', () => ({
   __esModule: true,
   default: 'Video',
@@ -58,6 +61,12 @@ jest.mock('react-native-video', () => ({
     DISABLED: 'disabled',
     TITLE: 'title',
     LANGUAGE: 'language',
+    INDEX: 'index',
+  },
+  SelectedVideoTrackType: {
+    AUTO: 'auto',
+    DISABLED: 'disabled',
+    RESOLUTION: 'resolution',
     INDEX: 'index',
   },
 }));
