@@ -42,10 +42,12 @@ type Options struct {
 
 	// PublicEndpoint is the base URL a player will use to fetch HLS output.
 	//
-	// This is the same unresolved problem as the presigned-URL finding from 4A:
-	// inside compose the endpoint is http://localstack:4566, which does not
-	// resolve anywhere else. Left as configuration rather than solved here,
-	// because the real-AWS access model is a deliberate open question.
+	// This is the same unresolved problem as the presigned-URL finding from 4A.
+	// Reels are served straight out of the HLS bucket with no CDN in front, so
+	// the host a player must reach — a bucket website endpoint, a custom domain,
+	// eventually a distribution — is a deployment decision. Left as
+	// configuration rather than solved here, because the access model is a
+	// deliberate open question.
 	PublicEndpoint string
 }
 

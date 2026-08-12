@@ -9,7 +9,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -55,61 +54,39 @@ type S3Client struct {
 	presignClient *s3.PresignClient
 	bucket        string
 
-	// presignEndpoint is the host presigned URLs are SIGNED against, when it
-	// differs from the endpoint the API itself talks to.
+	// presignEndpoint is the host presigned URLs are SIGNED against, when that
+	// is not the endpoint the API itself talks to.
 	//
 	// SigV4 covers the Host header, so a presigned URL is only valid for the
-	// exact host it was signed for. The API reaches S3 at an in-cluster address
-	// the client cannot resolve, so signing against that address produces URLs
-	// that are correct, unusable, and fail with SignatureDoesNotMatch the moment
-	// anyone rewrites the host to something reachable.
+	// exact host it was signed for. Signing against a host the device cannot
+	// reach produces URLs that are correct, unusable, and fail with
+	// SignatureDoesNotMatch the moment anyone rewrites the host to something
+	// reachable — which is the stage 7 bug this field exists to prevent.
 	//
-	// Empty means sign against whatever the client is already configured for,
-	// which is the correct behaviour on real AWS.
+	// Empty means sign against whatever the SDK resolves, which is the normal
+	// case on real AWS: the regional S3 endpoint is reachable from the phone as
+	// well as from the server, so nothing needs overriding.
 	presignEndpoint string
 }
 
 // NewS3Client creates a new S3Client configured for the given bucket.
 func NewS3Client(ctx context.Context, cfg *config.Config) (*S3Client, error) {
-	var opts []func(*awsconfig.LoadOptions) error
-
-	opts = append(opts, awsconfig.WithRegion(cfg.AWSRegion))
-
-	if cfg.UseLocalStack && cfg.AWSEndpoint != "" {
-		opts = append(opts,
-			awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
-		)
-	}
-
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+	// Credentials come from the SDK's default chain: environment, shared config
+	// file, or the instance/task role. There is no emulator to special-case any
+	// more, so there are no static test credentials either.
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.AWSRegion))
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
 	}
 
-	var s3Opts []func(*s3.Options)
-	if cfg.UseLocalStack && cfg.AWSEndpoint != "" {
-		s3Opts = append(s3Opts, func(o *s3.Options) {
-			o.BaseEndpoint = aws.String(cfg.AWSEndpoint)
-			o.UsePathStyle = true
-		})
-	}
-
-	client := s3.NewFromConfig(awsCfg, s3Opts...)
+	client := s3.NewFromConfig(awsCfg)
 	presignClient := s3.NewPresignClient(client)
-
-	// Only override when the public endpoint actually differs. On real AWS both
-	// values are empty, nothing is overridden, and the SDK signs the genuine S3
-	// endpoint — so this whole mechanism disappears rather than needing removal.
-	presignEndpoint := cfg.PublicEndpoint()
-	if presignEndpoint == cfg.AWSEndpoint {
-		presignEndpoint = ""
-	}
 
 	return &S3Client{
 		client:          client,
 		presignClient:   presignClient,
 		bucket:          cfg.S3RawBucket,
-		presignEndpoint: presignEndpoint,
+		presignEndpoint: cfg.PublicEndpoint(),
 	}, nil
 }
 
@@ -141,6 +118,20 @@ func (s *S3Client) GeneratePresignedUploadURL(ctx context.Context, key, uploadID
 }
 
 // CompleteMultipartUpload finalizes a multipart upload with the given ETags.
+//
+// It is idempotent, and has to be. POST /jobs/{id}/complete now enqueues the
+// validate stage as well as assembling the object, and a failed enqueue is
+// answered with a 500 the client is expected to retry — see api.CompleteUpload.
+// A retry that arrives after S3 has already assembled the object gets
+// NoSuchUpload, because the upload ID is gone precisely because it succeeded.
+// Reporting that as a failure would strand a video sitting complete in the
+// bucket, so a HeadObject settles it: if the object is there, the upload is
+// done, whatever this call said.
+//
+// The fallback is deliberately narrow. Only NoSuchUpload can mean "already
+// assembled"; every other rejection — InvalidPart, EntityTooSmall, a transport
+// failure — leaves no object behind, and the caller needs the real error to
+// choose between telling the client to restart and telling it to retry.
 func (s *S3Client) CompleteMultipartUpload(ctx context.Context, key, uploadID string, parts []CompletedPart) error {
 	completedParts := make([]types.CompletedPart, len(parts))
 	for i, p := range parts {
@@ -159,6 +150,11 @@ func (s *S3Client) CompleteMultipartUpload(ctx context.Context, key, uploadID st
 		},
 	})
 	if err != nil {
+		if IsNoSuchUpload(err) {
+			if exists, headErr := s.ObjectExists(ctx, s.bucket, key); headErr == nil && exists {
+				return nil
+			}
+		}
 		return fmt.Errorf("complete multipart upload: %w", err)
 	}
 	return nil
@@ -254,10 +250,10 @@ func (s *S3Client) ListMultipartUploads(ctx context.Context, prefix string) ([]I
 // exist: aborted, reaped by a lifecycle rule, or already completed.
 //
 // The generic smithy.APIError is checked as well as the typed error because the
-// typed shape depends on the error body deserializing into it, and LocalStack's
-// error bodies are not always the ones the SDK's shape expects. A resume that
-// cannot tell "gone" from "broken" retries forever against an upload that will
-// never come back.
+// typed shape depends on the error body deserializing into it, which is not
+// guaranteed for every response S3 (or an S3-compatible endpoint) can produce.
+// A resume that cannot tell "gone" from "broken" retries forever against an
+// upload that will never come back.
 func IsNoSuchUpload(err error) bool {
 	var typed *types.NoSuchUpload
 	if errors.As(err, &typed) {
@@ -280,11 +276,10 @@ func IsNoSuchUpload(err error) bool {
 // same request will fail identically forever, and the only recovery is a fresh
 // upload.
 //
-// It is reachable locally in a way it is not on real S3. LocalStack (verified
-// 2026-08-13, this image) sets a part's ETag to the literal string "None" and
-// its size to null when a part number is uploaded a second time, so any retry
-// of a part that had actually landed poisons the upload. Real S3 returns the
-// new ETag and overwrites cleanly.
+// A client that assembles the part list from its own notes is what reaches this:
+// a stale ETag, a part number it never actually uploaded, or parts out of order.
+// It is the reason POST /jobs/{id}/complete derives the list from ListParts when
+// the client does not supply one.
 func IsInvalidPart(err error) bool {
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
@@ -313,8 +308,10 @@ func (s *S3Client) AbortMultipartUpload(ctx context.Context, key, uploadID strin
 // separate public endpoint is configured.
 //
 // The override is applied to the presign call only. The API's own S3 traffic
-// keeps using the in-cluster endpoint, which is both faster and the only address
-// that resolves from inside the compose network.
+// keeps using whatever the SDK resolves, so an override that is wrong breaks
+// client uploads without also breaking the server. On real AWS with
+// S3_PUBLIC_ENDPOINT unset this returns nothing but the expiry, and the SDK
+// signs the genuine regional endpoint.
 func (s *S3Client) presignOptions(expiry time.Duration) []func(*s3.PresignOptions) {
 	opts := []func(*s3.PresignOptions){s3.WithPresignExpires(expiry)}
 
@@ -322,8 +319,9 @@ func (s *S3Client) presignOptions(expiry time.Duration) []func(*s3.PresignOption
 		opts = append(opts, s3.WithPresignClientFromClientOptions(func(o *s3.Options) {
 			o.BaseEndpoint = aws.String(s.presignEndpoint)
 			// Path style keeps the bucket in the path rather than in the
-			// hostname. A virtual-host URL would sign a host that does not
-			// exist locally.
+			// hostname. An overridden endpoint is a specific host that was
+			// configured because it is reachable; prefixing the bucket onto it
+			// invents a hostname that nothing resolves.
 			o.UsePathStyle = true
 		}))
 	}

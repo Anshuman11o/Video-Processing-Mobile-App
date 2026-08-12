@@ -65,8 +65,11 @@ seeking, or overlap in the stages that consume it.
 - **The model is downloaded at runtime**, so `WHISPER_MODEL_PATH` must point into
   a persistent volume. Without the mount it re-downloads on every fresh
   container. A missing model is transient for the same reason.
-- **This stage can outlive the queue's visibility timeout.** `dayreel-transcribe`
-  is created with 900s rather than 300s, and the runner heartbeats visibility
-  while `Process` runs. Neither guard is optional: the idempotency check cannot
-  catch a mid-flight redelivery, because it asks whether the output exists and it
-  does not exist until the work finishes.
+- **This stage can outlive the queue's visibility timeout.** The broker has one
+  timeout for every queue (`QUEUE_VISIBILITY_TIMEOUT`, 5m) rather than a
+  per-queue attribute, so there is nowhere to give this stage a longer lease than
+  the others; the runner's heartbeat, which extends the lease every 30s while
+  `Process` runs, is the only thing keeping a long transcription's message from
+  being re-claimed. It is not optional: the idempotency check cannot catch a
+  mid-flight redelivery, because it asks whether the output exists and it does
+  not exist until the work finishes.

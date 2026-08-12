@@ -9,7 +9,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	ddbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -26,32 +25,16 @@ type DynamoDBClient struct {
 
 // NewDynamoDBClient creates a new DynamoDBClient connected to the configured table.
 func NewDynamoDBClient(ctx context.Context, cfg *config.Config) (*DynamoDBClient, error) {
-	var opts []func(*awsconfig.LoadOptions) error
-
-	opts = append(opts, awsconfig.WithRegion(cfg.AWSRegion))
-
-	if cfg.UseLocalStack && cfg.AWSEndpoint != "" {
-		opts = append(opts,
-			awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
-		)
-	}
-
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+	// Credentials come from the SDK's default chain: environment, shared config
+	// file, or the instance/task role. There is no emulator to special-case any
+	// more, so there are no static test credentials either.
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.AWSRegion))
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
 	}
 
-	var ddbOpts []func(*dynamodb.Options)
-	if cfg.UseLocalStack && cfg.AWSEndpoint != "" {
-		ddbOpts = append(ddbOpts, func(o *dynamodb.Options) {
-			o.BaseEndpoint = aws.String(cfg.AWSEndpoint)
-		})
-	}
-
-	client := dynamodb.NewFromConfig(awsCfg, ddbOpts...)
-
 	return &DynamoDBClient{
-		client: client,
+		client: dynamodb.NewFromConfig(awsCfg),
 		table:  cfg.DynamoDBTable,
 	}, nil
 }
