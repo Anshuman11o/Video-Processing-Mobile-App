@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/anshumanagarwal/dayreel/internal/db"
@@ -19,6 +20,17 @@ const (
 	// be able to spin on a persistent error.
 	initialReceiveBackoff = 1 * time.Second
 	maxReceiveBackoff     = 30 * time.Second
+
+	// heartbeatInterval is how often a running stage extends its message's
+	// visibility, and heartbeatVisibilitySeconds is how far ahead each extension
+	// pushes it.
+	//
+	// The interval is deliberately much shorter than the extension: a heartbeat
+	// that fails or is delayed still leaves several minutes of headroom before
+	// SQS redelivers. The extension is deliberately short enough that a crashed
+	// worker's message returns in minutes rather than being held hostage.
+	heartbeatInterval          = 30 * time.Second
+	heartbeatVisibilitySeconds = 300
 )
 
 // Stage is one step of the pipeline. Implementations do the media work and
@@ -175,7 +187,15 @@ func (r *Runner) handle(ctx context.Context, m queue.Message) {
 	}
 
 	if !done {
+		// Keep the message invisible for as long as the work actually takes.
+		// Without this, a stage slower than the queue's visibility timeout gets
+		// its message redelivered mid-flight and a second worker starts the same
+		// job. The idempotency guard above cannot catch that: it asks whether the
+		// output exists, and the output does not exist until Process returns.
+		stopHeartbeat := r.heartbeat(ctx, m)
 		outputKey, err = r.stage.Process(ctx, msg)
+		stopHeartbeat()
+
 		if err != nil {
 			r.fail(ctx, m, msg, err)
 			return
@@ -196,6 +216,65 @@ func (r *Runner) handle(ctx context.Context, m queue.Message) {
 
 	r.delete(ctx, m)
 	log.Printf("worker[%s] job=%s done output=%s", stageName, msg.JobID, outputKey)
+}
+
+// heartbeat keeps a message invisible while Process runs, and returns a function
+// that stops it. The returned stop is safe to call exactly once, and callers
+// must call it — leaving the goroutine running would keep extending a message
+// that is already finished.
+//
+// Extending on a ticker rather than setting one long timeout up front is what
+// makes a crashed worker recover quickly: heartbeats stop the moment the process
+// dies, so the message becomes visible again after one interval instead of after
+// the full extension.
+func (r *Runner) heartbeat(ctx context.Context, m queue.Message) func() {
+	return heartbeatLoop(ctx, heartbeatInterval, func() {
+		// Deliberately uses ctx, not the loop's own context: this call must not
+		// be cancelled by the stop that happens the instant Process returns.
+		if err := r.queue.ExtendVisibility(
+			ctx, r.queueName, m.ReceiptHandle, heartbeatVisibilitySeconds,
+		); err != nil {
+			// Not fatal on its own. The message may simply have been deleted
+			// already, and if the extension genuinely failed the worst case is a
+			// redelivery the idempotency guard handles.
+			log.Printf("worker[%s] heartbeat: %v", r.stage.Name(), err)
+		}
+	})
+}
+
+// heartbeatLoop calls beat every interval until the returned stop is called.
+//
+// Split from the queue call so the lifecycle — which is the part with the
+// concurrency bugs in it — can be tested without an SQS client. stop blocks
+// until the goroutine has exited, so no beat can land after Process has
+// returned and the message has been deleted.
+func heartbeatLoop(ctx context.Context, interval time.Duration, beat func()) func() {
+	beatCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-beatCtx.Done():
+				return
+			case <-ticker.C:
+				beat()
+			}
+		}
+	}()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			cancel()
+			<-done
+		})
+	}
 }
 
 // stageAlreadyCompleted reports whether this stage is recorded as completed for

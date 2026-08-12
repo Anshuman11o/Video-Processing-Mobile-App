@@ -169,6 +169,30 @@ func (c *Client) Delete(ctx context.Context, queueName, receiptHandle string) er
 	return nil
 }
 
+// ExtendVisibility resets a message's visibility timeout to seconds from now.
+//
+// This is how a worker says "still working" on a job that outlives the queue's
+// configured timeout. Without it, SQS decides the worker died, redelivers the
+// message, and a second worker begins the same job — which the runner's
+// idempotency guard cannot prevent, because that guard asks whether the output
+// exists and the output does not exist until the work finishes.
+func (c *Client) ExtendVisibility(ctx context.Context, queueName, receiptHandle string, seconds int32) error {
+	url, err := c.QueueURL(ctx, queueName)
+	if err != nil {
+		return err
+	}
+
+	_, err = c.sqs.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
+		QueueUrl:          aws.String(url),
+		ReceiptHandle:     aws.String(receiptHandle),
+		VisibilityTimeout: seconds,
+	})
+	if err != nil {
+		return fmt.Errorf("extend visibility on %q: %w", queueName, err)
+	}
+	return nil
+}
+
 // Publish JSON-encodes body and sends it to the named queue.
 func (c *Client) Publish(ctx context.Context, queueName string, body any) error {
 	url, err := c.QueueURL(ctx, queueName)
