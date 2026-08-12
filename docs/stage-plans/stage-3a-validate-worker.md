@@ -1,8 +1,7 @@
 # Stage 3A: Validate Worker
 
-> Status: **draft — needs review before implementation.**
-> Four decisions marked **[DECIDE]** below change the shape of the code and
-> should be settled first.
+> Status: **approved — ready to implement.** Decisions settled 2026-08-12; the
+> four **[DECIDE]** items below now record the choice that was made and why.
 
 ## Aim
 
@@ -27,8 +26,8 @@ the shared scaffolding built here matters more than the validation logic itself.
 | `backend/internal/storage/s3.go` | Modify — add download/upload of whole objects |
 | `backend/Dockerfile.worker` | Create — needs ffmpeg, unlike the API image |
 | `infra/docker-compose.yml` | Modify — add `worker-validate` service |
-| `infra/localstack/init-aws.sh` | Modify — see **[DECIDE 2]** on the `.mp4` filter |
-| `mobile/src/types/api.ts` | Modify — status vocabulary is wrong, see **[DECIDE 4]** |
+| `infra/localstack/init-aws.sh` | Modify — drop the `.mp4` suffix filter (**[DECIDE 2]**) |
+| `mobile/src/types/api.ts` | **Out of scope** — deferred to Stage 7 (**[DECIDE 4]**) |
 
 ## Boundaries
 
@@ -70,23 +69,26 @@ Note the S3 envelope carries no `job_id`, no `trace_id`, no `attempt`. `job_id`
 is recoverable as the first path segment of the key, because the API writes
 `<job_id>/<filename>` (`backend/internal/api/handlers.go:103`).
 
-**[DECIDE 1] — how to reconcile these.**
+**[DECIDE 1] — RESOLVED: normalize both shapes at the edge.**
 
-- **(a) Worker accepts both, normalizes to `StageMessage` at the edge.**
-  *Recommended.* Keeps the S3 notification as the trigger, so there is no
-  dual-write: the API completing the multipart upload *is* the event, and a job
-  cannot be lost if the API crashes right after `CompleteMultipartUpload`. Cost
-  is one `normalizeMessage()` function and a synthesized `trace_id` for
-  S3-triggered work.
-- **(b) Drop the S3 notification; API publishes `StageMessage` on
-  `POST /jobs/{id}/complete`.** Uniform shape everywhere, real `trace_id` from
-  the start. But it introduces a dual-write — S3 complete succeeds, SQS publish
-  fails, job is stranded in `processing` with no retry path.
-- **(c) Both.** Duplicate triggering; needs the idempotency guard below to be
-  airtight. Not worth it yet.
+The S3 notification stays the trigger, and `events.NormalizeMessage(body []byte)
+(*StageMessage, error)` converts either envelope into the canonical shape before
+the runner sees it. It lives in `internal/events`, next to the type it produces,
+so stages 4A–6A never learn that the S3 shape exists.
 
-I recommend **(a)**, and that `normalizeMessage` lives in `internal/events`
-alongside the type it produces, so stages 4A–6A never see the S3 shape.
+Chosen over having the API publish on upload-complete because that would be a
+dual-write: S3 completion succeeds, the SQS publish fails, and the job sits in
+`processing` with no retry path and nothing to alert on. Here the multipart
+completion *is* the event, so an API crash immediately after
+`CompleteMultipartUpload` still results in a processed job.
+
+Costs accepted:
+- `trace_id` is synthesized (a fresh UUID) for S3-triggered work rather than
+  threaded from the API request.
+- `attempt` comes from the SQS `ApproximateReceiveCount`, not the message body.
+- `job_id` is parsed from the key prefix, so a key without a `<uuid>/` prefix is
+  a permanent failure. Worth an explicit error message — this is the seam that
+  breaks first if key layout ever changes.
 
 ### Outbound: `StageMessage` to `dayreel-extract`
 
@@ -151,26 +153,24 @@ and the parent `status` flips to `failed`.
 | `backend/internal/media/ffmpeg.go` | Create | `ffmpeg` exec wrapper with context cancellation |
 | `backend/internal/storage/s3.go` | Modify | `DownloadToFile`, `UploadFile`, `ObjectExists` |
 | `backend/internal/db/dynamodb.go` | Modify | `SetStageRunning`, `SetStageCompleted`, `SetStageFailed` |
-| `backend/internal/events/messages.go` | Modify | `NormalizeMessage` for the S3 envelope (per **[DECIDE 1a]**) |
+| `backend/internal/events/messages.go` | Modify | `NormalizeMessage` for the S3 envelope |
 | `backend/Dockerfile.worker` | Create | ffmpeg-bearing image |
 | `infra/docker-compose.yml` | Modify | `worker-validate` service |
-| `infra/localstack/init-aws.sh` | Modify | Notification filter (**[DECIDE 2]**) |
-| `mobile/src/types/api.ts` | Modify | Align status strings with Go (**[DECIDE 4]**) |
+| `infra/localstack/init-aws.sh` | Modify | Remove the `.mp4` suffix filter |
 
 ## Tasks
 
-1. [ ] Settle the four **[DECIDE]** items
-2. [ ] `internal/queue`: SQS wrapper — long-poll receive (20s), delete, publish
-3. [ ] `internal/storage`: `DownloadToFile`, `UploadFile`, `ObjectExists`
-4. [ ] `internal/db`: per-stage update methods with `attempts` increment
+1. [ ] `internal/queue`: SQS wrapper — long-poll receive (20s), delete, publish
+2. [ ] `internal/storage`: bucket-param refactor + `DownloadToFile`, `UploadFile`, `ObjectExists`
+3. [ ] `internal/db`: per-stage update methods with `attempts` increment
+4. [ ] `internal/events`: `NormalizeMessage` for the S3 envelope
 5. [ ] `internal/media`: `ffprobe` JSON parse + `ffmpeg` exec, both context-aware
 6. [ ] `internal/worker`: `Stage` interface + consume loop with error classification
 7. [ ] `internal/worker/validate`: idempotency check → probe → gate → remux → upload
 8. [ ] `cmd/worker/main.go`: wire it, `WORKER_STAGE=validate`, graceful shutdown
 9. [ ] `Dockerfile.worker` + compose service
-10. [ ] Adjust S3 notification filter per **[DECIDE 2]**
-11. [ ] Fix mobile status vocabulary per **[DECIDE 4]**
-12. [ ] End-to-end test below
+10. [ ] Remove the `.mp4` suffix filter from `init-aws.sh`
+11. [ ] End-to-end test below
 
 ## Implementation Plan
 
@@ -285,7 +285,7 @@ func Permanent(reason string, err error) error   // checked with errors.As
 
 The runner loop, once per message:
 
-1. `events.NormalizeMessage(body)` → `*StageMessage` (see **[DECIDE 1]**).
+1. `events.NormalizeMessage(body)` → `*StageMessage` (**[DECIDE 1]**).
    A parse failure is *permanent* — redelivering unparseable JSON changes nothing.
 2. `db.SetStageRunning` — increments `attempts`.
 3. Idempotency: `ObjectExists(processed, "<job_id>/validated.mp4")`. If present,
@@ -316,7 +316,7 @@ type Limits struct {
 upload to `dayreel-processed/<job_id>/validated.mp4` → return that key.
 
 Every gate rejection returns `Permanent(...)`: no video stream, duration over
-limit, codec outside the allowlist (pending **[DECIDE 3]**). Download and upload
+limit, codec outside the allowlist (**[DECIDE 3]**). Download and upload
 failures stay transient.
 
 ### Step 7 — `cmd/worker/main.go`
@@ -395,26 +395,52 @@ API happily issues presigned URLs for — and the notification never fires. The 
 sits in `processing` forever with no error, no DLQ entry, nothing to alert on.
 This is the failure mode I'd most expect to lose time to later.
 
-Options: **(a)** drop the suffix filter entirely and let ffprobe be the gate —
-validating the file *is* this worker's job, and a non-video simply fails cleanly;
-**(b)** normalize the upload key to `<job_id>/input<ext>` in the API and filter on
-the `<job_id>/input` prefix instead. I lean **(a)** for this stage — it is one
-line and removes a whole class of silent stall — with (b) as a follow-up if we
-want key layout to be predictable for the later stages.
+**RESOLVED: drop the suffix filter entirely; ffprobe is the gate.**
 
-Either way, a job stuck in `processing` with no stage running is invisible today.
-A staleness check is worth its own small stage.
+The `FilterRules` block comes out of the `put-bucket-notification-configuration`
+call in `init-aws.sh`, so *every* `ObjectCreated` on `dayreel-raw-videos` reaches
+the validate queue. Anything that isn't a decodable video now fails loudly with a
+real ffprobe error and a `failed` stage, instead of stalling invisibly.
 
-### [DECIDE 3] — non-h264 input: reject or transcode?
+Chosen over normalizing the key to `<job_id>/input<ext>` because it is a one-line
+infra change that touches no working code, and because gating on content rather
+than filename is what this stage is *for*. Key normalization stays available as a
+follow-up if 4A–6A want predictable layout.
 
-`-c copy` remuxing only works if the codec is already MP4-compatible. For a
-VP9/AV1 input the remux fails. Rejecting is cheap and honest for a stage named
-"validate"; transcoding is correct but turns a ~1s stage into a minute-plus one
-and blows past the 300s visibility timeout for longer clips.
+Consequence to keep in mind: the queue now receives an event for every object
+written to the bucket, so anything else ever written there (debug artifacts,
+manual `aws s3 cp` during testing) will spin up a validate attempt and fail. That
+is noisy but safe — the `<uuid>/` prefix parse in **[DECIDE 1]** rejects it as a
+permanent error and the message is deleted rather than retried.
 
-Recommend: **reject** anything outside an h264/hevc + aac/mp3 allowlist as a
-permanent failure for 3A, and revisit if real inputs demand it. The gate belongs
-in one place so it is easy to loosen later.
+Separately: a job stuck in `processing` with no stage running is still invisible
+today. A staleness check deserves its own small stage.
+
+### [DECIDE 3] — non-h264 input
+
+**RESOLVED: reject via allowlist. No transcoding in 3A.**
+
+```go
+var DefaultLimits = Limits{
+    MaxDuration:        10 * time.Minute,
+    AllowedVideoCodecs: []string{"h264", "hevc"},
+    AllowedAudioCodecs: []string{"aac", "mp3"},
+}
+```
+
+Anything outside the allowlist is a `PermanentError` with the offending codec
+named in the message. This keeps the stage at roughly a second and comfortably
+inside the 300s visibility timeout, so no heartbeat logic is needed yet.
+
+Chosen over transcoding because transcoding turns a ~1s remux into minutes,
+which would force visibility-extension into the runner now rather than when it's
+actually needed. Rejecting is also the honest behavior for a stage named
+"validate".
+
+`MaxDuration` and both allowlists are one struct in one place, so loosening this
+later — or adding a transcode fallback branch in `Process` — does not mean
+restructuring anything. Note `DefaultLimits` values are a starting guess; real
+input may argue for different ones.
 
 ### [DECIDE 4] — status vocabulary drift, and it is already wrong in the app
 
@@ -438,9 +464,24 @@ It typechecks because both sides are string-literal unions that never meet at
 compile time. The `skipped` stage status in the mobile union has no Go
 counterpart either, and `JobStatus` there is missing `pending`.
 
-Recommend: Go stays authoritative, fix `mobile/src/types/api.ts` to match, and
-correct the two docs. Worth doing as part of 3A rather than later — this is
-exactly the bug that gets diagnosed as "the worker isn't updating DynamoDB."
+**RESOLVED: deferred to Stage 7, when the app is actually wired to the API.**
+Go stays authoritative; `mobile/src/types/api.ts` gets corrected then, along with
+the `skipped` value that has no Go counterpart and the missing `pending` in
+`JobStatus`.
+
+The deferral is safe for a specific reason: the mobile client serves mock data
+today and makes no API calls at all, so the mismatch cannot mislead anyone during
+3A end-to-end testing. That testing reads DynamoDB and the queues via `curl` and
+`aws` — the paths in the Test section below — never the app. The bug only becomes
+reachable at the moment Stage 7 points the client at a live API, which is exactly
+when it will be fixed.
+
+**Carry this into Stage 7 as a known first bug**, not a discovery. If the job
+list shows 0/4 stages on the first real run, the cause is `JobListScreen.tsx:27`,
+not the worker.
+
+Worth correcting `PROJECT_PLAN.md` and `TEMPLATE.md` opportunistically too, since
+they seeded the wrong vocabulary in the first place.
 
 ### Error classification is the load-bearing decision
 
