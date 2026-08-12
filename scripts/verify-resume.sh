@@ -93,6 +93,20 @@ put_part_container() {
     --key "$1" --upload-id "$2" --part-number "$3" --body "$4" >/dev/null
 }
 
+# count_mpu returns how many in-flight uploads exist for a key.
+#
+# Counted in python rather than with --query 'length(Uploads[?...])', which is a
+# trap: when nothing is in flight S3 omits Uploads entirely and jmespath's
+# length() fails on the null with exit 255. The empty result is the one this is
+# asked for most — "is it gone yet" — so the check would break precisely when it
+# was supposed to say yes.
+count_mpu() {
+  docker exec "$CONTAINER" awslocal s3api list-multipart-uploads --bucket "$BUCKET" --output json \
+    | python3 -c 'import json,sys
+key = sys.argv[1]
+print(sum(1 for u in (json.load(sys.stdin).get("Uploads") or []) if u["Key"] == key))' "$1"
+}
+
 echo "stage 8A resume verification — api=$API"
 
 make_fixture
@@ -131,10 +145,8 @@ put_part_container "$KEY" "$UPLOAD" 1 /tmp/verify-resume/part_aa
 # Two listings of the same bucket disagree about whether ~7.7 MiB exists. This
 # is why DECIDE 4 is a correctness requirement and not a cost one.
 in_objects="$(docker exec "$CONTAINER" awslocal s3 ls "s3://$BUCKET/" --recursive | grep -c "$JOB")"
-in_mpu="$(docker exec "$CONTAINER" awslocal s3api list-multipart-uploads --bucket "$BUCKET" \
-  --query "length(Uploads[?Key=='$KEY'])" --output text)"
 check "abandoned parts absent from s3 ls" 0 "$in_objects"
-check "abandoned parts present in list-mpu" 1 "$in_mpu"
+check "abandoned parts present in list-mpu" 1 "$(count_mpu "$KEY")"
 
 # ── The endpoint the stage exists for ─────────────────────────────────────────
 resume="$(curl -s -X POST "$API/jobs/$JOB/upload-urls")"
@@ -191,9 +203,7 @@ put_part_container "$JOB2/cancelled.mp4" "$(jqp 'd["upload_id"]' <<<"$job2_json"
 
 check "DELETE /jobs/{id}/upload" 200 \
   "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$API/jobs/$JOB2/upload")"
-check "the parts are actually gone from S3" 0 \
-  "$(docker exec "$CONTAINER" awslocal s3api list-multipart-uploads --bucket "$BUCKET" \
-     --query "length(Uploads[?Key=='$JOB2/cancelled.mp4'])" --output text)"
+check "the parts are actually gone from S3" 0 "$(count_mpu "$JOB2/cancelled.mp4")"
 check "abort twice is not an error" 200 \
   "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$API/jobs/$JOB2/upload")"
 # 410, not 500. Without a distinguishable code the client retries forever

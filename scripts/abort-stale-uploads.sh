@@ -90,7 +90,11 @@ for u in listing.get("Uploads", []):
 ' "$listing" "$older_than_min")"
 
 if [ -z "$rows" ]; then
-  echo "  none${older_than_min:+ older than ${older_than_min}m}"
+  if [ "$older_than_min" -gt 0 ]; then
+    echo "  none older than ${older_than_min}m"
+  else
+    echo "  none"
+  fi
   echo
   echo "Nothing is holding parts. This is the state a session should end in."
   exit 0
@@ -126,8 +130,12 @@ done <<<"$rows"
 
 # Re-list rather than trusting the abort calls' exit codes. This project has
 # been bitten repeatedly by operations that report success and change nothing.
-remaining="$(s3api list-multipart-uploads --bucket "$BUCKET" --query 'length(Uploads)' --output text 2>/dev/null)"
-[ "$remaining" = "None" ] && remaining=0
-printf '\n  remaining in-flight uploads after abort: %s\n' "$remaining"
+#
+# Counted in python rather than with --query 'length(Uploads)', which is a trap:
+# when nothing is left, S3 omits Uploads entirely and jmespath's length() fails
+# on the null with exit 255. The success case was the one that broke the check.
+remaining="$(s3api list-multipart-uploads --bucket "$BUCKET" --output json 2>/dev/null \
+  | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("Uploads") or []))' 2>/dev/null)"
+printf '\n  remaining in-flight uploads after abort: %s\n' "${remaining:-unknown}"
 
-[ "$failed" -eq 0 ] && [ "${remaining:-1}" = "0" ]
+[ "$failed" -eq 0 ] && [ "${remaining:-none}" = "0" ]
