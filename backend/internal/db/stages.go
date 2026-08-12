@@ -156,9 +156,12 @@ func (d *DynamoDBClient) SetStageDuration(
 	_, err := d.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:        aws.String(d.table),
 		Key:              d.jobKey(jobID),
-		UpdateExpression: aws.String("SET metrics.#field = :ms"),
+		UpdateExpression: aws.String("SET #metrics.#field = :ms"),
 		ExpressionAttributeNames: map[string]string{
-			"#field": field,
+			// Both segments need aliasing: "metrics" is a DynamoDB reserved
+			// keyword, and the per-stage field name is built at runtime.
+			"#metrics": "metrics",
+			"#field":   field,
 		},
 		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
 			":ms": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(ms, 10)},

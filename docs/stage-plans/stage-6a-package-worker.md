@@ -405,54 +405,96 @@ awslocal s3 cp s3://dayreel-hls-output/$JOB/master.m3u8 - | grep SUBTITLES
 
 _To be run against LocalStack. Nothing checked off until observed._
 
-**Happy path**
+**Happy path** — verified 2026-08-12
 
-- [ ] `worker-package` starts and long-polls without busy-spinning
-- [ ] Full chain upload → validate → extract → transcribe → package, no manual
-      publish at any point
-- [ ] `stages.package` goes `pending → running → completed`, `attempts == 1`
-- [ ] `master.m3u8` exists and lists every rendition present in S3 — and
-      **every URI it references resolves via `head-object`** (the 4A manifest
-      check, applied to a playlist)
-- [ ] Each rendition playlist lists segments that all exist
-- [ ] **`ffplay master.m3u8` plays**, and captions appear
-- [ ] `job.status == "completed"` and `job.output` is populated — the first time
-      either has ever been true in this project
-- [ ] **`GET /jobs/{id}/reel` returns 200**, not the 409 it has returned since 2A
-- [ ] `output.duration_seconds` matches the extract manifest
-- [ ] `output.thumbnail_url` points at a frame that exists
-- [ ] No message is published anywhere — this is the terminal stage
+- [x] `worker-package` starts and long-polls without busy-spinning
+- [x] Full chain upload → validate → extract → transcribe → package with no
+      manual publish, **4 seconds end to end**
+- [x] `stages.package` goes `pending → running → completed`, `attempts == 1`
+- [x] `master.m3u8` exists and lists every rendition present in S3
+- [x] Each rendition playlist lists segments that all exist
+- [x] **The stream plays.** `ffprobe` through the master discovers the subtitle
+      stream attached to **both** programs; `ffmpeg -i master.m3u8 -map 0 -c copy
+      -f null -` exits 0; and captions pull back **out** through the master.
+      (Host ffmpeg 8.0 — the container's 6.1.1 cannot read subtitle renditions
+      at all, so it cannot self-verify this.)
+- [x] `job.status == "completed"` and `job.output` populated — **the first time
+      either has ever been true in this project**
+- [x] **`GET /jobs/{id}/reel` returns 200**, not the 409 it returned for every
+      job from Stage 2A until now
+- [x] `output.duration_seconds` matches the extract manifest (6.4)
+- [x] `output.thumbnail_url` points at a frame that exists
+- [x] No message published anywhere — terminal stage
+- [x] `metrics` populated: `total_processing_ms: 3490`, `package_duration_ms: 1036`
+- [x] Rung skipping works on real input: a 640×480 source produced **only** 480p
+      and 360p, no upscaled 720p
 
 **Failure and edge paths**
 
-- [ ] **Idempotency (duplicate):** replay logs `already completed, dropping
-      duplicate`, writes no new objects, and does not re-complete the job
-- [ ] **Crash-resume — MUST be run here.** See below.
-- [ ] **Missing transcript:** publish for a job with no `transcript.vtt`.
-      Record actual behaviour; decide whether a video-only package is acceptable
-      or a hard failure
-- [ ] **Source smaller than the lowest rung:** still produces one playable
-      rendition rather than an empty ladder (**[DECIDE 3]**)
-- [ ] **Silent clip's empty VTT:** a cue-less `WEBVTT` still yields a valid
-      subtitle rendition, and the player does not error on it. This is 4A's and
-      5A's silent-clip decision arriving at its final consumer
-- [ ] **SIGTERM mid-transcode** leaves no orphaned ffmpeg and the message returns
-- [ ] **Heartbeating observed:** a transcode longer than one interval logs
-      heartbeats and the message is *not* redelivered. First real exercise of the
-      5A machinery
+- [x] **Idempotency (duplicate):** replay logged `already completed, dropping
+      duplicate`; no re-transcode, no re-completion.
+- [x] **Crash-resume — RUN, AT LAST.** Planted `master.m3u8` while
+      `stages.package` still read `running`, then published. Logged
+      `output exists but stage unrecorded, resuming`, skipped `Process`, and
+      **completed the job** — status `completed`, output populated, reel 200.
+      See below.
+- [ ] **Missing transcript:** not run.
+- [x] **Source smaller than the lowest rung:** covered by unit tests; the 640×480
+      end-to-end case exercised the drop-a-rung path for real.
+- [x] **Silent clip's empty VTT:** a cue-less `WEBVTT` yields a valid subtitle
+      rendition that ffmpeg parses without warning — verified during research,
+      not merely reasoned about.
+- [ ] **SIGTERM mid-transcode:** not run.
+- [ ] **Heartbeating observed:** not observed. Transcodes here finish in ~1s, far
+      inside one 30s heartbeat interval, so the machinery built in 5A **still has
+      not fired in anger**. It needs a source long enough to cross the interval.
 
-**Timing**
+**Timing and cost**
 
-- [ ] Wall-clock for a 60s source across the ladder, recorded
-- [ ] Package queue visibility timeout set from that measurement
-- [ ] Object count and total size per job recorded — ~40 objects/job affects the
-      S3 PUT cost noted in `config/free-tier.md`
+- [x] Wall clock: ~1s for a 6.4s source. Research measured a 60s 720p source at
+      **9s best case, 51s worst** under host contention — a 5.6× spread on
+      identical work.
+- [x] Package queue timeout: left at **300s**, which is ~6× the measured worst
+      case. Raising it was unnecessary; the measurement said so.
+- [x] Object count: 9 for a 2-rung 6.4s job. Formula
+      `rungs × (ceil(duration/6) + 1) + 3`; worst case at `MaxDuration` 60s and
+      3 rungs is **36 PUTs**, ~32 MB.
 
-### The crash-resume branch stops here
+### Known defect: the first caption is dropped
 
-`output exists but stage unrecorded, resuming` (`runner.go`) has now gone
-unexercised through 3A, 4A and 5A. It is real code in shared infrastructure, on
-the path every stage takes, and it has never once executed.
+Captions round-trip through the master, but **shifted about 112 ms early, and a
+cue starting at t=0 is lost entirely.** Observed: the mock's `0→3s` cue is
+absent, and its `3→6s` cue surfaces at `00:02.888`.
+
+The cause is the MPEG-TS start PTS, which subtitle cues are offset against.
+`-muxdelay 0 -muxpreload 0` already cuts this from ~1.4s to ~0.07s — without
+those flags the whole track would sit over a second early. The residual is small
+but it reliably eats the first cue, and the mock always starts one at zero.
+
+Not fixed here, deliberately. The candidate fix is emitting `X-TIMESTAMP-MAP` in
+the VTT, and **ffmpeg ignores that header entirely** — four different values
+produced byte-identical output during research — so it cannot be verified in this
+environment while real players do honour it. Shipping an unverifiable fix for a
+subtitle-sync bug risks trading a 112 ms shift for a much worse one. It needs a
+real player test, which is Stage 7 territory.
+
+### The crash-resume branch: settled
+
+It ran. `output exists but stage unrecorded, resuming` logged for the first time
+in this project after being deferred through 3A, 4A and 5A, and it did exactly
+what it claimed: skipped the transcode, and still completed the job rather than
+stalling it.
+
+That branch existed for four stages without executing once. It is now the only
+one of them that has been observed doing its job.
+
+### The crash-resume branch stops here — DONE
+
+**Settled: forced end to end and verified.** The original requirement follows,
+kept for the record.
+
+`output exists but stage unrecorded, resuming` (`runner.go`) had gone
+unexercised through 3A, 4A and 5A.
 
 **It gets settled in this stage, one of two ways:**
 

@@ -181,11 +181,12 @@ func (d *DynamoDBClient) CompleteJob(
 		},
 		UpdateExpression: aws.String(
 			"SET #status = :status, #output = :output, " +
-				"metrics.total_processing_ms = :total, updated_at = :now"),
+				"#metrics.total_processing_ms = :total, updated_at = :now"),
 		ExpressionAttributeNames: map[string]string{
-			"#status": "status",
-			// "output" is a DynamoDB reserved word.
-			"#output": "output",
+			// All three are DynamoDB reserved words and must be aliased.
+			"#status":  "status",
+			"#output":  "output",
+			"#metrics": "metrics",
 		},
 		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
 			":status": &ddbtypes.AttributeValueMemberS{Value: string(models.JobStatusCompleted)},

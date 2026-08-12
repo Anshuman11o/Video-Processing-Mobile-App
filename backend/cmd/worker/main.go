@@ -19,6 +19,7 @@ import (
 	"github.com/anshumanagarwal/dayreel/internal/transcribe"
 	"github.com/anshumanagarwal/dayreel/internal/worker"
 	"github.com/anshumanagarwal/dayreel/internal/worker/extract"
+	"github.com/anshumanagarwal/dayreel/internal/worker/packager"
 	transcribeworker "github.com/anshumanagarwal/dayreel/internal/worker/transcribe"
 	"github.com/anshumanagarwal/dayreel/internal/worker/validate"
 )
@@ -51,7 +52,7 @@ func main() {
 		log.Fatalf("create sqs client: %v", err)
 	}
 
-	stage, err := buildStage(stageName, cfg, s3Client)
+	stage, err := buildStage(stageName, cfg, s3Client, dbClient)
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
@@ -67,7 +68,10 @@ func main() {
 }
 
 // buildStage maps a stage name to its implementation. Stages 4A-6A land here.
-func buildStage(name models.StageName, cfg *config.Config, s3Client *storage.S3Client) (worker.Stage, error) {
+func buildStage(
+	name models.StageName, cfg *config.Config,
+	s3Client *storage.S3Client, dbClient *db.DynamoDBClient,
+) (worker.Stage, error) {
 	switch name {
 	case models.StageValidate:
 		return validate.New(s3Client, cfg.S3ProcessedBucket, validate.DefaultLimits), nil
@@ -90,7 +94,13 @@ func buildStage(name models.StageName, cfg *config.Config, s3Client *storage.S3C
 		}
 		return transcribeworker.New(s3Client, cfg.S3ProcessedBucket, newDecoder), nil
 	case models.StagePackage:
-		return nil, unimplementedStageError(name)
+		// The terminal stage. It alone takes a database client, because it alone
+		// finishes the job via worker.Finalizer.
+		return packager.New(
+			s3Client, dbClient,
+			cfg.S3HLSBucket, cfg.S3ProcessedBucket,
+			packager.DefaultOptions(cfg.PublicEndpoint()),
+		), nil
 	default:
 		return nil, unknownStageError(name)
 	}

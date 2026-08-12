@@ -47,6 +47,30 @@ awslocal s3api put-bucket-cors --bucket dayreel-hls-output --cors-configuration 
   ]
 }'
 
+# Public read on the HLS bucket.
+#
+# LOCAL DEVELOPMENT ONLY. HLS playlists reference their segments by relative
+# path, so a presigned master playlist is followed by 403s on every segment —
+# presigning cannot work for HLS without rewriting every URI, which defeats the
+# format. A readable bucket is what CloudFront would sit in front of in
+# production.
+#
+# The real-AWS access model is deliberately an OPEN QUESTION and must be decided
+# before anything deploys. A public bucket on a real account is both a cost and
+# an exposure; see config/free-tier.md.
+awslocal s3api put-bucket-policy --bucket dayreel-hls-output --policy '{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PublicReadLocalDevOnly",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::dayreel-hls-output/*"
+    }
+  ]
+}' || true
+
 echo "S3 buckets created."
 
 # ============================================================================
