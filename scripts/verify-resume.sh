@@ -227,6 +227,30 @@ check "a stale upload_id -> 409 UPLOAD_MISMATCH" "409 UPLOAD_MISMATCH" \
     | python3 -c "import json,sys;t=sys.stdin.read();b,c=t.rsplit(' ',1);print(c,json.loads(b)['code'])")"
 curl -s -o /dev/null -X DELETE "$API/jobs/$JOB3/upload"
 
+# ── The path stage 7's uploader uses, which must not break ────────────────────
+# The tolerant completion above is additive. A client that assembles the parts
+# array itself still has to work, because one already does.
+job4_json="$(create_job supplied.mp4)"
+JOB4="$(jqp 'd["job_id"]' <<<"$job4_json")"
+UPLOAD4="$(jqp 'd["upload_id"]' <<<"$job4_json")"
+i=1
+for suffix in aa ab ac; do
+  put_part_container "$JOB4/supplied.mp4" "$UPLOAD4" "$i" "/tmp/verify-resume/part_$suffix"
+  i=$((i+1))
+done
+# Built in python, not by shell interpolation: S3's ETags arrive already
+# quoted, and pasting them into a hand-written JSON string produces a body the
+# server rejects as malformed — which reads exactly like a server bug.
+body4="$(docker exec "$CONTAINER" awslocal s3api list-parts --bucket "$BUCKET" \
+  --key "$JOB4/supplied.mp4" --upload-id "$UPLOAD4" --output json \
+  | python3 -c 'import json,sys
+parts = json.load(sys.stdin)["Parts"]
+print(json.dumps({"upload_id": sys.argv[1],
+                  "parts": [{"part_number": p["PartNumber"], "etag": p["ETag"]} for p in parts]}))' "$UPLOAD4")"
+check "complete with a client-supplied parts array" 200 \
+  "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/jobs/$JOB4/complete" \
+     -H 'Content-Type: application/json' --data-binary "$body4")"
+
 # ── The pipeline must not be able to tell ─────────────────────────────────────
 # A resumed upload is just an object. If this ever fails, resume is producing a
 # file that differs from a fresh upload's, which every check above would miss.
