@@ -108,20 +108,22 @@ echo "Configuring S3 event notifications..."
 
 VALIDATE_QUEUE_ARN="arn:aws:sqs:${AWS_REGION}:${ACCOUNT_ID}:dayreel-validate"
 
+# No key filter, deliberately. The API issues presigned URLs for any filename
+# and writes the key as <job_id>/<original_filename>, so a suffix filter on
+# ".mp4" silently dropped every .mov/.webm upload: the job completed its upload
+# and then sat in "processing" forever with no error and no DLQ entry.
+#
+# The validate worker gates on content via ffprobe instead, which is what a
+# stage named "validate" should be doing anyway. The cost is that any other
+# object written to this bucket also enqueues a validate attempt; the worker
+# rejects those permanently when the key has no UUID job-id prefix.
 awslocal s3api put-bucket-notification-configuration \
   --bucket dayreel-raw-videos \
   --notification-configuration '{
     "QueueConfigurations": [
       {
         "QueueArn": "'"${VALIDATE_QUEUE_ARN}"'",
-        "Events": ["s3:ObjectCreated:CompleteMultipartUpload", "s3:ObjectCreated:Put"],
-        "Filter": {
-          "Key": {
-            "FilterRules": [
-              {"Name": "suffix", "Value": ".mp4"}
-            ]
-          }
-        }
+        "Events": ["s3:ObjectCreated:CompleteMultipartUpload", "s3:ObjectCreated:Put"]
       }
     ]
   }'

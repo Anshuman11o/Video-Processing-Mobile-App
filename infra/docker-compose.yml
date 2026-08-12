@@ -66,6 +66,30 @@ services:
     networks:
       - dayreel-network
 
+  worker-validate:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile.worker
+    container_name: dayreel-worker-validate
+    environment:
+      - WORKER_STAGE=validate
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - LOCALSTACK_ENDPOINT=http://localstack:4566
+      - USE_LOCALSTACK=true
+      - S3_RAW_BUCKET=dayreel-raw-videos
+      - S3_PROCESSED_BUCKET=dayreel-processed
+      - S3_HLS_BUCKET=dayreel-hls-output
+      - DYNAMODB_TABLE=dayreel-jobs
+      - REDIS_URL=redis:6379
+    depends_on:
+      localstack:
+        condition: service_healthy
+    networks:
+      - dayreel-network
+    restart: unless-stopped
+
 networks:
   dayreel-network:
     driver: bridge
