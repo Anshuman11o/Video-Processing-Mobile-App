@@ -158,8 +158,14 @@ assurance. This one is only verifiable against real S3.
 
 The `dayreel-hls-output` bucket is the deliberate exception: it is public by
 design locally, because HLS playlists reference segments by relative path and
-cannot be presigned. Its real-AWS access model is still an open question — see
-`config/free-tier.md`.
+cannot be presigned. Which also means playback "works" here for a reason that
+does not hold on real S3.
+
+Its real-AWS access model now has an **opt-in, off-by-default** answer —
+`scripts/aws-hls-public.sh` and **`docs/aws-public-hls.md`**, which covers the
+Block Public Access levels, the cost exposure, the teardown obligations and the
+alternative that was not built. Read it before pointing anything at a real
+bucket. It stays out of `init-aws.sh` for the reason above.
 
 ### Transcription is mocked by default
 

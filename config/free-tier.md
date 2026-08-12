@@ -39,6 +39,15 @@ IPs left unattached. It does not apply to S3 objects or DynamoDB items, which
 bill by size and are trivial at this scale, though they are still worth deleting
 at the end.
 
+**One thing that bills nothing per hour and still belongs on this list: a
+public-read policy on the HLS bucket.** `scripts/aws-hls-public.sh enable` is
+opt-in and off by default, and it grants the whole internet `s3:GetObject` until
+something takes it away — legitimate use rounds to $0, a scraped bucket does not.
+It also has a second, larger cost: if account-level Block Public Access is on,
+enabling it removes that guardrail from *every* bucket in the account. Run
+`./scripts/aws-hls-public.sh disable --yes` at the end of the run, and see
+`docs/aws-public-hls.md` for the four-item teardown checklist.
+
 **Teardown check after every AWS run:**
 
 ```bash
