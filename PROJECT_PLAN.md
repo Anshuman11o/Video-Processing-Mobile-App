@@ -25,12 +25,12 @@ path. Expand incrementally once the core flow works.
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │                           ▲
                           POST /jobs│                           │GET /jobs/{id}
-                          Presigned │                           │+ CloudFront URL
+                          Presigned │                           │+ HLS URL (S3)
                           URLs      │                           │
                                     ▼                           │
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                              BACKEND                                         │
-│  Go API + Workers, Docker Compose locally, ECS Fargate on AWS               │
+│  Go API + Workers, Docker Compose locally or on a single small VM            │
 │                                                                              │
 │  ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐   │
 │  │   API   │───▶│Validate │───▶│ Extract │───▶│Transcribe───▶│ Package │   │
@@ -63,7 +63,17 @@ path. Expand incrementally once the core flow works.
 - One DynamoDB item per job with a `stages` map
 
 **Local-first:** LocalStack emulates S3/SQS/DynamoDB. Same Go binaries run locally
-and on AWS via configurable endpoints. Docker Compose replaces Fargate locally.
+and on AWS via configurable endpoints. The same Docker containers run under Compose
+locally and on a single small VM if we deploy.
+
+**Deferred (deliberate, not an oversight):**
+- **No CDN.** At this scale — a handful of short clips — CloudFront is cost and
+  complexity with nothing to show for it. HLS is served directly from the HLS
+  bucket, which means that bucket has to be readable by the player. A CDN in front
+  of a private bucket is the first thing to add if this ever gets real viewers.
+- **No managed container hosting.** ECS Fargate buys autoscaling we don't need. The
+  Go binaries are identical either way, so this is a hosting choice we can revisit
+  without touching application code.
 
 ---
 
@@ -422,7 +432,7 @@ ffplay http://localhost:4566/hls-output/job-123/master.m3u8
 
 **Deliverables:**
 - react-native-video with ExoPlayer
-- Play completed reels from CloudFront/LocalStack
+- Play completed reels straight from the HLS bucket (LocalStack S3 locally, S3 on AWS)
 
 **Verification:**
 - Completed job shows play button
@@ -440,8 +450,9 @@ ffplay http://localhost:4566/hls-output/job-123/master.m3u8
 **Deliverables:**
 - VPC with public subnets (no NAT Gateway)
 - VPC endpoints for S3, DynamoDB
-- ECS Fargate tasks for API + workers
-- CloudFront distribution
+- A single small VM running the same Docker containers (API + workers) that
+  Compose runs locally — identical Go binaries, different host
+- HLS bucket readable by the player, served directly (no CDN)
 
 **Verification:**
 - `terraform apply` succeeds

@@ -6,7 +6,7 @@ Reference documentation for external service constraints that affect this projec
 
 | File | Purpose |
 |------|---------|
-| `aws-limits.md` | Hard limits from S3, SQS, DynamoDB, Lambda, Fargate, CloudFront, Redis |
+| `aws-limits.md` | Hard limits from S3, SQS, DynamoDB, Lambda, Redis; worker sizing and HLS delivery |
 | `free-tier.md` | AWS free tier quotas, cost traps (NAT Gateway!), budget alerts |
 
 ## Why This Exists
@@ -30,5 +30,9 @@ Before implementing anything that touches AWS:
 
 - **VPC Gateway Endpoints over NAT Gateway:** S3 and DynamoDB access via gateway
   endpoints is free. NAT Gateway is the biggest cost trap for this project.
-- **Public subnets for Fargate:** Simpler and cheaper than private subnets + NAT.
-  Security via tight security groups instead of network isolation.
+- **Public subnets for the worker VM:** Simpler and cheaper than private subnets +
+  NAT. Security via tight security groups instead of network isolation.
+- **No CDN, no managed container hosting:** A handful of short clips doesn't justify
+  CloudFront or ECS Fargate. HLS is served directly from the HLS bucket (so that
+  bucket must be player-readable), and the workers run as Docker containers on one
+  small VM. See `PROJECT_PLAN.md` → "Deferred".

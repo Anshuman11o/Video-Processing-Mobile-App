@@ -76,19 +76,16 @@ per-stage state. One `GetItem` returns full job status.
 | Ephemeral storage | 512 MB - 10 GB | Enough for video processing |
 | Concurrent executions | 1000 default | Not a concern at demo scale |
 
-**Decision:** Use ECS Fargate instead of Lambda for workers. Better for long-running
-FFmpeg/Whisper tasks, easier local dev parity.
+**Decision:** Run workers as long-lived Docker containers instead of Lambda. Better
+for long-running FFmpeg/Whisper tasks, and no 15-minute ceiling.
 
 ---
 
-## ECS Fargate
+## Worker Hosting
 
-| Constraint | Value | Impact on DayReel |
-|------------|-------|-------------------|
-| Task CPU | 0.25 - 4 vCPU | Use 1 vCPU for workers |
-| Task memory | 0.5 - 30 GB | Use 2GB for transcribe worker |
-| Ephemeral storage | 20 - 200 GB | Default 20GB is enough |
-| Task startup time | 30-60 seconds | Cold start latency, acceptable |
+Workers are plain Docker containers: Compose locally, the same images on a single
+small VM if we deploy. No managed container service — at this volume there is
+nothing to autoscale, and the Go binaries are identical either way.
 
 **Sizing per worker:**
 | Worker | CPU | Memory | Reason |
@@ -98,18 +95,25 @@ FFmpeg/Whisper tasks, easier local dev parity.
 | Transcribe | 1 | 4 GB | faster-whisper (CPU mode) |
 | Package | 1 | 2 GB | FFmpeg HLS encoding |
 
+Run all four on one host. Peak is the transcribe worker, so ~2 vCPU / 4 GB covers
+the whole set as long as stages don't run concurrently on the same clip.
+
 ---
 
-## CloudFront
+## HLS Delivery
+
+Reels are served **directly from the HLS bucket** — LocalStack's S3 endpoint locally,
+S3 on AWS. No CDN.
 
 | Constraint | Value | Impact on DayReel |
 |------------|-------|-------------------|
-| Origin response timeout | 30 seconds | HLS segments are small, not a concern |
-| Cache TTL | Configurable | Use long TTL for immutable HLS segments |
-| Price class | All edge locations vs subset | Use PriceClass_100 (cheapest) |
+| Bucket read access | Must be reachable by the player | Bucket policy allows public read on `hls-output` |
+| CORS | Required for browser/ExoPlayer range requests | Set on the HLS bucket at init |
+| Cache-Control | Set per object | Long TTL on immutable segments, short on `master.m3u8` |
 
-**HLS caching:** Segments are immutable after creation. Use aggressive caching.
-Master playlist may need shorter TTL if we ever update it.
+**HLS caching:** Segments are immutable after creation, so a long `Cache-Control`
+max-age is safe and lets the client do the caching a CDN would otherwise do. The
+master playlist gets a shorter TTL in case we ever rewrite it.
 
 ---
 
