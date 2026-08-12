@@ -543,6 +543,121 @@ been observed._
       visibility timeout. If it does not, the runner needs visibility
       heartbeating and that is a runner change, not an extract change.
 
+## Claude Code Implementation Plan
+
+### Recommended Approach: Sequential Phases with Parallel File Writes
+
+Every dependency this stage needs already exists — the runner, the `Stage`
+interface, whole-object S3 helpers, per-stage DynamoDB updates, and the worker
+image with ffmpeg. Nothing shared has to change, which is what makes 4A small.
+
+The work is four leaf packages with a strict import order
+(`events` ← `media` ← `extract` ← `main`), so phases are sequential while files
+*within* a phase are independent and can be written in one batch.
+
+### Pre-Flight Check
+
+Run before writing anything — 3A's session ended with the stack up but disk
+under pressure, and a failed build 40 minutes in is worse than a 30-second check.
+
+```
+0a. df -h /System/Volumes/Data          # need >5Gi; builds ate ~5Gi last session
+0b. docker builder prune -f             # build cache was 1.4GB at end of 3A
+0c. docker compose ps                   # all 4 healthy; docker daemon alive
+0d. git log --oneline -1                # expect the 3A verification commit
+0e. awslocal sqs purge-queue --queue-url .../dayreel-dlq
+                                        # 2 inert test messages from 3A's DLQ runs
+                                        # would corrupt a "DLQ is empty" assertion
+```
+
+### Execution Steps
+
+```
+Phase 1: Pure data, no I/O (single file, no dependencies)
+1.  Write backend/internal/events/manifest.go
+2.  go build ./... && go test ./...
+
+Phase 2: Media helpers (parallel writes — independent of each other)
+3a. Write backend/internal/media/audio.go
+3b. Write backend/internal/media/frames.go
+4.  Extend backend/internal/media/media_test.go
+    - ExtractAudio produces 16 kHz mono PCM (assert via ffprobe, not file size)
+    - DetectSceneChanges returns [] on the static testsrc fixture
+5.  go test ./internal/media/    <-- runs real ffmpeg; slowest feedback loop,
+                                     so get it green before building on it
+
+Phase 3: The stage (depends on 1 and 2)
+6a. Write backend/internal/worker/extract/extract.go
+6b. Write backend/internal/worker/extract/extract_test.go
+    - frame capping: 50 timestamps + MaxFrames 20 -> 20, evenly spaced
+    - t=0 always present, including when detection returns []
+    - manifest lists exactly the frames uploaded
+7.  go test ./internal/worker/extract/
+
+Phase 4: Wiring (parallel writes)
+8a. Modify backend/cmd/worker/main.go     -- case models.StageExtract
+8b. Modify infra/docker-compose.yml       -- worker-extract service
+8c. Write backend/internal/worker/extract/CONTEXT.md
+9.  go build ./... && go vet ./...
+
+Phase 5: Build and verify
+10. docker compose up -d --build worker-extract
+    ONE build at a time. Two concurrent `compose up --build` calls on the same
+    image deadlocked in 3A and had to be SIGKILLed.
+11. Run the end-to-end Test block above
+12. Work the Verification checklist; record results in this file
+```
+
+### Parallel Opportunities
+
+| Phase | Parallel Files |
+|-------|----------------|
+| 2 | `media/audio.go`, `media/frames.go` |
+| 3 | `extract/extract.go`, `extract/extract_test.go` |
+| 4 | `cmd/worker/main.go`, `docker-compose.yml`, `extract/CONTEXT.md` |
+
+### Why Not Subagents?
+
+- The stage is one file mirroring `validate.go`; describing it to a subagent
+  costs more than writing it.
+- `extract.go` has to match conventions established across `validate.go`,
+  `runner.go`, and `storage/objects.go` — error classification, temp-dir
+  discipline, bucket parameterization. That consistency is the whole point of
+  the stage and is exactly what a cold agent gets subtly wrong.
+- Sequential compilation catches interface drift immediately.
+
+Planning is the exception: drafting *this* document in the background while 3A's
+runner checks ran was a good use of one, because it was research over existing
+files with no code to keep consistent.
+
+### Potential Blockers
+
+| Blocker | Resolution |
+|---------|------------|
+| Disk full mid-build | The 3A failure mode. `docker builder prune -f`; needs >5Gi free |
+| Docker daemon dead after an ENOSPC | Orphaned `com.docker.backend` makes `open -a Docker` a silent no-op. `kill -9` the orphans first, then relaunch |
+| `movie=` lavfi filter unavailable | Alpine's `apk add ffmpeg` may lack `--enable-filter=movie`. Verify with `ffmpeg -filters \| grep movie` **inside the image**, not on the host. Fallback: `-vf select='gt(scene,T)',showinfo` and scrape stderr |
+| Concurrent `compose up --build` | Deadlocks. One build at a time |
+| Extract exceeds 300s visibility | Message redelivers mid-work and a second worker starts the same job. Surfaces as duplicate frame uploads. Needs runner heartbeating — a runner change, out of 4A's scope |
+| `-ss` lands on the wrong frame | `-ss` before `-i` seeks to the nearest preceding keyframe; recorded timestamps may drift from actual content |
+| Frames inflate S3 PUT count | 2,000 PUTs/month free tier. `MaxFrames: 20` caps it; watch during repeated E2E runs |
+
+### Time Estimate
+
+- Phase 1–2 (manifest + media helpers, with real-ffmpeg tests): ~20 minutes
+- Phase 3 (stage + unit tests): ~15 minutes
+- Phase 4 (wiring): ~5 minutes
+- Docker build: ~2–10 minutes (cold Go layer rebuild is the variable)
+- End-to-end + verification checklist: ~15 minutes
+- **Total:** ~60 minutes
+
+This exceeds `PROJECT_PLAN.md`'s 20-minute budget for 4A. The overrun is the
+verification checklist, not the code. 3A's two bugs were both silent and both
+surfaced only in end-to-end verification, so this is the wrong place to
+economize.
+
+---
+
 ## Notes
 
 ### [DECIDE 2] — are keyframes in scope for 4A at all?
