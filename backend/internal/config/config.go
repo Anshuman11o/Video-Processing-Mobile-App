@@ -99,7 +99,11 @@ func Load() *Config {
 		MockTranscribe:   getEnv("MOCK_TRANSCRIBE", "true") == "true",
 		S3PublicEndpoint: getEnv("S3_PUBLIC_ENDPOINT", ""),
 		UploadPartSize:   getEnvBytes("UPLOAD_PART_SIZE", DefaultUploadPartSize),
-		WhisperModelPath: getEnv("WHISPER_MODEL_PATH", "/models/ggml-base.bin"),
+		// Relative to the working directory, not /models: that absolute path was
+		// the worker container's volume mount, and nothing mounts it now that the
+		// worker runs as a plain process. Left as the container path it would
+		// resolve to a directory the process cannot write and probably cannot read.
+		WhisperModelPath: getEnv("WHISPER_MODEL_PATH", "./models/ggml-base.bin"),
 	}
 }
 

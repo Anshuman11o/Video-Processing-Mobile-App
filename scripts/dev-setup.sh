@@ -71,6 +71,23 @@ else
     print_status "sqlite3 CLI is installed"
 fi
 
+# whisper-cli and its model are warnings rather than errors because
+# MOCK_TRANSCRIBE defaults to true and the mock needs neither. They are checked
+# at all because the worker container used to supply the binary — it built
+# whisper.cpp from source — and nothing replaced that when the containers went.
+# Without this check the gap surfaces as an exec failure mid-pipeline on the
+# first real run, which is a confusing place to discover a missing dependency.
+WHISPER_MODEL_PATH="${WHISPER_MODEL_PATH:-./models/ggml-base.bin}"
+if ! command -v whisper-cli &> /dev/null; then
+    print_warning "whisper-cli is not on PATH. Fine while MOCK_TRANSCRIBE=true (the default);"
+    print_warning "  required for MOCK_TRANSCRIBE=false. See docs/SETUP.md."
+elif [ ! -f "$WHISPER_MODEL_PATH" ]; then
+    print_warning "whisper-cli found, but no model at $WHISPER_MODEL_PATH."
+    print_warning "  Download it before setting MOCK_TRANSCRIBE=false. See docs/SETUP.md."
+else
+    print_status "whisper-cli and model are present (real transcription available)"
+fi
+
 # ==========================================================================
 # Environment file
 # ==========================================================================
