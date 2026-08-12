@@ -543,9 +543,12 @@ _To be run against LocalStack. Nothing checked off until observed._
 
 ### Known defect: caption timing — MEASURED AND FIXED in 8B, 2026-08-13
 
-**Status: closed.** The offset was real, the dropped first cue was not, and the
-fix is `X-TIMESTAMP-MAP` — verified against a real player, which is exactly what
-6A said it needed.
+**Status: fixed on AVFoundation, still open on ExoPlayer.** The offset was real,
+the dropped first cue was not, and `X-TIMESTAMP-MAP` fixes it — verified against
+a real player, which is exactly what 6A said it needed. But "a real player" turned
+out to mean *one* real player: the 8B measurement on ExoPlayer reads the same
+media **66.8 ms late**, so the header lands the cues correctly on Apple's stack
+and mirrors the original error on Android's.
 
 #### What 6A originally recorded, kept for the record
 
@@ -573,9 +576,10 @@ player would display.
 
 **Limitations, stated plainly.** AVFoundation is one player. It is Safari's HLS
 engine on macOS and the iOS player's engine, so the headless probe is strictly
-more precise than the Safari check Stage 7 and 8B both planned — but
-**ExoPlayer has still never seen this stream.** Everything below is an
-AVFoundation result and must not be recorded as an Android one.
+more precise than the Safari check Stage 7 and 8B both planned — but everything
+in *this* section is an AVFoundation result and must not be recorded as an
+Android one. ExoPlayer was measured separately and **disagrees**; see
+"ExoPlayer, measured" below.
 
 #### The measurement — a controlled before/after on identical media
 
@@ -628,6 +632,66 @@ measured, not assumed: `MPEGTS:6000` landed every cue exactly on its authored
 time, while `MPEGTS:4080` — the container start, lower because AAC priming sits
 earlier — left them 21.3 ms early.
 
+#### ExoPlayer, measured — 8B, 2026-08-13. It does NOT agree.
+
+**`+66.8 ms late` (boundary `3.0668 s` ± 1.2 ms against an authored `3.000`).**
+
+| Player | Anchor it behaves as if it used | Offset at the same cue |
+|---|---|---|
+| AVFoundation | video start PTS (6000) | **0.333 ms late** |
+| ExoPlayer | zero | **66.8 ms late** |
+
+`6000 / 90000 = 66.667 ms` — the `MPEGTS` value in the header, to within the
+probe's resolution. ExoPlayer behaves as if it **adds** the `MPEGTS` value to
+every cue rather than treating it as the anchor that cancels the stream's own
+start PTS. (That the arithmetic matches is **VERIFIED**; that this is the
+mechanism inside `WebvttExtractor` is **inferred**, not read from ExoPlayer's
+source.)
+
+**This is materially different, and it is worse than either option [DECIDE 3]
+anticipated.** That question offered two outcomes — 0.33 ms late if ExoPlayer
+seeded from the video start, 21.3 ms early if from the container start. It did
+neither. The error is the same *magnitude* as the original defect this fix was
+written to remove (66.667 ms), with the sign flipped: **on Android the header
+moves the cues from 66.7 ms early to 66.7 ms late.** For ExoPlayer alone, the
+fix is worth approximately nothing; it trades one 66.7 ms error for another.
+
+The header is still right for AVFoundation, so this is not a regression to
+revert on the spot — it is a genuine **player-dependent anchoring** result, and
+the disagreement is itself the finding [DECIDE 3] asked for. Deciding what to
+emit for both players at once is a packager question, not a playback one, and is
+left to whoever owns 6A next. Worth noting for them: no single `MPEGTS` value
+satisfies both, since the two players differ by exactly the start PTS.
+
+**Instrument.** The in-app probe — `mobile/src/player/captionProbe.ts` driven
+from `PlayerScreen`'s dev-only "caption offset probe". With the player paused, a
+seek settles at a definite media time, so "which cue is active at T" is a
+race-free question; bisecting T locates the boundary. Not a screen recording:
+adb screencap round trips are hundreds of ms and the offsets here are tens.
+
+**Conditions.** `emulator-5554`, react-native-video v6 / ExoPlayer under RN
+0.87 New Architecture, job `4bd59394-a104-453b-90d0-fdd363ad1dba` — the same
+mock transcript (`3.000 / 6.000 / 9.000`) and the same `MPEGTS:6000` header the
+AVFoundation numbers above were taken against. Bracket `[2.85, 3.15]`, 9 probes,
+converging interior to the bracket rather than onto an edge.
+
+**A measurement defect was found and fixed to get this number, and it is worth
+recording because it is this project's usual shape.** The probe originally read
+the cue once after a fixed 400 ms wait. On the emulator that is too short: the
+read returns the cue from *before* the seek, the bisection accepts it as fact,
+and the first run reported a confident `-148.8 ms` whose `before → after` pair
+was `segment 4 → segment 1` — not the `segment 1 → segment 2` transition it
+claimed to have measured. A second run with a warm player then failed the
+opposite way, reporting "no cue change" for a bracket that plainly straddles
+one, while the screen showed the changed cue. The probe now polls until the cue
+actually changes and treats the fixed delay as a cap, not a delay.
+
+**Not established.** One boundary, one run, one device. The `6.000` and `9.000`
+boundaries were not re-measured — the shared emulator was taken by concurrent
+work before that check ran — so "constant shift across all cues" is **ASSUMED**
+for ExoPlayer, where AVFoundation had it verified across four cues. Nothing here
+touches a physical device or real AWS.
+
 #### Residual, and what is still unknown
 
 - **VERIFIED:** a deterministic **0.33 ms** residual (30 ticks at 90 kHz),
@@ -639,12 +703,11 @@ earlier — left them 21.3 ms early.
   lists **English** in the player's track picker, and plays through without error
   or crash. **The first time any client has consumed the silent-clip path** — 6A
   verified only that the file was valid.
-- **UNKNOWN:** what MPEG-TS timestamp **ExoPlayer** anchors on. If it seeds from
-  the container start rather than the video start, it will read these cues 21.3 ms
-  early instead of 0.33 ms late — still an improvement on 66.7 ms, but not the
-  same number. **8B-1 must re-run this measurement on the emulator**, and a
-  disagreement between the two players is itself the finding **[DECIDE 3]** asked
-  for.
+- **RESOLVED in 8B, and not in either direction this bullet predicted:**
+  ExoPlayer anchors on neither the video start nor the container start. It reads
+  these cues **66.8 ms late**, the header's own `MPEGTS` value. See "ExoPlayer,
+  measured" above. The guess recorded here — "still an improvement on 66.7 ms" —
+  was wrong: it is the same 66.7 ms, mirrored.
 - **UNKNOWN:** anything about real AWS. Unchanged by this work.
 
 ### The crash-resume branch: settled

@@ -28,8 +28,19 @@ export const DEFAULT_TOLERANCE_SECONDS = 0.004;
 /** Hard cap, so a probe that answers inconsistently cannot loop forever. */
 export const DEFAULT_MAX_PROBES = 24;
 
-/** Wait between issuing a seek and reading the cue back. */
-export const DEFAULT_SETTLE_MS = 400;
+/**
+ * Longest to wait after a seek for the text renderer to catch up.
+ *
+ * Generous because it is a CAP, not a delay: `videoRefProbe` returns as soon as
+ * the cue changes, and only waits this long when it does not. Measured on the
+ * emulator, a post-seek cue can take well over half a second to arrive — an
+ * earlier 400 ms blind wait read the PREVIOUS position's cue and produced a
+ * boundary pinned to the bracket edge.
+ */
+export const DEFAULT_SETTLE_MS = 2500;
+
+/** How often to re-read the cue while waiting for it to change. */
+export const DEFAULT_POLL_MS = 50;
 
 export interface CueProbe {
   /**
@@ -128,22 +139,37 @@ export function cueOffsetMs(
 /**
  * A probe over a mounted player.
  *
- * `settleMs` is a fixed delay because there is no event that means "the text
- * renderer has caught up" — onSeek reports the position change, which happens
- * first. This is the one genuinely fragile part of the measurement: too short
- * and it reads the cue from before the seek, which shows up as a boundary that
- * moves when the delay changes. That is the check to run if a result looks
- * wrong.
+ * There is no event meaning "the text renderer has caught up" — onSeek reports
+ * the position change, which happens first — so the only handle on settling is
+ * the cue value itself. Waiting a fixed delay and reading once is what this
+ * used to do, and it silently mismeasured: a 400 ms wait returned the cue from
+ * BEFORE the seek, which the bisection then treated as fact.
+ *
+ * So it polls until the cue differs from the one standing before the seek, and
+ * gives up at `settleMs`. Both outcomes are correct rather than one being a
+ * fallback: a changed cue is positive evidence the renderer moved, and when the
+ * new position genuinely carries the same cue there is nothing to wait for and
+ * the value already in hand is the answer. The residual failure — the cue
+ * changing later than `settleMs` — is the same one a fixed delay has, but the
+ * early return buys a cap large enough to make it unlikely.
  */
 export function videoRefProbe(
   seek: (seconds: number) => void,
   readCue: () => string | null,
   settleMs: number = DEFAULT_SETTLE_MS,
+  pollMs: number = DEFAULT_POLL_MS,
 ): CueProbe {
   return {
     cueAt: async (seconds: number) => {
+      const before = readCue();
       seek(seconds);
-      await new Promise<void>(resolve => setTimeout(resolve, settleMs));
+      for (let waited = 0; waited < settleMs; waited += pollMs) {
+        await new Promise<void>(resolve => setTimeout(resolve, pollMs));
+        const cue = readCue();
+        if (cue !== before) {
+          return cue;
+        }
+      }
       return readCue();
     },
   };
