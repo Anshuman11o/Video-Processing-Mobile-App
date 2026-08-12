@@ -44,19 +44,36 @@ class UploadApi(baseUrl: String) {
     data class MissingPart(val partNumber: Int, val url: String)
 
     /**
+     * A part S3 is already holding.
+     *
+     * `size` is carried and not discarded because presence alone is not
+     * correctness: a PUT whose process was killed mid-body can leave a short
+     * part that ListParts reports as present. S3 only rejects that at completion
+     * when the part happens to be under 5 MiB — above it the object assembles
+     * with a hole and every downstream stage succeeds on a corrupt video.
+     * The ETag is still deliberately absent (stage 8A [DECIDE 2]).
+     */
+    data class UploadedPart(val partNumber: Int, val size: Long)
+
+    /**
      * The server's answer to "what is left?".
      *
-     * `uploadedCount` comes from S3's ListParts, not from anything this client
-     * remembered. There is deliberately no ETag here: stage 8A [DECIDE 2] made
-     * resume server-authoritative, and the client never holds one.
+     * `uploaded` comes from S3's ListParts, not from anything this client
+     * remembered.
      */
     data class ResumePlan(
         val uploadId: String,
         val partSize: Long,
         val totalParts: Int,
-        val uploadedCount: Int,
+        val uploaded: List<UploadedPart>,
         val missing: List<MissingPart>,
-    )
+    ) {
+        val uploadedCount: Int
+            get() = uploaded.size
+
+        val bytesOnS3: Long
+            get() = uploaded.sumOf { it.size }
+    }
 
     /**
      * The request cannot succeed no matter how often it is repeated — an
@@ -97,11 +114,20 @@ class UploadApi(baseUrl: String) {
                 val entry = urls!!.getJSONObject(i)
                 missing.add(MissingPart(entry.getInt("part_number"), entry.getString("url")))
             }
+            val listed = json.optJSONArray("uploaded_parts")
+            val uploaded = ArrayList<UploadedPart>(listed?.length() ?: 0)
+            for (i in 0 until (listed?.length() ?: 0)) {
+                val entry = listed!!.getJSONObject(i)
+                uploaded.add(
+                    UploadedPart(entry.getInt("part_number"), entry.getLong("size"))
+                )
+            }
+
             return ResumePlan(
                 uploadId = json.optString("upload_id"),
                 partSize = json.getLong("part_size"),
                 totalParts = json.getInt("total_parts"),
-                uploadedCount = json.optJSONArray("uploaded_parts")?.length() ?: 0,
+                uploaded = uploaded,
                 missing = missing,
             )
         }
@@ -144,7 +170,8 @@ class UploadApi(baseUrl: String) {
      * that the OS is happy to kill for using any.
      */
     fun putPart(url: String, file: File, partNumber: Int, start: Long, length: Long): String {
-        val request = Request.Builder().url(url).put(FileRangeBody(file, start, length)).build()
+        val body = FileRangeBody(file, start, length)
+        val request = Request.Builder().url(url).put(body).build()
 
         val response =
             try {
@@ -167,6 +194,16 @@ class UploadApi(baseUrl: String) {
                     TransientException(message)
                 }
             }
+            // A 200 means S3 accepted what it received, not that it received
+            // everything. Nothing downstream re-reads a part's length, so an
+            // under-sent part becomes a hole in the assembled object; say so
+            // here rather than let the next round treat the part as done.
+            if (body.written != length) {
+                throw TransientException(
+                    "part $partNumber sent ${body.written}B of $length B",
+                )
+            }
+
             // Not bookkeeping we keep: the ETag is read only to check S3
             // acknowledged the part. The completion list is derived server-side
             // from ListParts, so this value is deliberately never persisted.
@@ -223,11 +260,16 @@ private class FileRangeBody(
     private val length: Long,
 ) : RequestBody() {
 
+    /** Bytes actually handed to the socket. Checked by the caller against [length]. */
+    var written: Long = 0L
+        private set
+
     override fun contentType() = null
 
     override fun contentLength() = length
 
     override fun writeTo(sink: BufferedSink) {
+        written = 0L
         RandomAccessFile(file, "r").use { raf ->
             raf.seek(offset)
             val buffer = ByteArray(64 * 1024)
@@ -242,6 +284,7 @@ private class FileRangeBody(
                     throw IOException("source file ended early at offset ${offset + (length - remaining)}")
                 }
                 sink.write(buffer, 0, read)
+                written += read
                 remaining -= read
             }
         }

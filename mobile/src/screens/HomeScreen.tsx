@@ -6,6 +6,7 @@ import {
   StyleSheet,
   Alert,
   ActivityIndicator,
+  Platform,
 } from 'react-native';
 import {
   errorCodes,
@@ -28,8 +29,14 @@ import {blobJobIndexStore} from '../storage/blobJobIndexStore';
  * well under a second, which leaves no window in which to kill the app and
  * observe that the upload survived — the stage's entire claim. `__DEV__` gates
  * it so a release build never carries it.
+ *
+ * 3s, not the 1.5s this started at, because the interesting kill is the one
+ * *between* parts — with no PUT in flight there is no half-sent part to confuse
+ * the resume. The 14.9 MB fixture is only 3 parts, and a host-driven kill takes
+ * about a second to land, so 1.5s was a coin flip on whether the process died
+ * in the gap or mid-body.
  */
-const DEBUG_PART_DELAY_MS = __DEV__ ? 1500 : 0;
+const DEBUG_PART_DELAY_MS = __DEV__ ? 3000 : 0;
 
 type HomeScreenProps = {
   navigation: NativeStackNavigationProp<RootStackParamList, 'Home'>;
@@ -66,7 +73,16 @@ export default function HomeScreen({navigation}: HomeScreenProps) {
 
         // Fallback for any build without the native module — iOS, or an APK
         // built before it existed. Uploads in the foreground and dies with the
-        // app, which is exactly the limitation 8A exists to remove.
+        // app, which is exactly the limitation 8A exists to remove. Taking this
+        // branch on Android means 8A is not working; it looks identical to
+        // success from the UI, so it is announced rather than assumed.
+        if (__DEV__ && Platform.OS === 'android') {
+          console.warn(
+            'Falling back to the foreground uploader: this upload will NOT ' +
+              'survive the app being killed.',
+          );
+        }
+
         const {jobId} = await uploadVideo({
           video,
           transport: blobTransport,
