@@ -119,7 +119,12 @@ func (s *Stage) Process(ctx context.Context, msg *events.StageMessage) (string, 
 		return "", fmt.Errorf("create output dir: %w", err)
 	}
 
-	if err := media.EncodeHLSLadder(ctx, videoPath, outDir, renditions, s.opts.SegmentSeconds); err != nil {
+	// The encoded renditions carry measured resolution and codec strings, which
+	// the master playlist needs. They cannot be predicted from the ladder: the
+	// H.264 level shifts with frame rate, and aspect-preserving scaling rounds to
+	// even dimensions.
+	encoded, err := media.EncodeHLSLadder(ctx, videoPath, outDir, renditions, s.opts.SegmentSeconds)
+	if err != nil {
 		// The input already passed validate and extract, so a transcode failure
 		// is a property of the file rather than of the attempt.
 		return "", worker.Permanent("hls transcode failed", err)
@@ -130,7 +135,7 @@ func (s *Stage) Process(ctx context.Context, msg *events.StageMessage) (string, 
 		return "", err
 	}
 
-	master := media.MasterPlaylist(renditions, subs)
+	master := media.MasterPlaylist(encoded, subs)
 	masterPath := filepath.Join(outDir, "master.m3u8")
 	if err := os.WriteFile(masterPath, []byte(master), 0o644); err != nil {
 		return "", fmt.Errorf("write master playlist: %w", err)

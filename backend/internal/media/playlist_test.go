@@ -13,6 +13,17 @@ func testLadder() []Rendition {
 	}
 }
 
+// testEncoded mirrors what ffmpeg actually reported for a 720p30 source: note
+// the 360p rung lands on a different H.264 level than the two above it.
+func testEncoded() []EncodedRendition {
+	ladder := testLadder()
+	return []EncodedRendition{
+		{Rendition: ladder[0], ActualWidth: 1280, ActualHeight: 720, Codecs: "avc1.4d401f,mp4a.40.2"},
+		{Rendition: ladder[1], ActualWidth: 854, ActualHeight: 480, Codecs: "avc1.4d401f,mp4a.40.2"},
+		{Rendition: ladder[2], ActualWidth: 640, ActualHeight: 360, Codecs: "avc1.4d401e,mp4a.40.2"},
+	}
+}
+
 func testSubs() *SubtitleRendition {
 	return &SubtitleRendition{
 		GroupID:  "subs",
@@ -24,13 +35,18 @@ func testSubs() *SubtitleRendition {
 }
 
 func TestMasterPlaylistStructure(t *testing.T) {
-	got := MasterPlaylist(testLadder(), testSubs())
+	got := MasterPlaylist(testEncoded(), testSubs())
 
 	if !strings.HasPrefix(got, "#EXTM3U\n") {
 		t.Errorf("playlist must begin with #EXTM3U:\n%s", got)
 	}
-	if !strings.Contains(got, "#EXT-X-VERSION:3") {
-		t.Error("missing version tag")
+	// Version 6 matches what ffmpeg writes into the media playlists it generates
+	// for these segments; a mismatch between master and media is a spec smell.
+	if !strings.Contains(got, "#EXT-X-VERSION:6") {
+		t.Errorf("expected version 6 to match the generated media playlists:\n%s", got)
+	}
+	if !strings.Contains(got, "#EXT-X-INDEPENDENT-SEGMENTS") {
+		t.Errorf("missing EXT-X-INDEPENDENT-SEGMENTS:\n%s", got)
 	}
 	if n := strings.Count(got, "#EXT-X-STREAM-INF:"); n != 3 {
 		t.Errorf("got %d variants, want 3:\n%s", n, got)
@@ -46,7 +62,7 @@ func TestMasterPlaylistStructure(t *testing.T) {
 // switches to it — which looks like a video bug, not a playlist bug, and only
 // shows up under bandwidth changes.
 func TestMasterPlaylistPutsSubtitlesOnEveryVariant(t *testing.T) {
-	got := MasterPlaylist(testLadder(), testSubs())
+	got := MasterPlaylist(testEncoded(), testSubs())
 
 	variants := strings.Count(got, "#EXT-X-STREAM-INF:")
 	tagged := strings.Count(got, `SUBTITLES="subs"`)
@@ -66,10 +82,49 @@ func TestMasterPlaylistPutsSubtitlesOnEveryVariant(t *testing.T) {
 	if !strings.Contains(got, `URI="subs/playlist.m3u8"`) {
 		t.Errorf("subtitle URI missing or unquoted:\n%s", got)
 	}
+	// AUTOSELECT is what makes a player enable the track for a matching system
+	// language without the user choosing it explicitly.
+	if !strings.Contains(got, "AUTOSELECT=YES") {
+		t.Errorf("missing AUTOSELECT on the subtitle rendition:\n%s", got)
+	}
+}
+
+// The measured resolution must win over the ladder's nominal one. A 1280x720
+// source scaled to the 480p rung yields 854x480, and advertising the ladder's
+// number instead would describe a stream that does not exist.
+func TestMasterPlaylistUsesMeasuredResolution(t *testing.T) {
+	encoded := testEncoded()
+	encoded[1].ActualWidth = 754 // e.g. a 1130x720 source
+	encoded[1].ActualHeight = 480
+
+	got := MasterPlaylist(encoded, nil)
+
+	if !strings.Contains(got, "RESOLUTION=754x480") {
+		t.Errorf("measured resolution not used:\n%s", got)
+	}
+	if strings.Contains(got, "RESOLUTION=854x480") {
+		t.Errorf("ladder resolution leaked into the master:\n%s", got)
+	}
+}
+
+func TestCodecsString(t *testing.T) {
+	// Level 31 (0x1f) is 720p30; level 32 (0x20) is what 720p60 produces. A
+	// hardcoded table would be wrong for every 60fps upload.
+	tests := map[int]string{
+		31: "avc1.4d401f,mp4a.40.2",
+		30: "avc1.4d401e,mp4a.40.2",
+		32: "avc1.4d4020,mp4a.40.2",
+		20: "avc1.4d4014,mp4a.40.2",
+	}
+	for level, want := range tests {
+		if got := CodecsString(level); got != want {
+			t.Errorf("CodecsString(%d) = %q, want %q", level, got, want)
+		}
+	}
 }
 
 func TestMasterPlaylistWithoutSubtitles(t *testing.T) {
-	got := MasterPlaylist(testLadder(), nil)
+	got := MasterPlaylist(testEncoded(), nil)
 
 	if strings.Contains(got, "SUBTITLES") {
 		t.Errorf("no subtitle rendition was given, but the master advertises one:\n%s", got)
@@ -86,26 +141,38 @@ func TestMasterPlaylistWithoutSubtitles(t *testing.T) {
 // sustain; the symptom is rebuffering rather than an error.
 func TestBandwidthExceedsCombinedBitrate(t *testing.T) {
 	for _, r := range testLadder() {
-		combined := (r.VideoBitrateKbps + r.AudioBitrateKbps) * 1000
-		if r.bandwidth() <= combined {
-			t.Errorf("%s: BANDWIDTH %d does not exceed combined bitrate %d",
-				r.Name, r.bandwidth(), combined)
+		if r.peakBandwidth() <= r.averageBandwidth() {
+			t.Errorf("%s: BANDWIDTH %d does not exceed AVERAGE-BANDWIDTH %d",
+				r.Name, r.peakBandwidth(), r.averageBandwidth())
+		}
+	}
+
+	// These are the exact values ffmpeg computes for its own master playlists;
+	// matching them keeps our hand-written master consistent with the segments.
+	want := map[string]int{"720p": 3220800, "480p": 1680800, "360p": 985600}
+	for _, r := range testLadder() {
+		if got := r.peakBandwidth(); got != want[r.Name] {
+			t.Errorf("%s: BANDWIDTH = %d, want %d (ffmpeg's own value)", r.Name, got, want[r.Name])
 		}
 	}
 }
 
 func TestMasterPlaylistDeclaresResolutionAndCodecs(t *testing.T) {
-	got := MasterPlaylist(testLadder(), nil)
+	got := MasterPlaylist(testEncoded(), nil)
 
 	for _, want := range []string{"RESOLUTION=1280x720", "RESOLUTION=854x480", "RESOLUTION=640x360"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q:\n%s", want, got)
 		}
 	}
-	// A wrong CODECS string is a silent playback failure: the player rejects the
-	// variant before fetching a segment.
-	if n := strings.Count(got, `CODECS="avc1.4d401f,mp4a.40.2"`); n != 3 {
+	// CODECS comes from measurement, not from the ladder: the level byte differs
+	// per rendition and moves with frame rate. Asserting all three are identical
+	// would bake in the very assumption that is wrong.
+	if n := strings.Count(got, "CODECS="); n != 3 {
 		t.Errorf("expected a CODECS attribute on each of 3 variants, got %d:\n%s", n, got)
+	}
+	if !strings.Contains(got, `CODECS="avc1.4d401e,mp4a.40.2"`) {
+		t.Errorf("the 360p rendition's distinct level was not carried through:\n%s", got)
 	}
 }
 

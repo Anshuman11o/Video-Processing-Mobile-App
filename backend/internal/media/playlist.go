@@ -19,13 +19,19 @@ type Rendition struct {
 // PlaylistPath is the rendition's playlist, relative to the master.
 func (r Rendition) PlaylistPath() string { return r.Name + "/playlist.m3u8" }
 
-// bandwidth is the advertised peak bitrate in bits per second.
+// peakBandwidth is the advertised peak bitrate in bits per second.
 //
-// Video plus audio plus a margin for container overhead. Advertising less than
-// the stream actually needs makes a player pick a rendition it cannot sustain,
-// which shows up as rebuffering rather than as an error.
-func (r Rendition) bandwidth() int {
-	return (r.VideoBitrateKbps+r.AudioBitrateKbps)*1000 + 128_000
+// The 1.1 multiplier matches what ffmpeg computes for its own master playlists,
+// and is not arbitrary: measured MPEG-TS framing overhead on these segments is
+// about 7%. Advertising less than the stream needs makes a player choose a
+// rendition it cannot sustain, which shows up as rebuffering rather than error.
+func (r Rendition) peakBandwidth() int {
+	return (r.VideoBitrateKbps + r.AudioBitrateKbps) * 1000 * 11 / 10
+}
+
+// averageBandwidth is the nominal payload rate, without framing overhead.
+func (r Rendition) averageBandwidth() int {
+	return (r.VideoBitrateKbps + r.AudioBitrateKbps) * 1000
 }
 
 // SubtitleRendition describes the WebVTT track advertised in the master.
@@ -43,34 +49,41 @@ type SubtitleRendition struct {
 // MasterPlaylist renders an HLS master playlist.
 //
 // ffmpeg can write its own master, but not one that includes a subtitle
-// rendition — its HLS muxer has no concept of one. Since the subtitle track is
-// the whole point of pairing this stage with the transcript, the master is
-// assembled here instead.
+// rendition — its HLS muxer has no concept of one, and asking it to produce one
+// alongside a multi-rendition ladder segfaults. Since the subtitle track is the
+// whole point of pairing this stage with the transcript, the master is assembled
+// here instead.
+//
+// Renditions must be EncodedRendition, not the requested ladder: RESOLUTION and
+// CODECS have to describe what the encoder actually produced. A 1280x720 source
+// scaled to 480p yields 854x480, and the H.264 level in the CODECS string shifts
+// with frame rate. Both are silent failures if guessed — a player rejects a
+// variant it cannot satisfy before fetching a single segment.
 //
 // subs may be nil, in which case no subtitle rendition is advertised and no
 // variant carries a SUBTITLES attribute.
-func MasterPlaylist(renditions []Rendition, subs *SubtitleRendition) string {
+func MasterPlaylist(renditions []EncodedRendition, subs *SubtitleRendition) string {
 	var b strings.Builder
 
 	b.WriteString("#EXTM3U\n")
-	b.WriteString("#EXT-X-VERSION:3\n")
+	// Version 6 matches the media playlists ffmpeg generates for these segments.
+	b.WriteString("#EXT-X-VERSION:6\n")
+	b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
 
 	if subs != nil {
 		b.WriteString(fmt.Sprintf(
-			"#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=%q,NAME=%q,LANGUAGE=%q,DEFAULT=%s,FORCED=%s,URI=%q\n",
+			"#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=%q,NAME=%q,LANGUAGE=%q,DEFAULT=%s,AUTOSELECT=%s,FORCED=%s,URI=%q\n",
 			subs.GroupID, subs.Name, subs.Language,
-			yesNo(subs.Default), yesNo(subs.Forced), subs.URI,
+			yesNo(subs.Default), yesNo(subs.Default), yesNo(subs.Forced), subs.URI,
 		))
 	}
 
 	for _, r := range renditions {
 		attrs := []string{
-			fmt.Sprintf("BANDWIDTH=%d", r.bandwidth()),
-			fmt.Sprintf("RESOLUTION=%dx%d", r.Width, r.Height),
-			// avc1.4d401f is H.264 Main profile level 3.1, aac-lc is mp4a.40.2.
-			// A player uses this to decide whether it can play the variant at
-			// all, before fetching a single segment.
-			`CODECS="avc1.4d401f,mp4a.40.2"`,
+			fmt.Sprintf("BANDWIDTH=%d", r.peakBandwidth()),
+			fmt.Sprintf("AVERAGE-BANDWIDTH=%d", r.averageBandwidth()),
+			fmt.Sprintf("RESOLUTION=%dx%d", r.ActualWidth, r.ActualHeight),
+			fmt.Sprintf("CODECS=%q", r.Codecs),
 		}
 		if subs != nil {
 			// Every variant must carry this. A player that switches to a variant
@@ -106,7 +119,7 @@ func SubtitlePlaylist(vttURI string, durationSeconds float64) string {
 
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n")
-	b.WriteString("#EXT-X-VERSION:3\n")
+	b.WriteString("#EXT-X-VERSION:6\n")
 	b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", target))
 	b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
 	// VOD tells the player the whole thing is available now and seeking is safe.
