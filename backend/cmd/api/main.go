@@ -1,0 +1,84 @@
+// Package main is the entry point for the DayReel API server.
+package main
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/anshumanagarwal/dayreel/internal/api"
+	"github.com/anshumanagarwal/dayreel/internal/cache"
+	"github.com/anshumanagarwal/dayreel/internal/config"
+	"github.com/anshumanagarwal/dayreel/internal/db"
+	"github.com/anshumanagarwal/dayreel/internal/storage"
+)
+
+func main() {
+	cfg := config.Load()
+	ctx := context.Background()
+
+	log.Printf("Starting DayReel API on port %s", cfg.Port)
+	log.Printf("LocalStack: %v, Endpoint: %s", cfg.UseLocalStack, cfg.AWSEndpoint)
+
+	// Initialize S3 client
+	s3Client, err := storage.NewS3Client(ctx, cfg)
+	if err != nil {
+		log.Fatalf("Failed to create S3 client: %v", err)
+	}
+
+	// Initialize DynamoDB client
+	dbClient, err := db.NewDynamoDBClient(ctx, cfg)
+	if err != nil {
+		log.Fatalf("Failed to create DynamoDB client: %v", err)
+	}
+
+	// Initialize Redis client
+	redisClient := cache.NewRedisClient(cfg)
+	if err := redisClient.Ping(ctx); err != nil {
+		log.Printf("WARN: Redis not available: %v (caching disabled)", err)
+	} else {
+		log.Println("Redis connected")
+	}
+	defer redisClient.Close()
+
+	// Create handler and router
+	handler := api.NewHandler(s3Client, dbClient, redisClient, cfg)
+	router := api.NewRouter(handler)
+
+	// Create server
+	srv := &http.Server{
+		Addr:         ":" + cfg.Port,
+		Handler:      router,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// Start server in goroutine
+	go func() {
+		log.Printf("API server listening on :%s", cfg.Port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+
+	// Wait for interrupt signal
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Println("Shutting down server...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Fatalf("Server forced to shutdown: %v", err)
+	}
+
+	log.Println("Server exited")
+}
