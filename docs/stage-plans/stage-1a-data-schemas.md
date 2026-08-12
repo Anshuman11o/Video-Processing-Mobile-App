@@ -169,7 +169,10 @@ in a `stages` map. This gives us full job status in one `GetItem` call.
 - **Next message:** Sends to `dayreel-transcribe` queue
 
 #### Transcribe
-- **Input:** `processed/{job_id}/audio.wav`
+- **Input:** `processed/{job_id}/extract.json` (the extract manifest; the audio
+  key is read from it). Corrected 2026-08-12 — stage 4A made the manifest its
+  canonical output, so the transcribe message points at that rather than
+  directly at the audio.
 - **Output:** `processed/{job_id}/transcript.vtt`
 - **Next message:** Sends to `dayreel-package` queue
 
