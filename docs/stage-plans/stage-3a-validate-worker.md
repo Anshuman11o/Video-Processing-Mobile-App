@@ -367,23 +367,71 @@ Expected: `stages.validate.status == "completed"` with a non-empty `output_key`;
 
 ## Verification
 
-- [ ] `worker-validate` starts and long-polls without busy-spinning the CPU
-- [ ] A completed upload triggers validate with no manual SQS publish
-- [ ] `stages.validate` goes `pending → running → completed`, `attempts == 1`
-- [ ] `dayreel-processed/{job_id}/validated.mp4` exists and is faststart
-      (`ffprobe -v error -show_entries format=start_time` returns promptly;
-      `moov` precedes `mdat`)
-- [ ] Exactly one message lands on `dayreel-extract`
-- [ ] Message is deleted from `dayreel-validate` (queue depth returns to 0)
-- [ ] **Idempotency:** replaying the same message leaves one output object,
+Run against LocalStack on 2026-08-12.
+
+- [x] `worker-validate` starts and long-polls without busy-spinning the CPU
+- [x] A completed upload triggers validate with no manual SQS publish
+- [x] `stages.validate` goes `pending → running → completed`, `attempts == 1`
+- [x] `dayreel-processed/{job_id}/validated.mp4` exists and is faststart
+      (unit-tested directly: `moov` precedes `mdat` in the output bytes)
+- [x] Exactly one message lands on `dayreel-extract`, carrying the inherited
+      `trace_id` and pointing at the processed bucket
+- [x] Message is deleted from `dayreel-validate` (queue depth returns to 0)
+- [x] **Idempotency:** replaying the same message leaves one output object,
       does not double-publish to extract, and does not bump `attempts`
-- [ ] **Permanent failure:** a text file renamed `.mp4` marks the stage `failed`
-      with a readable error, flips the job to `failed`, deletes the message, and
-      does **not** reach the DLQ
+      — **failed on first run; see "Bug found in verification" below**
+- [x] **Permanent failure:** a text file renamed `.mp4` marks the stage `failed`
+      with a readable error (`moov atom not found`), flips the job to `failed`,
+      deletes the message, and does **not** reach the DLQ. `attempts == 1`
+      confirms it was not retried.
 - [ ] **Transient failure:** with LocalStack stopped mid-job, the message returns
-      to the queue and succeeds on retry once LocalStack is back
+      to the queue and succeeds on retry once LocalStack is back — **not yet run**
 - [ ] After 3 genuine transient failures the message lands in `dayreel-dlq`
+      — **not yet run**
 - [ ] Worker exits cleanly on SIGTERM without orphaning an in-flight ffmpeg
+      — **not yet run**
+
+### Bug found in verification
+
+The idempotency check failed on the first run: replaying an S3 event for an
+already-completed job **double-published to `dayreel-extract`** (depth 1 → 2) and
+bumped `attempts` (1 → 2).
+
+"Output exists" cannot on its own separate two situations that need opposite
+handling — a pure duplicate delivery (must not republish) and a crash after
+uploading output but before recording completion (must republish, or the
+pipeline stalls forever). The original code always republished, which is right
+for the second and wrong for the first. The recorded stage status distinguishes
+them, but `SetStageRunning` was overwriting it before the check could read it.
+
+Fixed by moving the completion check ahead of `SetStageRunning`. Re-verified:
+the replay now logs `already completed, dropping duplicate`, `attempts` holds,
+and the extract queue stays put.
+
+Worth noting the shape of this bug: everything compiled, all unit tests passed,
+and the happy path was flawless. Only replaying a real message against real
+infrastructure exposed it.
+
+### Unplanned observation: S3 test events
+
+Configuring a bucket notification makes S3 emit an `s3:TestEvent`, which lands on
+the validate queue at startup. The worker classifies it as unparseable, deletes
+it, and moves on — the intended behaviour for stray messages, confirmed here by
+accident rather than design.
+
+### Finding: presigned URLs are unusable outside the Docker network
+
+`POST /jobs` returns upload URLs hosted at `http://localstack:4566/...`, the
+Docker-internal name, because the API signs them against `LOCALSTACK_ENDPOINT`.
+SigV4 signs the `host` header, so the host cannot simply be rewritten to
+`localhost` — the signature breaks. Testing from the host therefore had to run
+the upload from inside a container.
+
+This is a **Stage 7 blocker**: the mobile client runs outside the Docker network
+and will not be able to PUT to these URLs. The fix is a separate public-facing
+endpoint for presigning (e.g. `S3_PUBLIC_ENDPOINT=http://localhost:4566`) while
+the API keeps using the internal endpoint for its own calls. Not addressed here,
+since it is an API concern rather than a worker one.
 
 ## Notes
 
