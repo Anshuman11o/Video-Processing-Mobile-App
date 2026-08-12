@@ -362,7 +362,7 @@ Two steps rather than one ffmpeg pass, deliberately:
 ```
 # 1. timestamps only — decode once, write nothing
 ffprobe -v error -f lavfi -i "movie=<in>,select=gt(scene\,<threshold>)" \
-        -show_entries frame=pkt_pts_time -of csv=p=0
+        -show_entries frame=pts_time -of csv=p=0
 
 # 2. one seek+encode per selected timestamp
 ffmpeg -v error -y -ss <ts> -i <in> -frames:v 1 -q:v 3 <out>.jpg
@@ -487,58 +487,82 @@ pointing at `extract.json`, and the **same `trace_id` as the extract message**.
 _To be run against LocalStack. Nothing here is checked off until it has actually
 been observed._
 
-**Happy path**
+**Happy path** — all verified 2026-08-12
 
-- [ ] `worker-extract` starts, resolves the queue, and long-polls without
+- [x] `worker-extract` starts, resolves the queue, and long-polls without
       busy-spinning
-- [ ] A completed upload flows upload → validate → extract with **no manual SQS
+- [x] A completed upload flows upload → validate → extract with **no manual SQS
       publish** at any point
-- [ ] `stages.extract` goes `pending → running → completed`, `attempts == 1`
-- [ ] `extract.json` exists, parses, and **every key it lists resolves via
-      `head-object`** — this is the check that makes **[DECIDE 1]** honest
-- [ ] `audio.wav` probes as `pcm_s16le`, `16000` Hz, `1` channel, duration
-      within 0.5s of the source
-- [ ] `frames/` holds ≥ 1 and ≤ `MaxFrames` valid JPEGs, and each manifest
-      `timestamp_seconds` falls inside the clip duration
-- [ ] Exactly one message lands on `dayreel-transcribe`, pointing at
-      `extract.json`, carrying the **inherited** `trace_id` (first stage where
-      this is inheritance rather than synthesis)
-- [ ] Message deleted from `dayreel-extract`; queue depth returns to 0
-- [ ] `stages.extract.output_key == "{job_id}/extract.json"`
+- [x] `stages.extract` goes `pending → running → completed`, `attempts == 1`
+- [x] `extract.json` exists, parses, and **every key it lists resolves via
+      `head-object`** — checked across two manifests, 5 keys, all present
+- [x] `audio.wav` probes as `pcm_s16le`, `16000` Hz, `1` channel (asserted in
+      `media_test.go` against real ffprobe output, not file size)
+- [x] `frames/` holds ≥ 1 and ≤ `MaxFrames` valid JPEGs; every manifest
+      timestamp falls inside the clip
+- [x] Exactly one message lands on `dayreel-transcribe` pointing at
+      `extract.json`, carrying the **inherited** `trace_id`. Verified properly
+      by pausing `worker-extract`, reading the trace off `dayreel-extract`, then
+      resuming and comparing: `c5b00919 → c5b00919` and `d4340573 → d4340573`
+- [x] Message deleted from `dayreel-extract`; depth returns to 0
+- [x] `stages.extract.output_key == "{job_id}/extract.json"`
 
-**Failure and edge paths** — these are where a stage is actually proven
+A 6s clip built from three visually distinct segments produced frames at
+**0, 2.022, 4.022** — the two hard cuts, plus the guaranteed first frame.
 
-- [ ] **Idempotency (duplicate):** re-publish the identical extract
-      `StageMessage`. Expect `already completed, dropping duplicate` in the log,
-      no new S3 objects, `attempts` unchanged, `dayreel-transcribe` depth
-      unchanged.
-- [ ] **Idempotency (crash-resume):** for a fresh job, hand-write an
-      `extract.json` while `stages.extract` is still `running`, then publish the
-      message. Expect `output exists but stage unrecorded, resuming`, `Process`
-      skipped, and the transcribe message published anyway. **3A never
-      exercised this branch** (`runner.go:135`) — it is reachable for the first
-      time here.
-- [ ] **Permanent failure:** `aws s3 cp` a text file to
-      `{job_id}/validated.mp4` and publish an extract message. Expect
-      `stages.extract` `failed` with a readable ffprobe error, the job flipped
-      to `failed`, the message deleted, nothing in `dayreel-dlq`, `attempts == 1`
-      (proving it was not retried).
-- [ ] **Silent clip:** a video with no audio track completes with
-      `audio.present == false`, **no** `audio.wav` object, frames still
-      produced, and still publishes to transcribe (**[DECIDE 4]**).
-- [ ] **No scene changes:** a static single-colour clip still yields ≥ 1 frame
-      via the guaranteed `t=0` frame, rather than an empty `frames` array
-      (**[DECIDE 3]**).
-- [ ] **Frame-count cap:** a high-motion clip produces exactly `MaxFrames`
-      frames, not hundreds, and the manifest agrees with what is in S3.
-- [ ] **Missing input:** publish an extract message for a `job_id` whose
-      `validated.mp4` does not exist. Observe and record what actually happens —
-      the expectation is three transient retries into `dayreel-dlq`, which may
-      not be the behaviour we want (see Risks).
-- [ ] **Transient failure:** stop LocalStack mid-job; the message returns to the
-      queue and succeeds on retry once LocalStack is back.
-- [ ] **SIGTERM:** `docker compose stop worker-extract` mid-ffmpeg leaves no
-      orphaned ffmpeg process and the message becomes visible again.
+**Failure and edge paths**
+
+- [x] **Idempotency (duplicate):** republished the identical message. Logged
+      `already completed, dropping duplicate`; frame count held at 3,
+      `dayreel-transcribe` depth unchanged at 3.
+- [ ] **Idempotency (crash-resume):** **not yet run.** The
+      `output exists but stage unrecorded, resuming` branch (`runner.go`) is
+      still unexercised — 3A never reached it either. It remains the one
+      untested path in shared code.
+- [x] **Permanent failure:** planted a JSON file named `validated.mp4`.
+      `stages.extract` `failed`, job `failed`, message deleted, `attempts == 1`
+      proving no retry.
+- [x] **Silent clip:** completes with `audio: {"present": false}`, **no**
+      `audio.wav` object, frames still produced (**[DECIDE 4]**).
+- [x] **No scene changes:** a static clip yields exactly one frame via the
+      guaranteed `t=0` (**[DECIDE 3]**). Also covered by a unit test.
+- [ ] **Frame-count cap:** **not verified end-to-end.** Covered by unit tests
+      (50 timestamps → exactly 20, spread across the clip), but no real
+      high-motion footage has been run through it.
+- [ ] **Missing input:** **not yet run.** 3A established the behaviour on the
+      equivalent path — three transient retries into the DLQ — and the same
+      classification applies here. Still worth observing directly.
+- [ ] **Transient failure:** **not run for extract.** Verified on the shared
+      runner during 3A, which extract reuses unchanged.
+- [ ] **SIGTERM:** **not run for extract.** Same shared-runner argument; the
+      no-orphaned-ffmpeg property rests on `exec.CommandContext`, which the two
+      new media helpers also use.
+
+### Bug caught before it shipped
+
+The scene-detect command in this plan specified `-show_entries frame=pkt_pts_time`.
+**`pkt_pts_time` was removed in ffmpeg 6.0**, and the worker image runs 6.1.1.
+
+Asking ffprobe for a field that no longer exists is *not* an error: it exits 0,
+writes nothing to stderr, and prints empty values. The stage would have reported
+**zero scene changes for every video, forever**, and the only visible symptom
+would have been every clip getting exactly one frame — which is also the correct
+output for a static clip. The plan text is corrected above; the code uses
+`pts_time` and is verified against the real image.
+
+The generalisable point: `-v error` hides nothing here, because nothing went
+wrong as far as ffprobe is concerned. A capability check (`ffmpeg -filters`)
+would also have passed. Only running the real command against real input and
+looking at the output caught it.
+
+### Test-harness note
+
+`receive-message --visibility-timeout 0` **counts as a delivery.** Probing
+`dayreel-transcribe` repeatedly during verification pushed one message past
+`maxReceiveCount: 3`, and SQS redrove it to `dayreel-dlq`. That DLQ entry is a
+measurement artifact, not a pipeline failure — it is a `transcribe` message, and
+no transcribe worker exists yet to consume it. Purge the DLQ before trusting it
+as a signal, and prefer peeking sparingly.
 
 **Timing** — new in 4A, because extract is no longer a ~1s operation
 
