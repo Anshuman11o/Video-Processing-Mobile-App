@@ -1,7 +1,24 @@
 # Stage 8A: Background Upload
 
-> Status: **approved — implementation started 2026-08-13.** All seven decisions
-> settled; the answers are recorded below and inline in each section.
+> Status: **partially implemented; the headline feature is NOT verified.** All
+> seven decisions settled; the answers are recorded below and inline in each
+> section.
+>
+> **What is real as of 2026-08-13:** the backend half is done and tested — the
+> re-presign endpoint, the tolerant `CompleteUpload`, `ListParts`, the abort
+> path, the lifecycle rule and the reaper script. **[DECIDE 7]** is resolved and
+> the toolchain exists (see the outcome note in that section). The Kotlin
+> WorkManager module compiles, is registered in `MainApplication.kt`, and ships
+> in the installed APK.
+>
+> **What is not:** **no background upload has ever been observed to run.** At the
+> last check, JavaScript could not resolve the `DayReelUpload` native module, so
+> `isBackgroundUploadAvailable()` returns false and `HomeScreen` falls back —
+> silently, by design — to the foreground uploader from Stage 7. That fallback is
+> why the verified Stage 7 run says nothing about this stage. **The stage's own
+> verification — start an upload, kill the app, watch it finish — has not been
+> run.** Until it has, treat "upload survives app kill" as UNVERIFIED regardless
+> of how much of the code exists.
 >
 > | | Settled as |
 > |---|---|
@@ -11,7 +28,7 @@
 > | **[DECIDE 4]** abandoned uploads | **All three** — lifecycle rule, explicit `DELETE`, and a manual reaper script. |
 > | **[DECIDE 5]** source file | `DocumentDir` + orphan sweep, existence check as backstop. |
 > | **[DECIDE 6]** interrupt window | Debug-only inter-part delay, so there is something to kill. |
-> | **[DECIDE 7]** toolchain | **Install everything, NDK included.** Disk was freed the same day: **24 GiB now, not 2.8** — the "stop below ~12 GB" fallback is moot. Node 22 via nvm alongside it (RN 0.87 needs ≥22.13; the machine had v20.11). |
+> | **[DECIDE 7]** toolchain | **RESOLVED — installed, and the build is green.** Disk was freed the same day: 24 GiB, not 2.8. Node 22.23.2 via nvm alongside it (RN 0.87 needs ≥22.13; the machine had v20.11). See the outcome note in **[DECIDE 7]** for the three things the install turned up that the plan did not anticipate. |
 >
 > **Real AWS is deferred to a single run at the end**, not used for development.
 > Provisioning is real work, not a flag: compose hardcodes `USE_LOCALSTACK=true`
@@ -695,7 +712,44 @@ local override, or it becomes the next `S3_PUBLIC_ENDPOINT`-shaped trap.
 repeating it.** 8B is blocked on it *entirely*; 8A is blocked on it only from
 Phase 2 onward.
 
-Verified on this machine, today:
+> **RESOLVED, 2026-08-13 — the toolchain exists and has been exercised.** The
+> recommended sequence below was followed and worked: disk reclaimed first, then
+> the install, NDK included. `:app:assembleDebug` produces a ~147 MiB debug APK
+> that installs, launches on an AVD named `dayreel-avd`, and reaches the API at
+> `10.0.2.2:8080`. **This decision no longer blocks anything.**
+>
+> As installed: SDK at `~/Library/Android/sdk`, platforms `android-37.0` and
+> `android-36`, build-tools 37.0.0, NDK 27.1.12297006, system image
+> `android-36;google_apis;arm64-v8a`. Footprint **8.8 GiB** — the 15–20 GB
+> estimate below was roughly double the truth.
+>
+> **Three things the plan did not anticipate**, all now in `docs/SETUP.md`:
+>
+> 1. **`platforms;android-37` does not exist.** Google moved to minor-versioned
+>    platforms; the repository offers `android-37.0`, `37.1` and `37.2-beta*`.
+>    `compileSdk 37` does not name an installable package.
+> 2. **Node had to be upgraded.** RN 0.87 declares
+>    `^22.13.0 || ^24.3.0 || >= 26.0.0`; the machine had v20.11.0. Now 22.23.2
+>    via nvm, pinned by `mobile/.nvmrc`. **`nvm use` fails here** because
+>    `~/.npmrc` sets a `prefix` — use `nvm use --delete-prefix 22`, or put
+>    `~/.nvm/versions/node/v22.23.2/bin` on `PATH`.
+> 3. **The first build failed on a dependency, not on the toolchain.**
+>    `react-native-document-picker@9.3.1` does not compile against RN 0.87 — it
+>    extends `GuardedResultAsyncTask`, which 0.87 removed — and it is deprecated
+>    with no successor version. Replaced with `@react-native-documents/picker`,
+>    whose `keepLocalCopy()` **resolves on failure instead of throwing**.
+>
+> **The NDK question below was never actually answered.** Option (b)'s
+> "skip the NDK and find out" experiment was not run; once disk was plentiful the
+> NDK was simply installed, so whether the build strictly requires it is still
+> **UNKNOWN**. It was a ~10 GB question that stopped mattering rather than
+> getting resolved.
+>
+> The one honest miss in the reasoning below: it treated disk as the binding
+> constraint and the toolchain as the only obstacle. Disk was cleared in minutes
+> and never stopped anything; a dead dependency did.
+
+Verified on this machine at plan time, and **superseded by the note above**:
 
 | Fact | Value |
 |---|---|
@@ -889,7 +943,17 @@ _Nothing checked off until observed._
 
 **Phase 1 — backend, no toolchain required**
 
-- [ ] `POST /jobs` returns **12** URLs for a 3 MB file with `UPLOAD_PART_SIZE=262144`
+> `scripts/verify-resume.sh` exercises this list from `curl`. It runs from the
+> host despite the unroutable signed endpoint by using
+> `curl --connect-to 10.0.2.2:4566:127.0.0.1:4566`, which redirects the
+> connection while leaving the signed `Host` header intact — worth knowing,
+> because `docs/SETUP.md` previously offered only the compose flip and the `lo0`
+> alias for this problem.
+
+- [ ] ~~`POST /jobs` returns **12** URLs for a 3 MB file with `UPLOAD_PART_SIZE=262144`~~
+      **Void.** Per the second correction at the top of this document, sub-5 MiB
+      part sizes are clamped and a real multipart test needs a clip over 5 MiB
+      instead. Stage 7's verified run is the working example: 14.9 MB → 3 parts
 - [ ] `POST /jobs/{id}/upload-urls` on a fresh job returns all N parts as missing
 - [ ] After PUTting parts 1–3, it returns exactly parts 4–N and lists 1–3 as
       uploaded, **with the ETags S3 reports**, not any the client sent
@@ -912,10 +976,15 @@ _Nothing checked off until observed._
 - [ ] `s3 ls` does **not** show an abandoned upload and `list-multipart-uploads`
       **does** — run both, paste both
 
-**Phase 2 — the app. Blocked on [DECIDE 7]**
+**Phase 2 — the app.** ~~Blocked on **[DECIDE 7]**~~ — **unblocked 2026-08-13,
+and still unverified.** The toolchain exists and the module ships in the APK, but
+JavaScript could not resolve `DayReelUpload` at the last check, so `HomeScreen`
+falls back to the Stage 7 foreground uploader. **Nothing below has been
+observed.** Note that the fallback is silent by design, so a successful upload
+from the app is *not* evidence that any of this ran.
 
-- [ ] The app builds and launches on the emulator (**this has never happened in
-      this repo**)
+- [x] The app builds and launches on the emulator (~~this has never happened in
+      this repo~~ — it has now; ~147 MiB debug APK on `dayreel-avd`)
 - [ ] Upload starts, is killed at ~30%, app relaunches, upload resumes from the
       recorded part and finishes
 - [ ] The resumed job reaches `completed` and `GET /jobs/{id}/reel` returns 200
@@ -940,9 +1009,10 @@ _Nothing checked off until observed._
       `scripts/abort-stale-uploads.sh`
 - [ ] `docker system df` — the 8 GB ceiling holds (it was at 4.3 GB images +
       2.3 GB build cache before this stage started)
-- [ ] Host free disk recorded before and after (**2.8 GB** at plan time)
-- [ ] Nothing provisioned on real AWS. If anything was, name it explicitly per
-      `config/free-tier.md`
+- [x] Host free disk recorded before and after — **2.8 GB** at plan time, ~24 GiB
+      after reclamation, **~6 GiB** now with the 8.8 GiB SDK installed
+- [x] Nothing provisioned on real AWS. **Nothing ever has been**, in this stage or
+      any other: no bucket, queue or table has existed outside LocalStack
 
 **Explicitly NOT verified, and why**
 
@@ -1108,7 +1178,7 @@ this stage — **the 2.8 GB host disk figure**, which is now the binding constra
 
 | Blocker | Resolution |
 |---|---|
-| **No Android SDK; 2.8 GB free disk** | **[DECIDE 7]**. The single most likely reason this stage does not finish. Phases 2–4 are deliberately built to be immune to it |
+| ~~**No Android SDK; 2.8 GB free disk**~~ | **CLEARED 2026-08-13** — **[DECIDE 7]**. It was not the reason this stage did not finish; see the WorkManager row, which was the one marked "unbudgeted" |
 | **`UPLOAD_PART_SIZE` set but not reaching the container** | Landed 2026-08-13, but a value in compose is not a value in the process. One `POST /jobs` for 3 MB settles it: 12 URLs or 1 |
 | **`plans.length !== urls.length` guard in `uploader.ts`** | Rejects every resume by construction. Found by reading Stage 7's just-landed code, not by running it |
 | **No interruption window at loopback speed** | **[DECIDE 6]**(b), the debug inter-part delay. Without it the kill-and-resume test cannot reliably reach the state it tests |
@@ -1116,8 +1186,8 @@ this stage — **the 2.8 GB host disk figure**, which is now the binding constra
 | **Lifecycle rule unverifiable locally** | **[DECIDE 4]**. Documented as unverified rather than claimed. `abort-stale-uploads.sh` is the mechanism that actually runs |
 | **Source file gone on resume** | **[DECIDE 5]**. Detect, abort, re-pick. The mechanism can be perfect and still have nothing to upload |
 | **Stage 7's mobile half is not merged** | Phases 5–7 build on files that do not exist yet. Sequence, do not race |
-| **`S3_PUBLIC_ENDPOINT=10.0.2.2` breaks host-side `curl`** | Already documented in `docs/SETUP.md`. Flip to `localhost` for Phase 1–4, restore before any emulator run — and **restoring it is the step that gets forgotten** |
-| **WorkManager under New Architecture** | Only if **[DECIDE 1]**(b). A TurboModule under `newArchEnabled=true` on RN 0.87 with zero native modules in this repo today. Unbudgeted |
+| **`S3_PUBLIC_ENDPOINT=10.0.2.2` breaks host-side `curl`** | **Solved without the compose flip:** `curl --connect-to 10.0.2.2:4566:127.0.0.1:4566` redirects the connection and leaves the signed `Host` intact. `verify-resume.sh` does this; nothing has to be restored, so the step that gets forgotten no longer exists |
+| **WorkManager under New Architecture** — **this is where the stage actually stalled** | The module compiles, registers via `BaseReactPackage`, and is in the shipped APK, but **JS cannot resolve `DayReelUpload`**, so `TurboModuleRegistry.get` and the `NativeModules` fallback both return null. Registration is by hand rather than by codegen (`nativeUploader.ts` says so explicitly), which is the likely place to look. Correctly identified as **"unbudgeted"** when this table was written |
 
 ### Time Estimate
 

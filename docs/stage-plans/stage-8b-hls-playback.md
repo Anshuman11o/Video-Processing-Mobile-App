@@ -1,13 +1,21 @@
 # Stage 8B: HLS Playback
 
-> Status: **approved — implementation started 2026-08-13.** All six decisions
-> settled.
+> Status: **VERIFIED in the app, 2026-08-13.** A reel plays from the `hls_url`,
+> with captions, in `react-native-video`/ExoPlayer on the Android emulator. All
+> six decisions settled.
+>
+> **What that verification covers, and what it does not.** LocalStack only, one
+> emulator, `MOCK_TRANSCRIBE=true`. The caption track is present and renders — the
+> picker lists `#0 en English` and a cue was read back live during playback — but
+> **the caption offset has not been measured on ExoPlayer.** The numbers in
+> **[DECIDE 3]** and in 6A's known-defect section are **AVFoundation's**, and the
+> two players may not agree. Nothing here has ever touched real AWS.
 >
 > | | Settled as |
 > |---|---|
-> | **[DECIDE 1]** player | **Write the player code and fix New Architecture problems as they surface.** **This went against the plan's recommendation**, which was to prove the build green before writing anything. The risk is now accepted explicitly: if `react-native-video` v6 cannot work under `newArchEnabled=true`, the player code, the screen changes and the caption work will all have been written against something that cannot run. |
+> | **[DECIDE 1]** player | **Write the player code and fix New Architecture problems as they surface.** **This went against the plan's recommendation**, which was to prove the build green before writing anything. **The gamble paid: `react-native-video` v6 works under RN 0.87 with `newArchEnabled=true`** — verified by a build that runs and plays, 2026-08-13. The gate is answered; see the note in **[DECIDE 1]** for what the build did break on instead. |
 > | **[DECIDE 2]** segment access | **Playback stays LocalStack-only.** The real-AWS run verifies upload and pipeline only. Zero exposure, zero extra cost, and `dayreel-hls-output` never becomes a public bucket on a real account — at the price of the reel never being played from real infrastructure. |
-> | **[DECIDE 3]** caption defect | **Measure AND fix inside 8B.** **Against the plan's recommendation** of a separate 6B: this stage now edits `backend/internal/media/`, which is 6A's code. Measurement still strictly precedes the fix — "the player is fine, change nothing" remains a real possible outcome. |
+> | **[DECIDE 3]** caption defect | **Measure AND fix inside 8B.** **Against the plan's recommendation** of a separate 6B: this stage edits `backend/internal/media/`, which is 6A's code. **Done, 2026-08-13.** Measurement preceded the fix and did not vindicate "change nothing": the offset was real (66.667 ms, `2/fps`), though 6A's dropped-first-cue was an artefact of ffmpeg's reader. `X-TIMESTAMP-MAP` shipped in `media/subtitles.go`; residual 0.333 ms **on AVFoundation**. |
 > | **[DECIDE 4]** caption visibility | Select by language *and* render the track list, so "no captions" is a three-way diagnosis rather than a dead end. |
 > | **[DECIDE 5]** cleartext | Rely on the RN Gradle plugin's debug placeholder; document what it means for a release build. |
 > | **[DECIDE 6]** verification | Split into **8B-0** (host-side, needs no toolchain) and **8B-1** (the app). |
@@ -17,9 +25,11 @@
 > makes that possible.
 >
 > The Android toolchain question is **[DECIDE 7] in stage 8A** and is not
-> restated here. It has since been settled and the blocker cleared: disk went
-> from 2.8 GB to **24 GiB**, and a full SDK install including the NDK was
-> approved.
+> restated here. It is **resolved**: disk was reclaimed, the full SDK including
+> the NDK was installed (8.8 GiB), and the app builds and runs. 8A's
+> **[DECIDE 7]** carries the three surprises that install turned up — the
+> `android-37.0` platform naming, the Node 22 requirement, and the document
+> picker that does not compile against RN 0.87.
 
 ## Aim
 
@@ -73,8 +83,12 @@ picker. `docs/SETUP.md` records that LocalStack serves unsigned GETs regardless
 of policy, and `init-aws.sh` additionally grants public read on
 `dayreel-hls-output`, so no credentials are involved.
 
-**Status: ASSUMED, not verified.** It has not been run. It costs one command to
-find out, and if it works it means:
+**Status: ~~ASSUMED, not verified~~ — CONFIRMED, 2026-08-13, and better than
+planned.** The host really can play the master with no emulator involved. What
+was actually used was not Safari but a **headless AVFoundation probe**
+(`AVURLAsset` + `AVPlayerItemLegibleOutput`), which is the same engine and
+reports the cue presentation time as a number instead of requiring someone to
+eyeball a browser. Everything this section predicted followed:
 
 - Stage 7's caption measurement (**[DECIDE 7]** there) is **unblocked today**,
   before any toolchain exists.
@@ -96,7 +110,7 @@ the caption question from "blocked on Android" to "answerable now."
 | `mobile/src/api/client.ts` | **No change** — `getReel` already exists |
 | `mobile/src/hooks/` | Possibly modify — fetch the reel on focus |
 | `mobile/android/app/src/main/res/xml/network_security_config.xml` | Create — **only under [DECIDE 5]**(b) |
-| `backend/internal/media/hls.go`, `subtitles` | **Deliberately not touched** — the caption fix belongs to a 6B (**[DECIDE 3]**) |
+| `backend/internal/media/hls.go`, `subtitles.go` | **Modified.** ~~Deliberately not touched — the caption fix belongs to a 6B~~; **[DECIDE 3]** settled the other way and 8B applied the fix itself (`X-TIMESTAMP-MAP`, `media/subtitles.go`, wired in `packager.go`) |
 | `infra/localstack/init-aws.sh` | Possibly modify — **[DECIDE 2]**, only if the access model changes |
 
 ## Boundaries
@@ -165,8 +179,23 @@ item. It is the only stage in this project that is purely a consumer.
 
 **Answer this before anything else in the stage.** It is a build, not a debate.
 
-`mobile/package.json` has **no video library** (verified). `gradle.properties`
-has `newArchEnabled=true` and React Native is `0.87.0` with React `19.2.3`.
+> **ANSWERED, 2026-08-13: `react-native-video` v6 works** under RN 0.87 with
+> `newArchEnabled=true`. Not inferred from a green build — a reel plays, with a
+> caption track ExoPlayer lists and renders. Option **(a)** stands; the WebView
+> escape hatch **(d)** was not needed and neither were (b) or (c).
+>
+> **The caution below was right, but aimed at the wrong dependency.** "Expected to
+> work" did fail on this build — just not here. `react-native-document-picker`
+> was the library that did not compile against RN 0.87 (it extends
+> `GuardedResultAsyncTask`, which 0.87 removed), and it is deprecated with no
+> successor, so it had to be swapped for `@react-native-documents/picker`. The
+> smaller unknown flagged at the end of this section — Media3/ExoPlayer's own
+> `compileSdk` and AGP expectations against `compileSdk 37` / Kotlin 2.2.0 /
+> Gradle 9.4.1 — did not bite either.
+
+`mobile/package.json` has **no video library** (verified at plan time).
+`gradle.properties` has `newArchEnabled=true` and React Native is `0.87.0` with
+React `19.2.3`.
 
 **The unknown, stated plainly: `react-native-video` v6's support for RN 0.87 with
 `newArchEnabled=true` has not been checked in this environment or anywhere else
@@ -320,8 +349,33 @@ silence.
 
 ### [DECIDE 3] — 6A's caption defect: measure here, fix where?
 
-The defect, from `stage-6a-package-worker.md`'s known-defect section: **the first
-caption cue is dropped entirely, and every other cue lands ~112 ms early**,
+> **RESOLVED, 2026-08-13 — measured here, fixed here, and 6A's description of the
+> defect was wrong in three ways.** Candidate **(b)**, `X-TIMESTAMP-MAP`,
+> shipped in `media/subtitles.go`. The corrections, in descending order of how
+> much they would have cost:
+>
+> 1. **The first cue was never dropped.** A player delivers it at a negative item
+>    time and shows it from the start; only ffmpeg's *reader* discards it.
+>    Confirmed by seeking — the player reports `segment 1` at t=0.5, 1.5 and 2.8.
+>    So option **(a) "do nothing"** was being weighed against a symptom that did
+>    not exist.
+> 2. **The offset is `2/fps`, not a constant, and not 112 ms.** It is the
+>    encoder's B-frame reorder delay: 66.667 ms at 30 fps, 83.3 ms at 24 fps,
+>    both measured. **Option (c) — shift every cue by the measured offset —
+>    would therefore have shipped a number wrong for most sources.** That is the
+>    expensive mistake this decision avoided.
+> 3. **The anchor is the *video* start PTS, not the container's.** `MPEGTS:6000`
+>    landed every cue on its authored time; `MPEGTS:4080`, the container start,
+>    left them 21.3 ms early. Measured, not reasoned.
+>
+> Residual **0.333 ms**, cause UNKNOWN, recorded rather than chased. **All of
+> this is AVFoundation.** ExoPlayer renders the track but its offset has never
+> been measured, and if it seeds from the container start it will read ~21.3 ms
+> early instead. Full workings in `stage-6a-package-worker.md`.
+
+The defect as inherited, from `stage-6a-package-worker.md`'s known-defect
+section — **and see the note above, which contradicts most of it**: *the first
+caption cue is dropped entirely, and every other cue lands ~112 ms early*,
 because subtitle timings are offset against the MPEG-TS start PTS. Observed: the
 mock's `0→3s` cue is absent and its `3→6s` cue surfaces at `00:02.888`.
 
@@ -634,42 +688,51 @@ _Nothing checked off until observed._
 
 **The gate**
 
-- [ ] The app builds and launches on the emulator with `react-native-video`
-      installed and **no player code written yet** — so a later failure is
-      attributable to the code, not the dependency
+- [x] The app builds and launches on the emulator with `react-native-video`
+      installed — **passed 2026-08-13.** Not in the isolating form this box asks
+      for (**[DECIDE 1]** chose to write the player code first), so a failure
+      would have been ambiguous. It did not fail
 
 **Playback**
 
 - [ ] A completed job shows a play affordance; a `processing` or `failed` job
-      does not
-- [ ] Tapping it plays the HLS stream in the app
-- [ ] Video renders — not a black surface with audio, which is the usual shape of
-      a Fabric/New Architecture view-mounting failure
-- [ ] Audio plays
-- [ ] Seeking works and does not desync captions
+      does not — the negative half was not exercised
+- [x] Tapping it plays the HLS stream in the app
+- [x] Video renders — not a black surface with audio, which is the usual shape of
+      a Fabric/New Architecture view-mounting failure. This was the specific
+      Fabric risk **[DECIDE 1]** accepted, and it did not materialise
+- [ ] Audio plays — not confirmed separately from video
+- [ ] Seeking works and does not desync captions — seeking was used to *probe*
+      cue boundaries, which is not the same as verifying it for a viewer
 - [ ] `GET /jobs/{id}/reel` returning **409** is handled as "not ready, retry",
       not surfaced as an error — the reel endpoint bypasses the Redis cache
       (`handlers.go:245`) while `GET /jobs/{id}` does not, so the two can disagree
 
 **Captions — the reason this stage matters**
 
-- [ ] The caption **track picker lists "English"** — checked in the picker, not
-      inferred from the video surface
-- [ ] Captions are actually rendered, and are legible (`subtitleStyle`)
-- [ ] **The cue at t=0 is present, or confirmed dropped.** State which
-- [ ] **The measured offset, written as a number**, for ExoPlayer and for Safari
-      separately. Not "seems fine"
-- [ ] The two players agree, or the disagreement is recorded — it is itself a
-      finding about **[DECIDE 3]**
-- [ ] Result recorded in `stage-6a-package-worker.md`'s known-defect section
-- [ ] If a fix is applied (in a 6B), the same measurement is repeated **after** —
-      the comparison is the entire point
+- [x] The caption **track picker lists "English"** — `TEXT TRACKS #0 en English`,
+      read from the picker, not inferred from the video surface
+- [x] Captions are actually rendered, and are legible (`subtitleStyle`) — a live
+      cue, `[mock transcript] segment 4`, read back at position 10.000 s
+- [x] **The cue at t=0 is present.** It was never dropped — see **[DECIDE 3]**
+- [ ] **The measured offset, written as a number, for ExoPlayer.** **NOT DONE.**
+      The AVFoundation figures (66.667 ms → 0.333 ms) are recorded, but ExoPlayer
+      has only been observed *rendering* captions, which is a different claim
+- [ ] The two players agree, or the disagreement is recorded — **open**, and it
+      is a live possibility rather than a formality: the fix anchors on the video
+      start PTS, so a player seeding from the container start reads ~21.3 ms
+      early. This is the last unanswered question in **[DECIDE 3]**
+- [x] Result recorded in `stage-6a-package-worker.md`'s known-defect section
+- [x] The same measurement repeated **after** the fix — done on identical media,
+      header absent vs. present, which is what makes the number mean anything.
+      ~~(in a 6B)~~ — **[DECIDE 3]** settled on fixing inside 8B
 
 **Failure and edge paths**
 
-- [ ] **A silent clip** (empty `WEBVTT`, zero cues): the player does not crash,
-      the track may or may not be listed, and playback still works. 6A verified
-      the VTT is valid; **no client has ever consumed one**
+- [x] **A silent clip** (empty `WEBVTT`, zero cues): the player does not crash,
+      the track **is** still listed as English, and playback runs through. 6A
+      verified only that the VTT was valid; this was the first time any client
+      consumed one. **AVFoundation, not ExoPlayer**
 - [ ] **A two-rung ladder.** 6A verified a 640×480 source yields only 480p/360p.
       The player must not assume three variants
 - [ ] **A 404 master** (LocalStack restarted — `PERSISTENCE=1` is silently
@@ -682,8 +745,12 @@ _Nothing checked off until observed._
 
 **Access model**
 
-- [ ] Segments load from the app with no credentials — confirming the public-read
-      path works end to end
+- [x] Segments load from the app with no credentials — confirming the public-read
+      path works end to end **against LocalStack**, which serves unsigned GETs to
+      any bucket regardless of policy. So this box says the *relative-path
+      resolution* works; it says nothing about the access model. The master for
+      the verified job carries three renditions (1280x720, 854x480, 640x360)
+      plus the subtitle rendition, and the player fetched from them
 - [ ] **`thumbnail_url` is fetched (or explicitly not).** If `PlayerScreen` shows
       a poster, record that it points at `dayreel-processed`, which has **no**
       public-read policy and works locally only because LocalStack serves
