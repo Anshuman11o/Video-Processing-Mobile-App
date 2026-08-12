@@ -114,8 +114,14 @@ func (c *Client) Receive(ctx context.Context, queueName string) ([]Message, erro
 		QueueUrl:            aws.String(url),
 		MaxNumberOfMessages: maxMessages,
 		WaitTimeSeconds:     longPollSeconds,
-		MessageSystemAttributeNames: []sqstypes.MessageSystemAttributeName{
-			sqstypes.MessageSystemAttributeNameApproximateReceiveCount,
+		// AttributeNames is deprecated in favour of MessageSystemAttributeNames,
+		// but LocalStack 3.0 ignores the newer field and returns no system
+		// attributes at all for it. That silently pinned every delivery's
+		// receive count to the fallback of 1, so redeliveries logged and
+		// published attempt=1 forever. Real SQS still honours this field; the
+		// two are not set together because SQS rejects that combination.
+		AttributeNames: []sqstypes.QueueAttributeName{
+			sqstypes.QueueAttributeName(sqstypes.MessageSystemAttributeNameApproximateReceiveCount),
 		},
 	})
 	if err != nil {
