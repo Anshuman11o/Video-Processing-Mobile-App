@@ -1,8 +1,8 @@
 # Stage 4A: Extract Worker
 
-> Status: **draft — not reviewed.** The four **[DECIDE]** items below are open.
-> **[DECIDE 1]** is the one that actually matters; the rest are cheap once it is
-> settled. No code until this is reviewed.
+> Status: **approved — ready to implement.** Decisions settled 2026-08-12; the
+> four **[DECIDE]** items below now record the choice that was made and why.
+> Every recommendation was accepted as written.
 
 ## Aim
 
@@ -148,6 +148,9 @@ the manifest: `"{job_id}/extract.json"` is a meaningful thing to record there,
 ---
 
 ### [DECIDE 1] — extract produces several artifacts; the interface returns one key
+
+**RESOLVED: option A — the manifest.** `extract.json` is the canonical single
+output, uploaded last. The `Stage` interface is unchanged.
 
 **This is the decision the stage turns on.** Everything else in 4A is
 mechanical.
@@ -662,6 +665,11 @@ economize.
 
 ### [DECIDE 2] — are keyframes in scope for 4A at all?
 
+**RESOLVED: yes, keep them.** The user's call was to keep building and revisit
+when it actually becomes a problem or a failing test. Frames still have no
+downstream consumer beyond `OutputInfo.ThumbnailURL`; that is accepted knowingly
+rather than overlooked.
+
 Worth asking, because **nothing in the pipeline consumes them.**
 `stage-1a-data-schemas.md` has transcribe reading `audio.wav` and package
 reading `validated.mp4` + `transcript.vtt`. Frames appear in no downstream
@@ -689,6 +697,9 @@ this stage will exceed. That budget was always optimistic; I would rather note
 the overrun than quietly drop a documented deliverable.
 
 ### [DECIDE 3] — frame selection strategy and the cap
+
+**RESOLVED: bounded scene detection.** `t=0` always included, `MaxFrames: 20`
+with an evenly-spaced subset when detection overruns.
 
 `PROJECT_PLAN.md:334` says "FFmpeg scene-detect keyframes". Scene detection has
 two unbounded edges, both real:
@@ -727,6 +738,10 @@ These are starting guesses, not measured values. `0.3` in particular deserves a
 look once there is real footage.
 
 ### [DECIDE 4] — clips with no audio track
+
+**RESOLVED: option (c).** No `audio.wav`, `audio.present: false` in the
+manifest. This creates a ~6-line obligation in 5A to short-circuit to an empty
+`WEBVTT` — carry it into the 5A plan explicitly.
 
 Validate deliberately admits silent clips: `gate` treats audio as optional
 (`validate.go:117`, "a silent clip is legitimate"). So extract will meet them.
