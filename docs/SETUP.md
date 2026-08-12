@@ -92,6 +92,37 @@ one host returns `SignatureDoesNotMatch` to another — the signature covers the
 
 The committed target is the **iOS Simulator**.
 
+To prove this rather than assume it:
+
+```bash
+./scripts/verify-presign.sh
+```
+
+### LocalStack does not enforce bucket authorization
+
+`S3_SKIP_SIGNATURE_VALIDATION=0` in compose makes LocalStack check presigned
+signatures, and it checks them properly: a corrupted signature, a rewritten
+host, a swapped object key, a changed part number and a shortened expiry are
+all rejected with 403.
+
+What it does **not** check is whether a request is authenticated at all. An
+unsigned `PUT` to any bucket returns 200 and writes the object, and an unsigned
+`GET` reads it back. Holding a presigned URL therefore confers no privilege
+locally — it is merely one way in.
+
+**This is a LocalStack Community limitation, not a defect in this repo.** Real
+S3 has Block Public Access enabled by default and denies anonymous requests.
+But that is an assumption, and it is the assumption this whole upload design
+rests on, so it must be **asserted when real buckets are provisioned** rather
+than inherited by luck. No real-AWS provisioning exists yet — when it is
+written, it must set Block Public Access explicitly and re-run the matrix with
+`TARGET=aws`, where the anonymous row is a hard failure instead of a known gap.
+
+The `dayreel-hls-output` bucket is the deliberate exception: it is public by
+design locally, because HLS playlists reference segments by relative path and
+cannot be presigned. Its real-AWS access model is still an open question — see
+`config/free-tier.md`.
+
 ### Transcription is mocked by default
 
 `MOCK_TRANSCRIBE=true` in compose. Transcripts read `[mock transcript] segment N`.
