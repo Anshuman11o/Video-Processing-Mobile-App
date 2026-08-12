@@ -26,22 +26,32 @@ from last successful part.
 
 ---
 
-## SQS
+## Queue (self-hosted SQLite, not SQS)
 
-| Constraint | Value | Impact on DayReel |
-|------------|-------|-------------------|
-| Message size | 256 KB max | Messages carry S3 pointers, not payloads; ~300 bytes typical |
-| Visibility timeout | 0s - 12 hours | Set to 5 minutes; workers extend if needed |
-| Message retention | 1 minute - 14 days | Default 4 days is fine |
-| Receive batch size | 1-10 messages | Use 1 for simplicity |
-| DLQ redrive | After N failed receives | Set maxReceiveCount=3 |
+The pipeline queue is `data/queue.db`, implemented in `backend/internal/queue/`.
+These are settings we choose rather than limits AWS imposes, but they bind the
+same way: get them wrong and the pipeline stalls or reprocesses.
+
+| Setting | Value | Impact on DayReel |
+|---------|-------|-------------------|
+| Message size | No hard limit | Messages carry S3 pointers, not payloads; ~300 bytes typical |
+| Visibility timeout | 5 minutes (`QUEUE_VISIBILITY_TIMEOUT`) | Must exceed the slowest stage; transcribe is the risk |
+| Max deliveries | 3 (`QUEUE_MAX_DELIVERIES`) | Then the row moves to `dayreel-dlq` |
+| Poll interval | 250ms (`QUEUE_POLL_INTERVAL`) | No long-poll in SQLite; this is the latency floor per stage |
+| Concurrent claimers | One writer at a time | SQLite serializes writes; fine at this volume |
 
 **At-least-once delivery:** Workers must be idempotent. Check if output S3 key
-exists before processing.
+exists before processing. This is unchanged from the SQS design — the guarantee
+is the same, and so is the obligation.
 
 **Error handling:**
-- Transient errors: Don't delete message, let visibility timeout expire, retry
-- Permanent errors: Send to DLQ, delete original message
+- Transient errors: don't ack; the visibility timeout expires and the message
+  is claimed again on its own
+- Permanent errors: nack, which dead-letters once `deliveries` hits the max
+
+**The one that will bite:** a stage that takes longer than the visibility timeout
+gets its message re-claimed by another worker while it is still running. Either
+raise the timeout above the p99 stage duration or make the stage cheap to repeat.
 
 ---
 
@@ -70,45 +80,48 @@ per-stage state. One `GetItem` returns full job status.
 | Constraint | Value | Impact on DayReel |
 |------------|-------|-------------------|
 | Payload size (sync) | 6 MB | Not using sync invoke |
-| Payload size (async) | 256 KB | SQS trigger, same as SQS limit |
+| Payload size (async) | 256 KB | Would need an event source we no longer have |
 | Execution timeout | 15 minutes max | Transcription of 60s clip may hit this |
 | Memory | 128 MB - 10 GB | FFmpeg needs ~1GB, Whisper needs ~2GB |
 | Ephemeral storage | 512 MB - 10 GB | Enough for video processing |
 | Concurrent executions | 1000 default | Not a concern at demo scale |
 
-**Decision:** Run workers as long-lived Docker containers instead of Lambda. Better
+**Decision:** Run the worker as a long-lived process instead of Lambda. Better
 for long-running FFmpeg/Whisper tasks, and no 15-minute ceiling.
 
 ---
 
 ## Worker Hosting
 
-Workers are plain Docker containers: Compose locally, the same images on a single
-small VM if we deploy. No managed container service — at this volume there is
-nothing to autoscale, and the Go binaries are identical either way.
+The worker is a plain Go process: `go run ./cmd/worker` locally, the same binary
+on a single small VM if we deploy. No containers and no managed container
+service — at this volume there is nothing to autoscale, and the binary is
+identical either way.
 
-**Sizing per worker:**
-| Worker | CPU | Memory | Reason |
-|--------|-----|--------|--------|
+**Sizing per stage:**
+| Stage | CPU | Memory | Reason |
+|-------|-----|--------|--------|
 | Validate | 0.5 | 1 GB | FFprobe + remux is light |
 | Extract | 1 | 2 GB | FFmpeg keyframe extraction |
 | Transcribe | 1 | 4 GB | faster-whisper (CPU mode) |
 | Package | 1 | 2 GB | FFmpeg HLS encoding |
 
-Run all four on one host. Peak is the transcribe worker, so ~2 vCPU / 4 GB covers
-the whole set as long as stages don't run concurrently on the same clip.
+All four stages live in one worker process on one host. Peak is transcribe, so
+~2 vCPU / 4 GB covers the whole set as long as stages don't run concurrently on
+the same clip. Dropping the containers, the AWS emulator and the cache server
+freed 1.5–2.5 GB, which is most of a t3.micro.
 
 ---
 
 ## HLS Delivery
 
-Reels are served **directly from the HLS bucket** — LocalStack's S3 endpoint locally,
-S3 on AWS. No CDN.
+Reels are served **directly from the HLS bucket** on S3. No CDN.
 
 | Constraint | Value | Impact on DayReel |
 |------------|-------|-------------------|
 | Bucket read access | Must be reachable by the player | Bucket policy allows public read on `hls-output` |
-| CORS | Required for browser/ExoPlayer range requests | Set on the HLS bucket at init |
+| CORS | Required for browser/ExoPlayer range requests | Set once on the bucket, by hand or later by Terraform |
+| CORS `ExposeHeaders` | No wildcards allowed | Use `["ETag"]`; `"x-amz-meta-*"` is rejected with `InvalidRequest` |
 | Cache-Control | Set per object | Long TTL on immutable segments, short on `master.m3u8` |
 
 **HLS caching:** Segments are immutable after creation, so a long `Cache-Control`
@@ -117,18 +130,28 @@ master playlist gets a shorter TTL in case we ever rewrite it.
 
 ---
 
-## Redis (ElastiCache)
+## Status Cache (in-process, not ElastiCache)
+
+Job status is cached in a map inside the Go API process, with a 10-second TTL.
+Not Redis, not ElastiCache: one process reads this cache, the working set is a
+few hundred bytes per in-flight job, and a separate cache server costs more RAM
+than the whole rest of the local stack.
 
 | Constraint | Value | Impact on DayReel |
 |------------|-------|-------------------|
-| Max item size | 512 MB | Job status is ~1KB; not a concern |
-| Max connections | Varies by instance | Not a concern at demo scale |
+| Entry size | ~1 KB per job | Bounded by in-flight jobs, which is single digits |
+| Lifetime | Process lifetime | Restarting the API drops the cache; next poll hits DynamoDB |
+| Sharing | None — per process | A second API instance has its own cache and its own 10s of staleness |
 
-**Usage:** Read-through cache for job status. TTL of 10 seconds. Reduces DynamoDB
-reads on frequent status polls.
+**Usage:** Read-through cache for job status. Reduces DynamoDB reads on frequent
+status polls. Status polling at 2-second intervals gets ~80% cache hits.
 
 ```
-GET job:{id}:status
-  → cache hit: return cached
-  → cache miss: GetItem from DynamoDB, cache with TTL, return
+get job:{id}
+  → cache hit and not expired: return cached
+  → otherwise: GetItem from DynamoDB, store with TTL, return
 ```
+
+**What this costs:** cache coherence across API instances. Two instances can
+serve status up to 10 seconds apart. DynamoDB remains the only truth, the TTL is
+short, and there is one instance — so this is a real trade, just a cheap one.

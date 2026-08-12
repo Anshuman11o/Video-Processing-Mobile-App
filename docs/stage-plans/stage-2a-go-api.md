@@ -1,5 +1,11 @@
 # Stage 2A: Go API
 
+> **Partly superseded.** The endpoints, data flow and S3 multipart design are
+> current. Three things below are not: the Redis cache is now an in-process TTL
+> cache, `internal/queue/` is a SQLite queue rather than an SQS wrapper
+> (`stage-3b-local-queue.md`), and the Docker Compose section is void — the API
+> runs as `make api`. See `infra/CONTEXT.md`.
+
 > **Run in parallel with:** Stage 2B (Mobile Shell)
 > **Depends on:** Stage 1A (Data Schemas), Stage 1B (Infrastructure)
 > **Estimated time:** 30 minutes

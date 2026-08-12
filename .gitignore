@@ -73,8 +73,11 @@ backend/vendor/
 *.test
 *.out
 
-# Docker
-.docker/
+# Local SQLite queue (runtime state, not source)
+data/
+*.db
+*.db-wal
+*.db-shm
 
 # Logs
 *.log
@@ -95,9 +98,6 @@ temp/
 dist/
 build/
 out/
-
-# LocalStack persistence (may contain test data)
-.localstack/
 
 # Video files (large, not for git)
 *.mp4

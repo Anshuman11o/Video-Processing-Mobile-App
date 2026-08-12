@@ -11,10 +11,12 @@ constraints.
 |---------|-----------|----------------|--------|
 | **S3** | 5 GB storage, 20,000 GET, 2,000 PUT | ~1GB for demo | OK |
 | **DynamoDB** | 25 RCU, 25 WCU, 25 GB | Minimal | OK |
-| **SQS** | 1M requests/month | ~1000 for demo | OK |
 | **Lambda** | 1M requests, 400,000 GB-sec | Not using | N/A |
 | **EC2** | 750 hrs/month t3.micro | One small VM, on-demand | OK |
-| **ECR** | 500 MB storage | ~200MB images | OK |
+
+Only S3 and DynamoDB are actually used. The queue is a SQLite file on local disk
+and costs nothing; the status cache lives in the API process. ECR is no longer
+listed because nothing is containerized — the VM runs the Go binaries directly.
 
 ## Always-Free Tier
 
@@ -62,11 +64,11 @@ resource "aws_vpc_endpoint" "dynamodb" {
 
 ### Always-On Compute
 
-The workers are long-running SQS pollers, so anything hosting them bills by the
-hour whether or not clips are arriving.
+The worker is a long-running poller, so anything hosting it bills by the hour
+whether or not clips are arriving.
 
 **Mitigation:**
-- One small VM runs all four workers as Docker containers, not one host per stage
+- One small VM runs the API and the worker as two processes, not one host per stage
 - Start it for the demo, stop it after — don't leave it running
 - t3.micro is free tier for 12 months (750 hrs/month)
 
@@ -112,20 +114,27 @@ aws budgets create-budget \
 
 ---
 
-## LocalStack Parity Notes
+## Local Development Costs
 
-LocalStack Pro vs Community:
+There is no emulator. Local development talks to the same real S3 buckets and
+DynamoDB table as everything else, so development traffic counts against the
+free tier alongside demo traffic.
 
-| Feature | Community (Free) | Pro |
-|---------|------------------|-----|
-| S3 | Full | Full |
-| SQS | Full | Full |
-| DynamoDB | Full | Full |
-| Lambda | Basic | Full |
+| Local activity | Cost |
+|----------------|------|
+| Iterating on the pipeline (a few dozen clips) | Well inside 2,000 PUT / 20,000 GET |
+| Job status polling during dev | Well inside 25 RCU |
+| Queue operations | Free — SQLite file on local disk |
+| Status cache | Free — in-process map |
 
-**For local dev:** Community edition covers everything we use — S3, SQS, DynamoDB.
-Workers run as plain Docker containers under Compose, and HLS is served straight off
-LocalStack's S3 endpoint, so none of the Pro-only services are on the critical path.
+**Watch for:** a retry loop that re-uploads or re-processes without bound will
+burn the 2,000 monthly PUTs faster than anything else here. `QUEUE_MAX_DELIVERIES=3`
+and the DLQ exist partly to make that impossible.
+
+**Why no emulator:** LocalStack was dropped both for the ~1 GB of RAM it cost and
+because its divergences from real S3 hid a genuine bug — see `TROUBLESHOOTING.md`.
+Free-tier headroom is large enough that developing against real AWS is cheaper
+than debugging the difference.
 
 ---
 
@@ -136,7 +145,7 @@ LocalStack's S3 endpoint, so none of the Pro-only services are on the critical p
 | Process 10 demo clips | ~$0.50 |
 | Run one t3.micro VM for 2 hours | Free tier |
 | S3 storage (100MB) | ~$0.01 |
-| SQS (1000 messages) | Free tier |
+| Queue (1000 messages) | $0 — local SQLite file |
 | S3 egress for HLS (1GB) | Free tier |
 | **Total for demo** | **<$1** |
 

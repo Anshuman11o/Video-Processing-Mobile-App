@@ -64,8 +64,8 @@ const MOCK_JOBS: Job[] = [
       package: {status: 'complete', retry_count: 0, completed_at: '2024-01-15T10:34:00Z'},
     },
     output: {
-      hls_url: 'http://localhost:4566/dayreel-hls-output/550e8400/master.m3u8',
-      thumbnail_url: 'http://localhost:4566/dayreel-processed/550e8400/frames/frame_001.jpg',
+      hls_url: 'https://dayreel-hls-output.s3.us-east-1.amazonaws.com/550e8400/master.m3u8',
+      thumbnail_url: 'https://dayreel-processed.s3.us-east-1.amazonaws.com/550e8400/frames/frame_001.jpg',
       duration_ms: 15000,
     },
   },
