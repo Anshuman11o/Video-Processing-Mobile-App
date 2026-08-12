@@ -1,9 +1,9 @@
 # Stage 5A: Transcribe Worker
 
-> Status: **draft — not reviewed.** Four **[DECIDE]** items below are open.
-> **[DECIDE 1]** (how Whisper is invoked from a Go worker) and **[DECIDE 2]**
-> (which image carries it) are the ones that matter; they are entangled, and
-> both are constrained by an 8 GB Docker disk ceiling. No code until reviewed.
+> Status: **approved — ready to implement.** Decisions settled 2026-08-12.
+> The four **[DECIDE]** items below record what was chosen and why. Two went
+> against the recommendation, and those are the interesting ones: whisper.cpp
+> over a sidecar, and a runtime-downloaded model over a baked one.
 
 ## Aim
 
@@ -35,12 +35,13 @@ Two things are already settled and are not reopened here:
 |-----------|--------|
 | `backend/internal/worker/transcribe/` | Create — the `Stage` implementation |
 | `backend/internal/transcribe/` | Create — Whisper invocation + VTT writing, behind an interface |
-| `backend/Dockerfile.worker-transcribe` | Create — **probably** (**[DECIDE 2]**) |
-| `infra/docker-compose.yml` | Modify — add `worker-transcribe` |
+| `backend/Dockerfile.worker` | Modify — add whisper.cpp (**[DECIDE 1]** = one image, no Python) |
+| `infra/docker-compose.yml` | Modify — `worker-transcribe` + a **persistent model volume** (**[DECIDE 2]**) |
 | `backend/cmd/worker/main.go` | Modify — one `case models.StageTranscribe` |
-| `backend/internal/worker/runner.go` | **No change** — but see the timeout risk below |
+| `backend/internal/worker/runner.go` | **Modify** — visibility heartbeating (**[DECIDE 3]**), in its own commit |
+| `backend/internal/worker/validate/validate.go` | Modify — `MaxDuration` 600s → 60s (**[DECIDE 3]**) |
 | `backend/internal/events/` | **No change** — the manifest type already carries what is needed |
-| `infra/localstack/init-aws.sh` | **No change** — `dayreel-transcribe` and `dayreel-package` already exist |
+| `infra/localstack/init-aws.sh` | Modify — transcribe visibility timeout → 900s (**[DECIDE 3]**) |
 
 ## Boundaries
 
@@ -129,6 +130,21 @@ duration varies enough to be interesting.
 
 ### [DECIDE 1] — how a Go worker invokes Whisper
 
+**RESOLVED: option (B), whisper.cpp in the image.** Not the recommended sidecar.
+
+The deciding factor was keeping everything in one Alpine image with no Python
+anywhere — whisper.cpp is "another binary next to ffmpeg", which is a shape this
+codebase already handles well. The accepted cost is that **the model reloads on
+every invocation**, which the sidecar would have avoided.
+
+**This is an explicit deviation from `PROJECT_PLAN.md:340`, which names
+faster-whisper.** Recorded here so it is a decision rather than drift; the plan
+document should be updated to match.
+
+The `Transcriber` interface still stands, so this remains revisitable — if
+per-job model load proves painful, the sidecar is the escape hatch and only the
+implementation behind the interface changes.
+
 Every prior stage shells out to a binary baked into the image. Whisper does not
 fit that shape cleanly: `faster-whisper` is a **Python** library, and the worker
 is a static Go binary built with `CGO_ENABLED=0` on Alpine
@@ -201,6 +217,17 @@ with a `mockTranscriber` and a real one. The stage depends on the interface, so
 
 ### [DECIDE 2] — which image carries the model (8 GB Docker ceiling)
 
+**RESOLVED: the `base` model, downloaded at runtime** rather than baked in.
+
+Keeps the image small, which matters against the 8 GB ceiling. The accepted cost
+is a network dependency on first run.
+
+**This makes the volume mount load-bearing, not optional.** Without a persistent
+mount the model re-downloads on every fresh container, which is slow, repeats on
+every rebuild, and breaks the offline-by-default posture the rest of the stack
+has. The model path must be volume-mounted, and a missing model must be a
+*transient* failure — a download that failed can succeed on retry.
+
 Docker's disk allowance on this machine is **8 GB and cannot be raised without
 restarting the container**. Current usage is ~2.6 GB of images plus build cache.
 This is a hard constraint on model choice, not a theoretical one.
@@ -242,6 +269,20 @@ rest of the stack runs on LocalStack.
 
 ### [DECIDE 3] — the 300s visibility timeout becomes a real risk
 
+**RESOLVED: all three measures — (a), (b) and (c).**
+
+- Raise `dayreel-transcribe`'s visibility timeout to **900s**.
+- Lower `validate.DefaultLimits.MaxDuration` from 600s to **60s**, which is also
+  the cost lever `config/free-tier.md` flags.
+- **Add heartbeating to the shared runner.**
+
+The plan argued against heartbeating as a side effect of this stage, since it
+changes shared code every stage depends on and two silent bugs have already been
+found in that runner. That concern was heard and overruled deliberately: it is
+the correct general fix, and the other two measures are mitigations rather than
+solutions. It is therefore built **with its own tests**, and as a separate commit
+from the transcribe stage, so it can be reverted independently.
+
 Validate takes ~1s. Extract took ~1s on a 6s clip. **Transcription does not
 behave like this.** On CPU, `base` runs roughly 2–5× faster than realtime, so a
 10-minute clip — which `validate.DefaultLimits.MaxDuration` still permits — could
@@ -274,6 +315,8 @@ not be the reason one is made.
 ---
 
 ### [DECIDE 4] — what `MOCK_TRANSCRIBE=true` actually produces
+
+**RESOLVED: option (b), duration-aware synthetic cues.**
 
 Mock mode is the default development path, so what it emits matters more than it
 sounds.
