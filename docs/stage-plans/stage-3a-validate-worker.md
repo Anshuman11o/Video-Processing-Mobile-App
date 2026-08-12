@@ -172,6 +172,167 @@ and the parent `status` flips to `failed`.
 11. [ ] Fix mobile status vocabulary per **[DECIDE 4]**
 12. [ ] End-to-end test below
 
+## Implementation Plan
+
+Build order follows the dependency graph — each step compiles on its own, so
+`go build ./...` stays green throughout rather than only at the end.
+
+### Step 1 — `internal/queue/sqs.go` (no dependencies)
+
+```go
+type Message struct {
+    Body          string
+    ReceiptHandle string
+    ReceiveCount  int   // from ApproximateReceiveCount; feeds StageMessage.Attempt
+}
+
+func New(ctx context.Context, cfg *config.Config) (*Client, error)
+func (c *Client) QueueURL(ctx context.Context, name string) (string, error)  // cached
+func (c *Client) Receive(ctx context.Context, queue string) ([]Message, error)
+func (c *Client) Delete(ctx context.Context, queue, receiptHandle string) error
+func (c *Client) Publish(ctx context.Context, queue string, body any) error
+```
+
+`Receive` long-polls at `WaitTimeSeconds: 20`, `MaxNumberOfMessages: 1`, and
+requests the `ApproximateReceiveCount` attribute. Long-polling is what keeps the
+loop from burning CPU; a bare receive returns instantly and spins.
+
+LocalStack config mirrors the existing S3/DynamoDB clients — `BaseEndpoint` plus
+static `test`/`test` credentials when `USE_LOCALSTACK`.
+
+### Step 2 — `internal/storage/s3.go` (refactor + additions)
+
+**Blocking refactor:** `S3Client` binds one bucket at construction
+(`s3.go:62`, `bucket: cfg.S3RawBucket`) and every method uses `s.bucket`. The
+worker reads from `dayreel-raw-videos` and writes to `dayreel-processed`, so the
+bucket has to become a parameter.
+
+Least-disruptive path: keep `s.bucket` as the default for the existing multipart
+methods the API calls, and add bucket-explicit methods for the worker.
+
+```go
+func (s *S3Client) DownloadToFile(ctx context.Context, bucket, key, destPath string) error
+func (s *S3Client) UploadFile(ctx context.Context, bucket, key, srcPath, contentType string) error
+func (s *S3Client) ObjectExists(ctx context.Context, bucket, key string) (bool, error)
+```
+
+`ObjectExists` uses `HeadObject` and must treat a `*types.NotFound` /
+`smithy.APIError` with code `NotFound` as `(false, nil)` — not an error. Getting
+this wrong makes the idempotency guard fail open (reprocesses everything) or
+closed (skips everything).
+
+ffmpeg needs a real seekable file, so download to a temp path rather than
+streaming; `defer os.Remove`.
+
+### Step 3 — `internal/db/dynamodb.go` (additions)
+
+```go
+func (d *DynamoDBClient) SetStageRunning(ctx context.Context, jobID string, stage models.StageName) error
+func (d *DynamoDBClient) SetStageCompleted(ctx context.Context, jobID string, stage models.StageName, outputKey string) error
+func (d *DynamoDBClient) SetStageFailed(ctx context.Context, jobID string, stage models.StageName, errMsg string) error
+```
+
+These update a nested map, so the stage name is an expression-attribute *name*,
+not a literal:
+
+```
+UpdateExpression: "SET stages.#stg.#st = :st, stages.#stg.started_at = :now,
+                   updated_at = :now ADD stages.#stg.attempts :one"
+ExpressionAttributeNames:  {"#stg": "validate", "#st": "status"}
+```
+
+`ADD` for `attempts` rather than a read-modify-write, so concurrent redeliveries
+cannot lose an increment.
+
+This works only because `models.NewJob` pre-creates all four stage entries
+(`job.go:134-141`) — `SET` on a path under a missing map key fails with
+`ValidationException`. If job creation ever stops seeding stages, these break.
+
+`SetStageFailed` also sets the top-level `status` to `failed` in the same call.
+
+### Step 4 — `internal/media/`
+
+```go
+type ProbeResult struct {
+    DurationSec            float64
+    VideoCodec, AudioCodec string
+    Width, Height          int
+    HasVideo, HasAudio     bool
+}
+
+func Probe(ctx context.Context, path string) (*ProbeResult, error)
+func RemuxFaststart(ctx context.Context, inPath, outPath string) error
+```
+
+- `ffprobe -v error -print_format json -show_format -show_streams <path>`,
+  unmarshalled into a private struct and flattened into `ProbeResult`.
+- `ffmpeg -v error -y -i <in> -c copy -movflags +faststart -f mp4 <out>`.
+
+Both via `exec.CommandContext` so cancellation kills the child. Capture stderr
+and attach it to the error — a bare "exit status 1" is unactionable.
+
+### Step 5 — `internal/worker/worker.go`
+
+```go
+type Stage interface {
+    Name() models.StageName
+    Process(ctx context.Context, msg *events.StageMessage) (outputKey string, err error)
+}
+
+type PermanentError struct { Reason string; Err error }
+func Permanent(reason string, err error) error   // checked with errors.As
+```
+
+The runner loop, once per message:
+
+1. `events.NormalizeMessage(body)` → `*StageMessage` (see **[DECIDE 1]**).
+   A parse failure is *permanent* — redelivering unparseable JSON changes nothing.
+2. `db.SetStageRunning` — increments `attempts`.
+3. Idempotency: `ObjectExists(processed, "<job_id>/validated.mp4")`. If present,
+   skip to step 5 — **still publishing downstream**, because a crash between
+   upload and publish would otherwise stall the pipeline permanently.
+4. `stage.Process(ctx, msg)`.
+5. On success: `SetStageCompleted` → publish to `events.NextQueue(stage)` →
+   delete message. In that order: publishing before recording risks the next
+   stage racing ahead of a job whose state says otherwise.
+6. On `PermanentError`: `SetStageFailed`, **delete** the message. Do not let it
+   retry 3× and land in the DLQ carrying no new information.
+7. On any other error: log and **return without deleting**. The visibility
+   timeout expires and SQS redelivers with its own backoff.
+
+Steps 5–7 are the whole point of the stage; 4A–6A reuse this runner unchanged.
+
+### Step 6 — `internal/worker/validate/validate.go`
+
+```go
+type Limits struct {
+    MaxDuration        time.Duration
+    AllowedVideoCodecs []string
+    AllowedAudioCodecs []string
+}
+```
+
+`Process`: download → `Probe` → gate against `Limits` → `RemuxFaststart` →
+upload to `dayreel-processed/<job_id>/validated.mp4` → return that key.
+
+Every gate rejection returns `Permanent(...)`: no video stream, duration over
+limit, codec outside the allowlist (pending **[DECIDE 3]**). Download and upload
+failures stay transient.
+
+### Step 7 — `cmd/worker/main.go`
+
+Reads `WORKER_STAGE`, selects from a `map[models.StageName]worker.Stage`, and
+fails fast on an unknown value. Same graceful-shutdown shape as `cmd/api`:
+`signal.NotifyContext`, cancel the context, let the in-flight message finish or
+be redelivered.
+
+### Step 8 — Docker
+
+`backend/Dockerfile.worker` — same Go builder stage as the API, but the runtime
+layer is `alpine` + `apk add --no-cache ffmpeg` (pulls in `ffprobe`). Compose
+gets a `worker-validate` service with `WORKER_STAGE=validate`, gated on the same
+LocalStack and Redis healthchecks as `api`.
+
 ## Test
 
 ```bash
