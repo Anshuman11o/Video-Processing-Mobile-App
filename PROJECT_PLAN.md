@@ -119,7 +119,7 @@ and on AWS via configurable endpoints. Docker Compose replaces Fargate locally.
 │
 ├── config/
 │   ├── aws-limits.md            # S3, SQS, DynamoDB constraints
-│   ├── free-tier.md             # Free tier quotas and cost traps
+│   ├── free-tier.md             # Cost constraints, $20 budget (no free tier)
 │   └── CONTEXT.md
 │
 ├── docs/
@@ -502,11 +502,14 @@ Append as we go. Same problem never debugged twice.
 - DynamoDB: 400KB item limit, 1KB RCU, 1KB WCU
 
 **config/free-tier.md:**
-- S3: 5GB storage, 20,000 GET, 2,000 PUT
-- DynamoDB: 25 RCU, 25 WCU, 25GB storage
-- Lambda: 1M requests, 400,000 GB-seconds
-- SQS: 1M requests
-- **COST TRAP:** NAT Gateway ~$32/month. Use public subnets + VPC endpoints.
+- **No free tier on this account** (confirmed 2026-08-12). Everything bills from
+  the first request; the quota table that used to sit here was removed.
+- **Hard budget: $20 total.** Test clips ≤10s. Default posture is LocalStack;
+  AWS spend is opt-in, never incidental.
+- Per-request costs are negligible at this scale (a job is a fraction of a cent).
+  **Per-hour costs are the whole risk.**
+- **COST TRAPS, each over budget on its own:** NAT Gateway ~$32/mo,
+  Fargate 4 workers 24/7 ~$115/mo, ElastiCache ~$12/mo. All three stay local.
 
 ---
 

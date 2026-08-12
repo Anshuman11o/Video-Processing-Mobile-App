@@ -643,7 +643,7 @@ files with no code to keep consistent.
 | Concurrent `compose up --build` | Deadlocks. One build at a time |
 | Extract exceeds 300s visibility | Message redelivers mid-work and a second worker starts the same job. Surfaces as duplicate frame uploads. Needs runner heartbeating — a runner change, out of 4A's scope |
 | `-ss` lands on the wrong frame | `-ss` before `-i` seeks to the nearest preceding keyframe; recorded timestamps may drift from actual content |
-| Frames inflate S3 PUT count | 2,000 PUTs/month free tier. `MaxFrames: 20` caps it; watch during repeated E2E runs |
+| Frames inflate S3 PUT count | No free tier on this account, but PUTs bill at ~$0.005/1,000 — 20 frames/job is a fraction of a cent. Not a budget risk; `MaxFrames: 20` caps it anyway (`config/free-tier.md`) |
 
 ### Time Estimate
 
@@ -708,9 +708,12 @@ two unbounded edges, both real:
   single colour — crosses no scene threshold and produces an empty set. A job
   with no thumbnail at all is worse than a job with an arbitrary one.
 - **Hundreds of frames.** Shaky handheld footage or a hard-cut montage crosses
-  constantly. Each frame is an S3 `PUT`, and the free tier allows **2,000 PUTs
-  per month** (`config/free-tier.md:12`). One pathological 10-minute clip could
-  eat a meaningful slice of that.
+  constantly, and each frame is an S3 `PUT`. The original reasoning here cited a
+  2,000 PUT/month free-tier allowance; **there is no free tier on this account**
+  (`config/free-tier.md`). The corrected picture is less alarming: PUTs bill at
+  ~$0.005/1,000, so even a pathological clip costs fractions of a cent. The cap
+  is still worth having — unbounded output is worth bounding on its own terms —
+  but it is not the budget that justifies it.
 
 Fixed-interval sampling (`fps=1/N`) avoids both but produces frames that mean
 nothing — the thumbnail is whatever happened at t=10s.

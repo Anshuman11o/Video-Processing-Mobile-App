@@ -4,12 +4,21 @@ import (
 	"context"
 	"errors"
 	"log"
+	"time"
 
 	"github.com/anshumanagarwal/dayreel/internal/db"
 	"github.com/anshumanagarwal/dayreel/internal/events"
 	"github.com/anshumanagarwal/dayreel/internal/models"
 	"github.com/anshumanagarwal/dayreel/internal/queue"
 	"github.com/anshumanagarwal/dayreel/internal/storage"
+)
+
+const (
+	// initialReceiveBackoff and maxReceiveBackoff bound the wait between failed
+	// receives. Every SQS request is billed, so an unattended worker must not
+	// be able to spin on a persistent error.
+	initialReceiveBackoff = 1 * time.Second
+	maxReceiveBackoff     = 30 * time.Second
 )
 
 // Stage is one step of the pipeline. Implementations do the media work and
@@ -55,6 +64,8 @@ func NewRunner(stage Stage, q *queue.Client, database *db.DynamoDBClient, s3 *st
 func (r *Runner) Run(ctx context.Context) error {
 	log.Printf("worker[%s] consuming %s", r.stage.Name(), r.queueName)
 
+	backoff := initialReceiveBackoff
+
 	for {
 		if ctx.Err() != nil {
 			log.Printf("worker[%s] shutting down", r.stage.Name())
@@ -69,9 +80,29 @@ func (r *Runner) Run(ctx context.Context) error {
 				log.Printf("worker[%s] shutting down", r.stage.Name())
 				return nil
 			}
-			log.Printf("worker[%s] receive: %v", r.stage.Name(), err)
+
+			// Back off before retrying. A successful receive blocks for the
+			// long-poll duration, but a failing one returns immediately, so
+			// looping straight back round turns any persistent error — bad
+			// credentials, a throttle, a deleted queue — into a hot loop
+			// issuing SQS calls as fast as the network allows. That is billed
+			// per request and would also flood CloudWatch. The backoff grows
+			// to a ceiling so a long outage stays cheap while a blip still
+			// recovers quickly.
+			log.Printf("worker[%s] receive (retry in %s): %v", r.stage.Name(), backoff, err)
+			select {
+			case <-ctx.Done():
+				log.Printf("worker[%s] shutting down", r.stage.Name())
+				return nil
+			case <-time.After(backoff):
+			}
+			if backoff < maxReceiveBackoff {
+				backoff *= 2
+			}
 			continue
 		}
+
+		backoff = initialReceiveBackoff
 
 		for _, m := range msgs {
 			r.handle(ctx, m)
