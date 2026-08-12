@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -116,6 +117,55 @@ func (d *DynamoDBClient) SetStageFailed(ctx context.Context, jobID string, stage
 	})
 	if err != nil {
 		return fmt.Errorf("set stage %s failed: %w", stage, err)
+	}
+	return nil
+}
+
+// stageDurationField maps a stage to its metrics attribute.
+//
+// models.Metrics uses one named field per stage rather than a map, so writing a
+// duration means naming the attribute explicitly.
+func stageDurationField(stage models.StageName) string {
+	switch stage {
+	case models.StageValidate:
+		return "validate_duration_ms"
+	case models.StageExtract:
+		return "extract_duration_ms"
+	case models.StageTranscribe:
+		return "transcribe_duration_ms"
+	case models.StagePackage:
+		return "package_duration_ms"
+	default:
+		return ""
+	}
+}
+
+// SetStageDuration records how long a stage's work took.
+//
+// Best-effort by design: callers log a failure and carry on, because losing a
+// metric must never fail a job whose work actually succeeded. An unknown stage
+// is a no-op rather than an error for the same reason.
+func (d *DynamoDBClient) SetStageDuration(
+	ctx context.Context, jobID string, stage models.StageName, ms int64,
+) error {
+	field := stageDurationField(stage)
+	if field == "" {
+		return nil
+	}
+
+	_, err := d.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:        aws.String(d.table),
+		Key:              d.jobKey(jobID),
+		UpdateExpression: aws.String("SET metrics.#field = :ms"),
+		ExpressionAttributeNames: map[string]string{
+			"#field": field,
+		},
+		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
+			":ms": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(ms, 10)},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("set stage duration: %w", err)
 	}
 	return nil
 }

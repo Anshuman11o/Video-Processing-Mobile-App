@@ -4,6 +4,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -147,6 +148,54 @@ func (d *DynamoDBClient) UpdateUploadInfo(ctx context.Context, jobID string, upl
 	})
 	if err != nil {
 		return fmt.Errorf("update upload info: %w", err)
+	}
+	return nil
+}
+
+// CompleteJob marks a job finished and records where its output lives.
+//
+// This is the only place JobStatusCompleted is ever written. Until stage 6A
+// existed nothing wrote it at all, which is why GET /jobs/{id}/reel — which
+// requires both this status and a non-nil output — returned 409 for every job
+// the pipeline had ever processed.
+//
+// Status and output are set in one UpdateItem deliberately. Written separately,
+// a crash between them leaves a job claiming completion with nowhere to point,
+// and the reel endpoint's guard would then be the only thing preventing a nil
+// dereference downstream.
+func (d *DynamoDBClient) CompleteJob(
+	ctx context.Context, jobID string, output *models.OutputInfo, totalProcessingMs int64,
+) error {
+	outputAV, err := attributevalue.MarshalMap(output)
+	if err != nil {
+		return fmt.Errorf("marshal output info: %w", err)
+	}
+
+	now := time.Now().UTC()
+
+	_, err = d.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(d.table),
+		Key: map[string]ddbtypes.AttributeValue{
+			"pk": &ddbtypes.AttributeValueMemberS{Value: "JOB#" + jobID},
+			"sk": &ddbtypes.AttributeValueMemberS{Value: "METADATA"},
+		},
+		UpdateExpression: aws.String(
+			"SET #status = :status, #output = :output, " +
+				"metrics.total_processing_ms = :total, updated_at = :now"),
+		ExpressionAttributeNames: map[string]string{
+			"#status": "status",
+			// "output" is a DynamoDB reserved word.
+			"#output": "output",
+		},
+		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
+			":status": &ddbtypes.AttributeValueMemberS{Value: string(models.JobStatusCompleted)},
+			":output": &ddbtypes.AttributeValueMemberM{Value: outputAV},
+			":total":  &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(totalProcessingMs, 10)},
+			":now":    &ddbtypes.AttributeValueMemberS{Value: now.Format(time.RFC3339Nano)},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("complete job: %w", err)
 	}
 	return nil
 }

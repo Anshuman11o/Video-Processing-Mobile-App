@@ -51,6 +51,19 @@ type Stage interface {
 	Process(ctx context.Context, msg *events.StageMessage) (string, error)
 }
 
+// Finalizer is an optional Stage capability: work to do once the stage's own
+// state has been recorded as completed.
+//
+// Only the terminal stage implements it, to mark the job itself finished. It is
+// separate from Stage rather than part of it so the other three stages are
+// unaffected and the Stage interface stays narrow — Process does media work and
+// returns a key, and everything about job lifecycle stays out of it.
+//
+// The runner calls this after SetStageCompleted and before publishing onward.
+type Finalizer interface {
+	Finalize(ctx context.Context, msg *events.StageMessage, outputKey string) error
+}
+
 // Runner consumes a queue and applies a Stage to each message.
 type Runner struct {
 	stage   Stage
@@ -193,18 +206,40 @@ func (r *Runner) handle(ctx context.Context, m queue.Message) {
 		// job. The idempotency guard above cannot catch that: it asks whether the
 		// output exists, and the output does not exist until Process returns.
 		stopHeartbeat := r.heartbeat(ctx, m)
+		started := time.Now()
 		outputKey, err = r.stage.Process(ctx, msg)
+		elapsed := time.Since(started)
 		stopHeartbeat()
 
 		if err != nil {
 			r.fail(ctx, m, msg, err)
 			return
 		}
+
+		// Best-effort: a lost metric must never fail work that succeeded.
+		if err := r.db.SetStageDuration(ctx, msg.JobID, stageName, elapsed.Milliseconds()); err != nil {
+			log.Printf("worker[%s] job=%s record duration: %v", stageName, msg.JobID, err)
+		}
 	}
 
 	if err := r.db.SetStageCompleted(ctx, msg.JobID, stageName, outputKey); err != nil {
 		log.Printf("worker[%s] job=%s mark completed: %v", stageName, msg.JobID, err)
 		return
+	}
+
+	// Finalize runs after the stage row is marked completed, never before. The
+	// terminal stage uses this to mark the job itself finished, and the opposite
+	// order would let a job claim completion while its own stage still said
+	// running — permanently, if the process died in between.
+	//
+	// Not deleting the message on failure is deliberate: a job whose final state
+	// was never recorded should be retried, and the idempotency guard makes the
+	// retry cheap.
+	if f, ok := r.stage.(Finalizer); ok {
+		if err := f.Finalize(ctx, msg, outputKey); err != nil {
+			log.Printf("worker[%s] job=%s finalize: %v", stageName, msg.JobID, err)
+			return
+		}
 	}
 
 	// Record completion before publishing. The other order lets the next stage
