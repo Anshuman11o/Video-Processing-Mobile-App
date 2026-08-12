@@ -1,0 +1,121 @@
+package db
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	ddbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	"github.com/anshumanagarwal/dayreel/internal/models"
+)
+
+// Per-stage updates to the stages map on a job item.
+//
+// These update nested map paths (stages.<name>.<field>), so the stage name is
+// an expression-attribute name rather than a literal. That only works because
+// models.NewJob pre-seeds an entry for every stage: a SET against a path under
+// a missing map key fails with ValidationException. If job creation ever stops
+// seeding stages, these break.
+
+func (d *DynamoDBClient) jobKey(jobID string) map[string]ddbtypes.AttributeValue {
+	return map[string]ddbtypes.AttributeValue{
+		"pk": &ddbtypes.AttributeValueMemberS{Value: "JOB#" + jobID},
+		"sk": &ddbtypes.AttributeValueMemberS{Value: "METADATA"},
+	}
+}
+
+// SetStageRunning marks a stage running and increments its attempt counter.
+//
+// attempts uses ADD rather than a read-modify-write so that a redelivery
+// racing the original cannot lose an increment.
+func (d *DynamoDBClient) SetStageRunning(ctx context.Context, jobID string, stage models.StageName) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	_, err := d.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(d.table),
+		Key:       d.jobKey(jobID),
+		UpdateExpression: aws.String(
+			"SET stages.#stg.#st = :st, stages.#stg.started_at = :now, updated_at = :now " +
+				"ADD stages.#stg.attempts :one",
+		),
+		ExpressionAttributeNames: map[string]string{
+			"#stg": string(stage),
+			"#st":  "status",
+		},
+		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
+			":st":  &ddbtypes.AttributeValueMemberS{Value: string(models.StageStatusRunning)},
+			":now": &ddbtypes.AttributeValueMemberS{Value: now},
+			":one": &ddbtypes.AttributeValueMemberN{Value: "1"},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("set stage %s running: %w", stage, err)
+	}
+	return nil
+}
+
+// SetStageCompleted marks a stage completed and records its output key.
+func (d *DynamoDBClient) SetStageCompleted(ctx context.Context, jobID string, stage models.StageName, outputKey string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	_, err := d.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(d.table),
+		Key:       d.jobKey(jobID),
+		UpdateExpression: aws.String(
+			"SET stages.#stg.#st = :st, stages.#stg.completed_at = :now, " +
+				"stages.#stg.output_key = :key, stages.#stg.#err = :empty, updated_at = :now",
+		),
+		ExpressionAttributeNames: map[string]string{
+			"#stg": string(stage),
+			"#st":  "status",
+			"#err": "error",
+		},
+		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
+			":st":    &ddbtypes.AttributeValueMemberS{Value: string(models.StageStatusCompleted)},
+			":now":   &ddbtypes.AttributeValueMemberS{Value: now},
+			":key":   &ddbtypes.AttributeValueMemberS{Value: outputKey},
+			":empty": &ddbtypes.AttributeValueMemberS{Value: ""},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("set stage %s completed: %w", stage, err)
+	}
+	return nil
+}
+
+// SetStageFailed marks a stage failed and flips the whole job to failed.
+//
+// Both happen in one UpdateItem: a job whose stage failed but whose top-level
+// status still reads "processing" would look alive to every consumer of the
+// API, which is worse than either state alone.
+func (d *DynamoDBClient) SetStageFailed(ctx context.Context, jobID string, stage models.StageName, errMsg string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	_, err := d.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(d.table),
+		Key:       d.jobKey(jobID),
+		UpdateExpression: aws.String(
+			"SET stages.#stg.#st = :stageFailed, stages.#stg.completed_at = :now, " +
+				"stages.#stg.#err = :err, #jobst = :jobFailed, updated_at = :now",
+		),
+		ExpressionAttributeNames: map[string]string{
+			"#stg":   string(stage),
+			"#st":    "status",
+			"#err":   "error",
+			"#jobst": "status",
+		},
+		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
+			":stageFailed": &ddbtypes.AttributeValueMemberS{Value: string(models.StageStatusFailed)},
+			":jobFailed":   &ddbtypes.AttributeValueMemberS{Value: string(models.JobStatusFailed)},
+			":err":         &ddbtypes.AttributeValueMemberS{Value: errMsg},
+			":now":         &ddbtypes.AttributeValueMemberS{Value: now},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("set stage %s failed: %w", stage, err)
+	}
+	return nil
+}
