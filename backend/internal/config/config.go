@@ -5,19 +5,24 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"time"
 )
 
 // Config holds all configuration values for the API server.
 type Config struct {
 	Port              string
-	AWSEndpoint       string
 	AWSRegion         string
 	S3RawBucket       string
 	S3ProcessedBucket string
 	S3HLSBucket       string
 	DynamoDBTable     string
-	RedisURL          string
-	UseLocalStack     bool
+
+	// Queue settings. The broker is a local SQLite file rather than SQS, so the
+	// knobs that used to be queue attributes in AWS live here instead.
+	QueueDBPath            string
+	QueueVisibilityTimeout time.Duration
+	QueueMaxDeliveries     int
+	QueuePollInterval      time.Duration
 
 	// MockTranscribe skips the speech model and emits synthetic cues. Default
 	// true: the budget rules allow only a handful of real runs, so every stage
@@ -25,20 +30,22 @@ type Config struct {
 	MockTranscribe bool
 
 	// S3PublicEndpoint is the base URL a player or mobile client uses to fetch
-	// objects. It differs from AWSEndpoint because the in-cluster hostname
-	// (http://localstack:4566) does not resolve outside the compose network.
+	// objects, when that is not the endpoint the SDK resolves on its own.
 	//
-	// This is the same unresolved problem as the presigned-URL finding from
-	// stage 4A. Left as configuration because the real-AWS access model is a
-	// deliberate open question, not a settled default.
+	// On real AWS it is normally empty and the SDK's own regional endpoint is
+	// used for everything. It stays configurable because reels are served
+	// straight out of the HLS bucket with no CDN in front, so the host a player
+	// must reach is a deployment decision — a bucket website endpoint, a custom
+	// domain, or eventually a distribution — and not something the API can
+	// infer.
 	S3PublicEndpoint string
 
 	// UploadPartSize is the multipart part size, in bytes, that the API slices
 	// uploads into and presigns one URL per.
 	//
 	// It can only be raised, never lowered: S3 requires every part except the
-	// last to be at least 5 MiB, and LocalStack enforces that floor too, so a
-	// smaller value is clamped rather than honoured.
+	// last to be at least 5 MiB, so a smaller value is clamped rather than
+	// honoured.
 	//
 	// This was introduced to make short test clips upload as several parts —
 	// at 5 MiB a <10s clip is a single part, and one part never iterates the
@@ -49,9 +56,9 @@ type Config struct {
 	UploadPartSize int64
 
 	// WhisperModelPath is where the ggml model file lives. The model is
-	// downloaded at runtime rather than baked into the image, so this path is
-	// expected to be a persistent volume mount — without one it re-downloads on
-	// every fresh container.
+	// downloaded at runtime rather than baked into the binary, so this path is
+	// expected to be persistent storage — without one it re-downloads on every
+	// fresh start.
 	WhisperModelPath string
 }
 
@@ -59,18 +66,23 @@ type Config struct {
 func Load() *Config {
 	return &Config{
 		Port:              getEnv("API_PORT", "8080"),
-		AWSEndpoint:       getEnv("LOCALSTACK_ENDPOINT", ""),
 		AWSRegion:         getEnv("AWS_REGION", "us-east-1"),
 		S3RawBucket:       getEnv("S3_RAW_BUCKET", "dayreel-raw-videos"),
 		S3ProcessedBucket: getEnv("S3_PROCESSED_BUCKET", "dayreel-processed"),
 		S3HLSBucket:       getEnv("S3_HLS_BUCKET", "dayreel-hls-output"),
 		DynamoDBTable:     getEnv("DYNAMODB_TABLE", "dayreel-jobs"),
-		RedisURL:          getEnv("REDIS_URL", "localhost:6379"),
-		UseLocalStack:     getEnv("USE_LOCALSTACK", "true") == "true",
-		MockTranscribe:    getEnv("MOCK_TRANSCRIBE", "true") == "true",
-		S3PublicEndpoint:  getEnv("S3_PUBLIC_ENDPOINT", ""),
-		UploadPartSize:    getEnvBytes("UPLOAD_PART_SIZE", DefaultUploadPartSize),
-		WhisperModelPath:  getEnv("WHISPER_MODEL_PATH", "/models/ggml-base.bin"),
+
+		QueueDBPath: getEnv("QUEUE_DB_PATH", "./data/queue.db"),
+		// Five minutes is the SQS default and comfortably outlives every stage
+		// except transcribe, which heartbeats instead.
+		QueueVisibilityTimeout: getEnvDuration("QUEUE_VISIBILITY_TIMEOUT", 5*time.Minute),
+		QueueMaxDeliveries:     getEnvInt("QUEUE_MAX_DELIVERIES", 3),
+		QueuePollInterval:      getEnvDuration("QUEUE_POLL_INTERVAL", 250*time.Millisecond),
+
+		MockTranscribe:   getEnv("MOCK_TRANSCRIBE", "true") == "true",
+		S3PublicEndpoint: getEnv("S3_PUBLIC_ENDPOINT", ""),
+		UploadPartSize:   getEnvBytes("UPLOAD_PART_SIZE", DefaultUploadPartSize),
+		WhisperModelPath: getEnv("WHISPER_MODEL_PATH", "/models/ggml-base.bin"),
 	}
 }
 
@@ -95,10 +107,10 @@ func getEnvBytes(key string, fallback int64) int64 {
 	}
 	if n < DefaultUploadPartSize {
 		// Clamped, not merely warned about, because a smaller part size cannot
-		// work anywhere. LocalStack enforces the 5 MiB floor exactly as S3
-		// does — verified 2026-08-13, EntityTooSmall on CompleteMultipartUpload
-		// after all parts uploaded cleanly with 200s. Accepting the value would
-		// configure a system that fails only at the very last step.
+		// work anywhere. The 5 MiB floor was verified the hard way — 2026-08-13,
+		// EntityTooSmall on CompleteMultipartUpload after every part uploaded
+		// cleanly with a 200. Accepting the value would configure a system that
+		// fails only at the very last step.
 		log.Printf("config: %s=%d is below S3's %d minimum for non-final parts "+
 			"and would fail at CompleteMultipartUpload; using %d",
 			key, n, DefaultUploadPartSize, DefaultUploadPartSize)
@@ -114,14 +126,40 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
+// getEnvDuration accepts any Go duration string ("30s", "5m", "250ms").
+// A malformed value falls back to the default rather than failing startup:
+// a typo in a tuning knob should not take the API down.
+func getEnvDuration(key string, fallback time.Duration) time.Duration {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		log.Printf("WARN: %s=%q is not a duration, using %s", key, raw, fallback)
+		return fallback
+	}
+	return d
+}
+
+func getEnvInt(key string, fallback int) int {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		log.Printf("WARN: %s=%q is not an integer, using %d", key, raw, fallback)
+		return fallback
+	}
+	return n
+}
+
 // PublicEndpoint is the base URL for objects a player must reach.
 //
-// Falls back to the internal endpoint when unset, which is correct for
-// container-to-container access and wrong for anything outside the compose
-// network — deliberately visible rather than silently papered over.
+// Empty means "whatever the SDK resolves", which is the right answer on real
+// AWS: presigned URLs are then signed against the genuine regional endpoint and
+// no override is applied anywhere.
 func (c *Config) PublicEndpoint() string {
-	if c.S3PublicEndpoint != "" {
-		return c.S3PublicEndpoint
-	}
-	return c.AWSEndpoint
+	return c.S3PublicEndpoint
 }

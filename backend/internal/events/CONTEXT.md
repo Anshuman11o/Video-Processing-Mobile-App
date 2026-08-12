@@ -1,15 +1,20 @@
 # Events Package
 
-This package contains SQS message types and AWS resource constants for the DayReel video processing pipeline.
+This package contains stage message types and resource constants for the DayReel video processing pipeline.
 
 ## Overview
 
 The events package defines:
 
-- **StageMessage**: The message format sent between SQS queues to trigger processing stages
+- **StageMessage**: The message format sent between queues to trigger processing stages
 - **S3Ref**: Reference to an S3 object (bucket + key)
-- **Queue constants**: SQS queue names for each processing stage
+- **Queue constants**: queue names for each processing stage
 - **Bucket constants**: S3 bucket names for different storage tiers
+- **ExtractManifest**: What the extract stage records about a clip, read by transcribe and package
+
+The transport is the local SQLite queue in `backend/internal/queue/`, not SQS.
+The queue names below are values of its `queue` column, not AWS resources, and a
+`StageMessage` is stored as an opaque JSON body.
 
 ## Queue Names
 
@@ -53,4 +58,10 @@ nextQueue := events.NextQueue(models.StageValidate) // Returns QueueExtract
 4. Transcription complete -> `QueuePackage`
 5. Packaging complete -> Job done
 
-Failed messages (after retries) go to `QueueDLQ`.
+Step 1 is `POST /jobs/{id}/complete` publishing the message itself. It used to
+be an S3 `ObjectCreated` notification, which is why the package once carried a
+`NormalizeMessage` that could parse an S3 event envelope; real S3 cannot notify a
+SQLite file, so that path — and the code for it — is gone.
+
+Failed messages go to `QueueDLQ`, put there by the worker rather than by a
+redrive policy. See `internal/worker/runner.go` for when it decides to.
