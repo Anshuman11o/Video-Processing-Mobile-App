@@ -125,6 +125,3 @@ segments/**/*.ts
 *.aac
 *.vtt
 *.srt
-
-# Background-agent scratch worktrees (local, never committed)
-.claude/worktrees/
