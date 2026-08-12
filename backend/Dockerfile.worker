@@ -1,3 +1,6 @@
+# Unused by local development, which runs the binaries directly — kept for the
+# deferred single-VM deployment (see PROJECT_PLAN.md → Deferred). See the note
+# in ./Dockerfile on CGO_ENABLED=0 and on sharing the SQLite queue file.
 FROM golang:1.24-alpine AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
