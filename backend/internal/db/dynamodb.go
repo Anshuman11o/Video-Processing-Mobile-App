@@ -152,6 +152,49 @@ func (d *DynamoDBClient) UpdateUploadInfo(ctx context.Context, jobID string, upl
 	return nil
 }
 
+// MarkUploadComplete records that the multipart upload finished and moves the
+// job into processing.
+//
+// The completion timestamp was previously set on the in-memory job and then
+// dropped — nothing ever wrote it back — so on the next read a finished upload
+// was indistinguishable from an abandoned one. Resume needs exactly that
+// distinction: a completed upload's ListParts fails with NoSuchUpload in the
+// same way a reaped one does, and this field is the only thing that separates
+// "already done, go poll" from "gone, start over".
+//
+// Written in one UpdateItem with the status for the same reason CompleteJob is:
+// a crash between the two would leave a job in processing whose upload record
+// still claims to be resumable.
+func (d *DynamoDBClient) MarkUploadComplete(ctx context.Context, jobID string, completedAt time.Time) error {
+	now := time.Now().UTC()
+
+	_, err := d.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(d.table),
+		Key: map[string]ddbtypes.AttributeValue{
+			"pk": &ddbtypes.AttributeValueMemberS{Value: "JOB#" + jobID},
+			"sk": &ddbtypes.AttributeValueMemberS{Value: "METADATA"},
+		},
+		UpdateExpression: aws.String(
+			"SET #upload.completed_at = :completed, #status = :status, updated_at = :now"),
+		ExpressionAttributeNames: map[string]string{
+			"#status": "status",
+			// Not known to be reserved, but aliased anyway: the reserved list is
+			// ~570 words long and this project has already lost a cycle to one
+			// of them.
+			"#upload": "upload",
+		},
+		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
+			":completed": &ddbtypes.AttributeValueMemberS{Value: completedAt.Format(time.RFC3339Nano)},
+			":status":    &ddbtypes.AttributeValueMemberS{Value: string(models.JobStatusProcessing)},
+			":now":       &ddbtypes.AttributeValueMemberS{Value: now.Format(time.RFC3339Nano)},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("mark upload complete: %w", err)
+	}
+	return nil
+}
+
 // CompleteJob marks a job finished and records where its output lives.
 //
 // This is the only place JobStatusCompleted is ever written. Until stage 6A
