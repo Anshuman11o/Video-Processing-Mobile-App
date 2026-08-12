@@ -26,6 +26,19 @@ type S3Client struct {
 	client        *s3.Client
 	presignClient *s3.PresignClient
 	bucket        string
+
+	// presignEndpoint is the host presigned URLs are SIGNED against, when it
+	// differs from the endpoint the API itself talks to.
+	//
+	// SigV4 covers the Host header, so a presigned URL is only valid for the
+	// exact host it was signed for. The API reaches S3 at an in-cluster address
+	// the client cannot resolve, so signing against that address produces URLs
+	// that are correct, unusable, and fail with SignatureDoesNotMatch the moment
+	// anyone rewrites the host to something reachable.
+	//
+	// Empty means sign against whatever the client is already configured for,
+	// which is the correct behaviour on real AWS.
+	presignEndpoint string
 }
 
 // NewS3Client creates a new S3Client configured for the given bucket.
@@ -56,10 +69,19 @@ func NewS3Client(ctx context.Context, cfg *config.Config) (*S3Client, error) {
 	client := s3.NewFromConfig(awsCfg, s3Opts...)
 	presignClient := s3.NewPresignClient(client)
 
+	// Only override when the public endpoint actually differs. On real AWS both
+	// values are empty, nothing is overridden, and the SDK signs the genuine S3
+	// endpoint — so this whole mechanism disappears rather than needing removal.
+	presignEndpoint := cfg.PublicEndpoint()
+	if presignEndpoint == cfg.AWSEndpoint {
+		presignEndpoint = ""
+	}
+
 	return &S3Client{
-		client:        client,
-		presignClient: presignClient,
-		bucket:        cfg.S3RawBucket,
+		client:          client,
+		presignClient:   presignClient,
+		bucket:          cfg.S3RawBucket,
+		presignEndpoint: presignEndpoint,
 	}, nil
 }
 
@@ -83,7 +105,7 @@ func (s *S3Client) GeneratePresignedUploadURL(ctx context.Context, key, uploadID
 		Key:        aws.String(key),
 		UploadId:   aws.String(uploadID),
 		PartNumber: aws.Int32(int32(partNumber)),
-	}, s3.WithPresignExpires(expiry))
+	}, s.presignOptions(expiry)...)
 	if err != nil {
 		return "", fmt.Errorf("presign upload part %d: %w", partNumber, err)
 	}
@@ -125,4 +147,26 @@ func (s *S3Client) AbortMultipartUpload(ctx context.Context, key, uploadID strin
 		return fmt.Errorf("abort multipart upload: %w", err)
 	}
 	return nil
+}
+
+// presignOptions returns the presign options, overriding the signed host when a
+// separate public endpoint is configured.
+//
+// The override is applied to the presign call only. The API's own S3 traffic
+// keeps using the in-cluster endpoint, which is both faster and the only address
+// that resolves from inside the compose network.
+func (s *S3Client) presignOptions(expiry time.Duration) []func(*s3.PresignOptions) {
+	opts := []func(*s3.PresignOptions){s3.WithPresignExpires(expiry)}
+
+	if s.presignEndpoint != "" {
+		opts = append(opts, s3.WithPresignClientFromClientOptions(func(o *s3.Options) {
+			o.BaseEndpoint = aws.String(s.presignEndpoint)
+			// Path style keeps the bucket in the path rather than in the
+			// hostname. A virtual-host URL would sign a host that does not
+			// exist locally.
+			o.UsePathStyle = true
+		}))
+	}
+
+	return opts
 }

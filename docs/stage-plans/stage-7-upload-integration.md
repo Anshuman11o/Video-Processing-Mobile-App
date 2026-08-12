@@ -1,8 +1,9 @@
 # Stage 7: Upload Integration
 
-> Status: **draft — not approved.** Seven decisions open, listed below.
-> Written 2026-08-12, immediately after 6A landed and the pipeline first
-> produced a playable reel.
+> Status: **approved — ready to implement.** All seven decisions settled
+> 2026-08-12. Two went against the recommendation and are worth reading before
+> the code: the Redis cache is deliberately left unfixed (**[DECIDE 4]**), and
+> playback is pulled into this stage from 8B (**[DECIDE 6]**).
 
 ## Aim
 
@@ -110,6 +111,9 @@ is finished; Stage 7 only changes who talks to it.
 ---
 
 ### [DECIDE 1] — how a client outside Docker gets a usable presigned URL
+
+**RESOLVED: (a), sign against the public endpoint.** Chosen partly because it is
+a no-op on real AWS, so it constrains a later deploy least.
 
 **This is the stage.** Everything else is a React Native app talking to an HTTP
 API, which is ordinary work. This is not.
@@ -235,6 +239,8 @@ Two consequences to carry:
 
 ### [DECIDE 2] — which client is the target: simulator, emulator, or device
 
+**RESOLVED: iOS Simulator.** Device is not committed.
+
 Follows directly from **[DECIDE 1]**: the signed host is fixed per API process,
 so this has to be answered, not hedged.
 
@@ -262,6 +268,9 @@ and the first plausible place this stage stalls.
 ---
 
 ### [DECIDE 3] — upload mechanics on the client
+
+**RESOLVED: (a), `react-native-blob-util`.** One native dependency serving both
+the part slicing and the job-index persistence in **[DECIDE 5]**.
 
 #### The constraint
 
@@ -325,6 +334,19 @@ path**, and check `copyError`.
 
 ### [DECIDE 4] — how the client learns the job is done
 
+**RESOLVED: (a), poll every 2s — and deliberately DO NOT fix the cache.**
+
+Not the recommendation, and the consequence should be stated plainly rather than
+discovered: with a 10s cache TTL, no worker invalidation, and a ~4s pipeline, the
+UI will usually jump from `uploading` to `completed` having shown no intermediate
+stage at all. **The stage-progress display is therefore structurally unable to
+show progress most of the time.**
+
+That means `PROJECT_PLAN.md`'s stated verification for this stage — *"See job
+move through pipeline stages"* — cannot be satisfied as written. It is recorded
+as a known limitation rather than quietly reworded, and the cache-coherence gap
+stays open for a later stage to close.
+
 #### What the API supports today
 
 Polling `GET /jobs/{id}`. That is the entire list. There is no SSE endpoint, no
@@ -383,6 +405,15 @@ pipeline that takes minutes; this one takes four seconds.
 
 ### [DECIDE 5] — the job list has no endpoint, and the types are already wrong
 
+**RESOLVED: (a), a local job index on the device**, plus regenerating the types
+from the Go structs by hand with a guard against future drift.
+
+**Carrying limitation, to be documented in the setup guide:** the job index lives
+only on the device. Reinstalling the app, clearing its data, or switching
+simulators **loses the entire job history**, even though those jobs still exist
+server-side and are still reachable by ID. This is a direct consequence of there
+being no `GET /jobs` endpoint, and it is a known trade rather than an oversight.
+
 Two problems that have to be solved together, because both are about the list
 screen.
 
@@ -430,6 +461,15 @@ the fix is to write them from the wire.
 
 ### [DECIDE 6] — does Stage 7 include playback?
 
+**RESOLVED: YES — basic playback IS in scope.** Stage 7 absorbs what
+`PROJECT_PLAN.md` scheduled as 8B.
+
+This overrides the plan's own recommendation and PROJECT_PLAN's staging. The
+practical consequences: a **second** native dependency (`react-native-video`)
+with its own iOS pod setup, on an app where CocoaPods has never run; and the
+caption defect in **[DECIDE 7]** stops being a measurement exercise and becomes
+something a user can actually see.
+
 `PROJECT_PLAN.md` settles this itself. Stage 7, verbatim:
 
 > **Deliverables:**
@@ -470,6 +510,9 @@ exact RN version is unverified here.
 ---
 
 ### [DECIDE 7] — the caption defect, and what evidence settles it
+
+**RESOLVED: measure first, then fix if the measurement says so.** With playback
+now in scope, the app itself becomes a second oracle alongside Safari.
 
 6A shipped a known defect: **the first caption cue is dropped, and every other
 cue lands ~112 ms early**, because subtitle timings are offset against the
