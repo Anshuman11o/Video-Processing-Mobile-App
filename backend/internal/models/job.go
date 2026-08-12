@@ -72,12 +72,12 @@ type OutputInfo struct {
 
 // Metrics contains timing metrics for the processing job.
 type Metrics struct {
-	UploadDurationMs    int64 `json:"upload_duration_ms,omitempty" dynamodbav:"upload_duration_ms,omitempty"`
-	TotalProcessingMs   int64 `json:"total_processing_ms,omitempty" dynamodbav:"total_processing_ms,omitempty"`
-	ValidateDurationMs  int64 `json:"validate_duration_ms,omitempty" dynamodbav:"validate_duration_ms,omitempty"`
-	ExtractDurationMs   int64 `json:"extract_duration_ms,omitempty" dynamodbav:"extract_duration_ms,omitempty"`
+	UploadDurationMs     int64 `json:"upload_duration_ms,omitempty" dynamodbav:"upload_duration_ms,omitempty"`
+	TotalProcessingMs    int64 `json:"total_processing_ms,omitempty" dynamodbav:"total_processing_ms,omitempty"`
+	ValidateDurationMs   int64 `json:"validate_duration_ms,omitempty" dynamodbav:"validate_duration_ms,omitempty"`
+	ExtractDurationMs    int64 `json:"extract_duration_ms,omitempty" dynamodbav:"extract_duration_ms,omitempty"`
 	TranscribeDurationMs int64 `json:"transcribe_duration_ms,omitempty" dynamodbav:"transcribe_duration_ms,omitempty"`
-	PackageDurationMs   int64 `json:"package_duration_ms,omitempty" dynamodbav:"package_duration_ms,omitempty"`
+	PackageDurationMs    int64 `json:"package_duration_ms,omitempty" dynamodbav:"package_duration_ms,omitempty"`
 }
 
 // Job represents a video processing job in DynamoDB.

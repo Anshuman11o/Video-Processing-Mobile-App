@@ -8,34 +8,39 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 
 	"github.com/anshumanagarwal/dayreel/internal/cache"
 	"github.com/anshumanagarwal/dayreel/internal/config"
 	"github.com/anshumanagarwal/dayreel/internal/db"
+	"github.com/anshumanagarwal/dayreel/internal/events"
 	"github.com/anshumanagarwal/dayreel/internal/models"
+	"github.com/anshumanagarwal/dayreel/internal/queue"
 	"github.com/anshumanagarwal/dayreel/internal/storage"
 )
 
 const (
-	partSize       = 5 * 1024 * 1024 // 5MB per part
-	presignExpiry  = 1 * time.Hour
+	partSize      = 5 * 1024 * 1024 // 5MB per part
+	presignExpiry = 1 * time.Hour
 )
 
 // Handler holds dependencies for all HTTP handlers.
 type Handler struct {
 	s3     *storage.S3Client
 	db     *db.DynamoDBClient
-	cache  *cache.RedisClient
+	cache  *cache.Cache
+	queue  queue.Queue
 	config *config.Config
 }
 
 // NewHandler creates a new Handler with the given dependencies.
-func NewHandler(s3 *storage.S3Client, db *db.DynamoDBClient, cache *cache.RedisClient, cfg *config.Config) *Handler {
+func NewHandler(s3 *storage.S3Client, db *db.DynamoDBClient, cache *cache.Cache, q queue.Queue, cfg *config.Config) *Handler {
 	return &Handler{
 		s3:     s3,
 		db:     db,
 		cache:  cache,
+		queue:  q,
 		config: cfg,
 	}
 }
@@ -182,7 +187,8 @@ func (h *Handler) CompleteUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Complete the S3 multipart upload
+	// Complete the S3 multipart upload. This call is idempotent, so a client
+	// retrying after a queue failure below does not get a spurious S3 error.
 	if err := h.s3.CompleteMultipartUpload(r.Context(), job.Upload.Key, req.UploadID, req.Parts); err != nil {
 		log.Printf("ERROR: complete multipart upload: %v", err)
 		writeError(w, http.StatusInternalServerError, "failed to complete upload", "S3_ERROR")
@@ -198,6 +204,23 @@ func (h *Handler) CompleteUpload(w http.ResponseWriter, r *http.Request) {
 
 	// Invalidate cache
 	_ = h.cache.InvalidateJob(r.Context(), jobID)
+
+	// Hand the job to the pipeline. Nothing else triggers processing — there is
+	// no S3 event notification any more — so a job that is not enqueued here is
+	// a video that silently never gets processed. That is why the failure is a
+	// 500 the client must retry rather than a logged warning.
+	stage := events.NewStageMessage(
+		jobID,
+		models.StageValidate,
+		events.S3Ref{Bucket: h.config.S3RawBucket, Key: job.Upload.Key},
+		1,
+		traceID(r),
+	)
+	if err := h.queue.Send(r.Context(), events.QueueValidate, stage, 0); err != nil {
+		log.Printf("ERROR: enqueue validate for job %s: %v", jobID, err)
+		writeError(w, http.StatusInternalServerError, "failed to queue job for processing", "QUEUE_ERROR")
+		return
+	}
 
 	writeJSON(w, http.StatusOK, completeUploadResponse{
 		JobID:   jobID,
@@ -275,4 +298,16 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, message, code string) {
 	writeJSON(w, status, errorResponse{Error: message, Code: code})
+}
+
+// traceID returns the caller's trace header, or a fresh ID. It rides on the
+// StageMessage through every stage, so a single video's whole journey — API,
+// queue, worker logs — can be grepped with one value.
+func traceID(r *http.Request) string {
+	for _, header := range []string{"X-Trace-Id", "X-Request-Id"} {
+		if v := r.Header.Get(header); v != "" {
+			return v
+		}
+	}
+	return uuid.NewString()
 }
