@@ -25,33 +25,37 @@ path. Expand incrementally once the core flow works.
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │                           ▲
                           POST /jobs│                           │GET /jobs/{id}
-                          Presigned │                           │+ CloudFront URL
+                          Presigned │                           │+ HLS URL (S3)
                           URLs      │                           │
                                     ▼                           │
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              BACKEND                                         │
-│  Go API + Workers, Docker Compose locally, ECS Fargate on AWS               │
-│                                                                              │
-│  ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐   │
-│  │   API   │───▶│Validate │───▶│ Extract │───▶│Transcribe───▶│ Package │   │
-│  │ (Go)    │    │ Worker  │    │ Worker  │    │ Worker  │    │ Worker  │   │
-│  └─────────┘    └─────────┘    └─────────┘    └─────────┘    └─────────┘   │
+│                              BACKEND                                        │
+│  Two Go processes: `go run ./cmd/api` and `go run ./cmd/worker`             │
+│                                                                             │
+│  ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐    │
+│  │   API   │───▶│Validate │───▶│ Extract │───▶│Transcribe───▶│ Package │    │
+│  │ (Go)    │    │ Stage   │    │ Stage   │    │ Stage   │    │ Stage   │    │
+│  └────┬────┘    └─────────┘    └─────────┘    └─────────┘    └─────────┘    │
 │       │              │              │              │              │         │
-│       └──────────────┴──────────────┴──────────────┴──────────────┘         │
-│                                    │                                         │
-│                    ┌───────────────┼───────────────┐                        │
-│                    ▼               ▼               ▼                        │
-│              ┌─────────┐    ┌─────────┐    ┌─────────┐                     │
-│              │   S3    │    │DynamoDB │    │   SQS   │                     │
-│              │ (video, │    │ (jobs)  │    │ (stages)│                     │
-│              │  HLS)   │    └─────────┘    └─────────┘                     │
-│              └─────────┘          │                                         │
-│                    │              │                                         │
-│                    └──────┬───────┘                                         │
-│                           ▼                                                  │
-│                     ┌─────────┐                                             │
-│                     │  Redis  │ (status cache)                              │
-│                     └─────────┘                                             │
+│       │              └──────────────┴──────────────┴──────────────┘         │
+│       │                             │                                       │
+│       │  in-process                 │  claim / ack / dead-letter            │
+│       │  TTL cache                  ▼                                       │
+│       │  (status)         ┌───────────────────┐                             │
+│       │                   │  SQLite queue     │  data/queue.db              │
+│       │                   │  (validate,       │  one row per message,       │
+│       │                   │   extract,        │  `visible_at` is the        │
+│       │                   │   transcribe,     │  visibility timeout,        │
+│       │                   │   package, dlq)   │  `queue` is the routing key │
+│       │                   └───────────────────┘                             │
+│       │                                                                     │
+│       └──────────────┬──────────────┐                                       │
+│                      ▼              ▼                                       │
+│                ┌─────────┐    ┌─────────┐        ── real AWS ──             │
+│                │   S3    │    │DynamoDB │                                   │
+│                │ (video, │    │ (jobs)  │                                   │
+│                │  HLS)   │    └─────────┘                                   │
+│                └─────────┘                                                  │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -62,8 +66,33 @@ path. Expand incrementally once the core flow works.
 - Transient errors retry with backoff; permanent errors go to DLQ
 - One DynamoDB item per job with a `stages` map
 
-**Local-first:** LocalStack emulates S3/SQS/DynamoDB. Same Go binaries run locally
-and on AWS via configurable endpoints. Docker Compose replaces Fargate locally.
+Dropping SQS did not drop any of these. The SQLite queue implements the same
+contract — claim with a visibility timeout, ack on success, dead-letter after N
+deliveries — which is the part the pipeline actually depends on.
+
+**Local-first:** the entire local stack is two Go processes and a file. S3 and
+DynamoDB are real AWS from the start, so there is no emulator to install and no
+emulator-vs-real behaviour gap to debug. The same binaries run on a VM if we
+deploy; only the queue would be swapped for a hosted broker, behind the same
+interface.
+
+**Deferred (deliberate, not an oversight):**
+- **No CDN.** At this scale — a handful of short clips — CloudFront is cost and
+  complexity with nothing to show for it. HLS is served directly from the HLS
+  bucket, which means that bucket has to be readable by the player. A CDN in front
+  of a private bucket is the first thing to add if this ever gets real viewers.
+- **No managed container hosting.** ECS Fargate buys autoscaling we don't need. The
+  Go binaries are identical either way, so this is a hosting choice we can revisit
+  without touching application code.
+- **No Docker, no LocalStack, no Redis, no SQS.** The project processes a handful
+  of 10–60 second clips. Containers, an AWS emulator, and a separate cache server
+  cost 1.5–2.5 GB of RAM and buy nothing at that scale. SQS becomes a SQLite
+  queue, Redis becomes an in-process TTL cache, and Compose has nothing left to
+  orchestrate. See `infra/CONTEXT.md`.
+- **No S3 event notifications.** Real S3 cannot notify a SQLite file, so uploads
+  no longer start the pipeline by themselves; the API enqueues the validate
+  message on `POST /jobs/{id}/complete`. Event-driven start returns with a real
+  broker, if ever.
 
 ---
 
@@ -89,36 +118,37 @@ and on AWS via configurable endpoints. Docker Compose replaces Fargate locally.
 ├── backend/
 │   ├── cmd/
 │   │   ├── api/                 # HTTP API entry point
-│   │   └── worker/              # Worker entry point (all stages)
+│   │   └── worker/              # Worker entry point (WORKER_STAGE picks the stage)
 │   ├── internal/
 │   │   ├── api/                 # HTTP handlers, routes
 │   │   ├── models/              # DynamoDB schemas, job types
-│   │   ├── worker/              # Stage implementations
+│   │   ├── events/              # Stage message contract, queue names, manifests
+│   │   ├── media/               # ffmpeg/ffprobe wrappers, HLS ladder, playlists
+│   │   ├── transcribe/          # Whisper and mock transcribers, WebVTT
+│   │   ├── worker/              # Stage implementations + the runner
 │   │   │   ├── validate/
 │   │   │   ├── extract/
 │   │   │   ├── transcribe/
-│   │   │   └── package/
+│   │   │   └── packager/
 │   │   ├── storage/             # S3 client wrapper
-│   │   ├── queue/               # SQS client wrapper
-│   │   └── cache/               # Redis client wrapper
+│   │   ├── queue/               # Self-hosted SQLite queue (claim/ack/DLQ)
+│   │   └── cache/               # In-process TTL cache for job status
 │   ├── go.mod
 │   ├── go.sum
-│   ├── Dockerfile
 │   └── CONTEXT.md
 │
+├── data/
+│   └── queue.db                 # SQLite queue (gitignored, created on first run)
+│
 ├── infra/
-│   ├── docker-compose.yml       # Local stack: LocalStack, Redis, API, workers
-│   ├── docker-compose.override.yml  # Local dev overrides
-│   ├── localstack/
-│   │   └── init-aws.sh          # Creates buckets, queues, tables on startup
-│   ├── terraform/               # AWS deployment (later stage)
+│   ├── terraform/               # AWS deployment (later stage, not written yet)
 │   │   ├── main.tf
 │   │   ├── variables.tf
 │   │   └── outputs.tf
-│   └── CONTEXT.md
+│   └── CONTEXT.md               # Why there is no compose stack here
 │
 ├── config/
-│   ├── aws-limits.md            # S3, SQS, DynamoDB constraints
+│   ├── aws-limits.md            # S3 and DynamoDB constraints, local queue settings
 │   ├── free-tier.md             # Cost constraints, $20 budget (no free tier)
 │   └── CONTEXT.md
 │
@@ -138,17 +168,21 @@ and on AWS via configurable endpoints. Docker Compose replaces Fargate locally.
 
 ## Development Sequence (Parallelized for Speed)
 
-**Rationale:** DynamoDB access patterns must be settled before the API. SQS schemas
-must be defined before workers. We maximize speed by running independent tracks
-concurrently.
+**Rationale:** DynamoDB access patterns must be settled before the API. Stage
+message schemas must be defined before workers. We maximize speed by running
+independent tracks concurrently.
+
+**Status:** stages 1A through 6A are **built**, not planned — the pipeline runs
+end to end from a queued validate message to an HLS master playlist. Stages 7
+and 8 are the remaining work.
 
 ### Parallel Execution Map
 
 ```
 PHASE 1: Foundation (run in parallel)
 ┌─────────────────────────────┐     ┌─────────────────────────────┐
-│ 1A. DynamoDB schema         │     │ 1B. Docker Compose +        │
-│     + SQS message schemas   │     │     LocalStack + Redis      │
+│ 1A. DynamoDB schema         │     │ 1B. AWS account setup:      │
+│     + stage message schemas │     │     buckets + jobs table    │
 │     (~30 min)               │     │     (~20 min)               │
 └─────────────┬───────────────┘     └─────────────┬───────────────┘
               │                                   │
@@ -226,11 +260,12 @@ PHASE 2: TRACK A (Backend)            TRACK B (Mobile)
 
 | Task | ID | Depends On | Can Parallel With | Est. Time |
 |------|-----|------------|-------------------|-----------|
-| DynamoDB + SQS schemas | 1A | — | 1B | 30 min |
-| Docker/LocalStack/Redis | 1B | — | 1A | 20 min |
+| DynamoDB + message schemas | 1A | — | 1B | 30 min |
+| AWS buckets + jobs table | 1B | — | 1A | 20 min |
 | Go API skeleton | 2A | 1A, 1B | 2B | 30 min |
 | RN app shell + picker | 2B | 1B | 2A, 3A-6A | 30 min |
-| Validate worker | 3A | 2A | 2B | 20 min |
+| SQLite queue | 3B | 1A | 2B, 3A | 30 min |
+| Validate worker | 3A | 2A, 3B | 2B | 20 min |
 | Extract worker | 4A | 3A | 2B | 20 min |
 | Transcribe worker | 5A | 4A | 2B | 20 min |
 | Package worker | 6A | 5A | 2B | 20 min |
@@ -257,11 +292,11 @@ phase can run concurrently.
 ### Phase 1: Foundation (Parallel)
 
 #### Stage 1A: Data Schemas
-**Aim:** Lock DynamoDB and SQS contracts before any code.
+**Aim:** Lock DynamoDB and stage-message contracts before any code.
 
 **Deliverables:**
 - DynamoDB table schema in `backend/internal/models/schema.go`
-- SQS message types in `backend/internal/events/messages.go`
+- Stage message types in `backend/internal/events/messages.go`
 - Access pattern documentation
 
 **Verification:**
@@ -270,22 +305,25 @@ phase can run concurrently.
 
 **Observable outcome:** Data contracts documented, team aligned.
 
-#### Stage 1B: Local Infrastructure
-**Aim:** Docker Compose brings up all services.
+#### Stage 1B: AWS Resources
+**Aim:** The three buckets and the jobs table exist in a real AWS account.
 
 **Deliverables:**
-- `infra/docker-compose.yml` with LocalStack, Redis
-- `infra/localstack/init-aws.sh` creates S3 buckets, SQS queues, DynamoDB table
+- `dayreel-raw-videos`, `dayreel-processed`, `dayreel-hls-output` buckets with CORS
+- `dayreel-jobs` DynamoDB table (pk/sk, PAY_PER_REQUEST)
+- `scripts/dev-setup.sh` checks all of it, plus toolchain and credentials
 
 **Verification:**
 ```bash
-docker-compose up -d
-aws --endpoint-url=http://localhost:4566 s3 ls
-aws --endpoint-url=http://localhost:4566 dynamodb list-tables
-aws --endpoint-url=http://localhost:4566 sqs list-queues
+./scripts/dev-setup.sh
+make verify
 ```
 
-**Observable outcome:** All AWS resources exist locally.
+**Observable outcome:** `make verify` prints the caller ARN, three OK buckets,
+and an ACTIVE table.
+
+> Superseded: this stage originally stood up Docker Compose with LocalStack and
+> Redis. Both are gone; see `infra/CONTEXT.md`.
 
 **SYNC POINT:** Both 1A and 1B complete before Phase 2 starts.
 
@@ -300,8 +338,8 @@ aws --endpoint-url=http://localhost:4566 sqs list-queues
 
 **Deliverables:**
 - `POST /jobs` — creates job, returns presigned URLs
-- `POST /jobs/{id}/complete` — signals upload done, triggers SQS
-- `GET /jobs/{id}` — returns job status
+- `POST /jobs/{id}/complete` — signals upload done, enqueues the validate message
+- `GET /jobs/{id}` — returns job status (in-process TTL cache in front of DynamoDB)
 
 **Verification:**
 ```bash
@@ -310,19 +348,26 @@ curl -X POST localhost:8080/jobs -d '{"filename":"test.mp4","size":1000000}'
 
 **Observable outcome:** API responds, job in DynamoDB.
 
+##### Stage 3B: Local Queue
+**Aim:** Replace SQS with a self-hosted SQLite queue.
+
+See `docs/stage-plans/stage-3b-local-queue.md`. Runs in parallel with 2A; blocks
+3A.
+
 ##### Stage 3A: Validate Worker
 **Aim:** First pipeline stage processes videos.
 
 **Deliverables:**
-- SQS consumer polls validate queue
+- Worker claims from the validate queue in `data/queue.db`
 - ffprobe checks codec/duration
 - Remux to faststart MP4
 - Update job status in DynamoDB
 
 **Verification:**
 ```bash
-aws --endpoint-url=http://localhost:4566 s3 cp test.mp4 s3://raw-videos/job-123/input.mp4
-# Send SQS message or let S3 event trigger
+aws s3 cp test.mp4 s3://dayreel-raw-videos/job-123/input.mp4
+# Enqueue via POST /jobs/{id}/complete, then watch the row move:
+make queue-peek
 curl localhost:8080/jobs/job-123  # status: validate:complete
 ```
 
@@ -355,7 +400,7 @@ curl localhost:8080/jobs/job-123  # status: validate:complete
 
 **Verification:**
 ```bash
-ffplay http://localhost:4566/hls-output/job-123/master.m3u8
+ffplay "$HLS_BASE_URL/job-123/master.m3u8"
 ```
 
 **Observable outcome:** **Backend E2E works.** Video in → HLS out.
@@ -422,7 +467,7 @@ ffplay http://localhost:4566/hls-output/job-123/master.m3u8
 
 **Deliverables:**
 - react-native-video with ExoPlayer
-- Play completed reels from CloudFront/LocalStack
+- Play completed reels straight from the HLS bucket on S3 (no CDN)
 
 **Verification:**
 - Completed job shows play button
@@ -440,8 +485,11 @@ ffplay http://localhost:4566/hls-output/job-123/master.m3u8
 **Deliverables:**
 - VPC with public subnets (no NAT Gateway)
 - VPC endpoints for S3, DynamoDB
-- ECS Fargate tasks for API + workers
-- CloudFront distribution
+- A single small VM running the same two Go binaries (API + worker) that run
+  locally — identical binaries, different host, no containers
+- HLS bucket readable by the player, served directly (no CDN)
+- The SQLite queue file lives on the VM's disk. Fine for one host; a second host
+  is the point at which it has to be swapped for a real broker.
 
 **Verification:**
 - `terraform apply` succeeds
@@ -498,18 +546,20 @@ Append as we go. Same problem never debugged twice.
 
 **config/aws-limits.md:**
 - S3: 5MB min part size, 10,000 max parts, 5TB max object
-- SQS: 256KB message limit, 12hr max visibility timeout
 - DynamoDB: 400KB item limit, 1KB RCU, 1KB WCU
+- Queue: 5-minute visibility timeout, maxDeliveries=3 (local SQLite, not SQS)
 
 **config/free-tier.md:**
 - **No free tier on this account** (confirmed 2026-08-12). Everything bills from
   the first request; the quota table that used to sit here was removed.
-- **Hard budget: $20 total.** Test clips ≤10s. Default posture is LocalStack;
-  AWS spend is opt-in, never incidental.
+- **Hard budget: $20 total.** Test clips ≤10s. Only two AWS services are used —
+  S3 and DynamoDB — and both bill per request, so development traffic is pennies.
 - Per-request costs are negligible at this scale (a job is a fraction of a cent).
   **Per-hour costs are the whole risk.**
 - **COST TRAPS, each over budget on its own:** NAT Gateway ~$32/mo,
-  Fargate 4 workers 24/7 ~$115/mo, ElastiCache ~$12/mo. All three stay local.
+  Fargate 4 workers 24/7 ~$115/mo, ElastiCache ~$12/mo. None of the three is in
+  the architecture any more, and none should come back without a decided
+  teardown time.
 
 ---
 
@@ -518,8 +568,9 @@ Append as we go. Same problem never debugged twice.
 1. **Test videos:** Do you have sample videos, or should we generate/download them?
    Ideally 3-5 clips: various codecs (H.264, HEVC), durations (10s, 60s), resolutions.
 
-2. **HLS local playback:** We'll try LocalStack S3 first. If CORS or other issues
-   block ExoPlayer, we'll flag and discuss (per your preference).
+2. **HLS playback:** Reels stream straight off the HLS bucket, which means that
+   bucket has to be player-readable and CORS-configured. If ExoPlayer trips on
+   either, we'll flag and discuss (per your preference).
 
 3. **Mock transcription:** Confirmed: implement both real faster-whisper and
    `MOCK_TRANSCRIBE=true` mode for fast iteration.
@@ -530,9 +581,9 @@ With parallelization, here's what's achievable:
 
 | Time | Track A (Backend) | Track B (Mobile) |
 |------|-------------------|------------------|
-| 0:00-0:30 | 1A: DynamoDB + SQS schemas | 1B: Docker/LocalStack |
+| 0:00-0:30 | 1A: DynamoDB + message schemas | 1B: AWS buckets + table |
 | 0:30-1:00 | 2A: Go API skeleton | 2B: RN app shell |
-| 1:00-1:20 | 3A: Validate worker | (continue 2B) |
+| 1:00-1:20 | 3B: SQLite queue, 3A: Validate worker | (continue 2B) |
 | 1:20-1:40 | 4A: Extract worker | — |
 | 1:40-2:00 | 5A: Transcribe (mock mode) | — |
 | 2:00-2:20 | 6A: Package worker | — |

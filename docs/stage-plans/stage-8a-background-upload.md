@@ -44,6 +44,13 @@
 > a multi-part upload to interrupt at all — requires a test clip over 5 MiB, not
 > a smaller part size.
 
+> **Substrate superseded.** Docker Compose, LocalStack, SQS and Redis are gone;
+> S3 and DynamoDB are real AWS and the queue is a local SQLite file. See
+> `infra/CONTEXT.md`. Nothing in this stage depended on the emulator except the
+> endpoints it uploads to — which is one more reason to revisit the [WAIT]
+> items after Stage 7, since the host-binding problem they inherit from Stage 7
+> no longer exists.
+
 ## Aim
 
 Make an interrupted upload finishable — after a network drop, after a
