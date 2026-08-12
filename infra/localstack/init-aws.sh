@@ -71,6 +71,47 @@ awslocal s3api put-bucket-policy --bucket dayreel-hls-output --policy '{
   ]
 }' || true
 
+# Reap abandoned multipart uploads on the raw bucket.
+#
+# Every interrupted upload leaves its parts behind. They bill as storage from
+# the moment the first part lands, they are released only by a completion or an
+# abort, and they appear in NO object listing — not `aws s3 ls`, not the
+# console. ListMultipartUploads is the only thing that can see them, which also
+# means they cannot be named in the teardown reminder config/free-tier.md
+# requires. That is the argument for this rule; the money is pennies.
+#
+# One day is the floor. The field is DaysAfterInitiation and it takes an
+# integer, so there is no shorter rule to write.
+#
+# LOCALSTACK DOES NOT ENFORCE THIS. Verified 2026-08-13, not assumed:
+#   - the PUT succeeds and get-bucket-lifecycle-configuration reads it back
+#     verbatim, so "it applied" proves nothing;
+#   - LocalStack does not validate it either — DaysAfterInitiation=0 is accepted
+#     here and rejected by real S3;
+#   - it parses the rule far enough to report a derived expiry-date on
+#     HeadObject, which makes it look implemented;
+#   - and it never acts. An object whose lifecycle Expiration Date was in 2020
+#     was still present, and an incomplete multipart upload under a
+#     DaysAfterInitiation=0 rule survived a minute of polling and repeated
+#     bucket access.
+#
+# Same shape as the public-read policy below and the put-public-access-block
+# precedent in docs/SETUP.md: accepted, readable, ignored. The rule is here for
+# real AWS. Locally, scripts/abort-stale-uploads.sh is the thing that actually
+# reaps — run it, do not trust this.
+awslocal s3api put-bucket-lifecycle-configuration \
+  --bucket dayreel-raw-videos \
+  --lifecycle-configuration '{
+    "Rules": [
+      {
+        "ID": "AbortIncompleteMultipartUploads",
+        "Status": "Enabled",
+        "Filter": {"Prefix": ""},
+        "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}
+      }
+    ]
+  }' || true
+
 echo "S3 buckets created."
 
 # ============================================================================
