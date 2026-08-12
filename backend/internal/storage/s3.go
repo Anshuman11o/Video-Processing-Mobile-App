@@ -3,6 +3,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 
 	"github.com/anshumanagarwal/dayreel/internal/config"
 )
@@ -91,6 +93,13 @@ func (s *S3Client) GeneratePresignedUploadURL(ctx context.Context, key, uploadID
 }
 
 // CompleteMultipartUpload finalizes a multipart upload with the given ETags.
+//
+// It is idempotent. The client is told to retry POST /jobs/{id}/complete when the
+// API fails to enqueue the job, and a retry that arrives after S3 already
+// assembled the object gets NoSuchUpload — the upload ID is gone precisely
+// because it succeeded. Treating that as a failure would strand a video that is
+// sitting complete in the bucket, so a HeadObject decides: if the object is
+// there, the upload is done, whatever the API call said.
 func (s *S3Client) CompleteMultipartUpload(ctx context.Context, key, uploadID string, parts []CompletedPart) error {
 	completedParts := make([]types.CompletedPart, len(parts))
 	for i, p := range parts {
@@ -109,9 +118,43 @@ func (s *S3Client) CompleteMultipartUpload(ctx context.Context, key, uploadID st
 		},
 	})
 	if err != nil {
+		if exists, headErr := s.ObjectExists(ctx, key); headErr == nil && exists {
+			return nil
+		}
 		return fmt.Errorf("complete multipart upload: %w", err)
 	}
 	return nil
+}
+
+// ObjectExists reports whether an object is present in the raw bucket.
+//
+// A missing object is (false, nil), not an error: "not there" is an answer, and
+// only a genuine failure to ask — permissions, network, a wedged endpoint — is
+// worth propagating.
+func (s *S3Client) ObjectExists(ctx context.Context, key string) (bool, error) {
+	_, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	})
+	if err == nil {
+		return true, nil
+	}
+
+	// HeadObject has no body, so S3 cannot return a typed NoSuchKey; the SDK
+	// surfaces the bare 404 as types.NotFound. Some S3-compatible endpoints
+	// answer with the generic codes instead, hence the second check.
+	var notFound *types.NotFound
+	if errors.As(err, &notFound) {
+		return false, nil
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NotFound", "NoSuchKey", "404":
+			return false, nil
+		}
+	}
+	return false, fmt.Errorf("head object %s: %w", key, err)
 }
 
 // AbortMultipartUpload cancels an in-progress multipart upload.
