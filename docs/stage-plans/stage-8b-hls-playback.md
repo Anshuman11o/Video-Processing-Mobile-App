@@ -1,15 +1,25 @@
 # Stage 8B: HLS Playback
 
-> Status: **draft — not approved.** Six decisions open: **[DECIDE 1]**–**[DECIDE 6]**.
-> Written 2026-08-13 alongside `stage-8a-background-upload.md`.
+> Status: **approved — implementation started 2026-08-13.** All six decisions
+> settled.
 >
-> **[DECIDE 1] is a gate, not a preference.** If `react-native-video` v6 does not
-> work under RN 0.87's New Architecture, the stage does not proceed on its
-> recommended path and every estimate below is void. Answer it first, cheaply.
+> | | Settled as |
+> |---|---|
+> | **[DECIDE 1]** player | **Write the player code and fix New Architecture problems as they surface.** **This went against the plan's recommendation**, which was to prove the build green before writing anything. The risk is now accepted explicitly: if `react-native-video` v6 cannot work under `newArchEnabled=true`, the player code, the screen changes and the caption work will all have been written against something that cannot run. |
+> | **[DECIDE 2]** segment access | **Playback stays LocalStack-only.** The real-AWS run verifies upload and pipeline only. Zero exposure, zero extra cost, and `dayreel-hls-output` never becomes a public bucket on a real account — at the price of the reel never being played from real infrastructure. |
+> | **[DECIDE 3]** caption defect | **Measure AND fix inside 8B.** **Against the plan's recommendation** of a separate 6B: this stage now edits `backend/internal/media/`, which is 6A's code. Measurement still strictly precedes the fix — "the player is fine, change nothing" remains a real possible outcome. |
+> | **[DECIDE 4]** caption visibility | Select by language *and* render the track list, so "no captions" is a three-way diagnosis rather than a dead end. |
+> | **[DECIDE 5]** cleartext | Rely on the RN Gradle plugin's debug placeholder; document what it means for a release build. |
+> | **[DECIDE 6]** verification | Split into **8B-0** (host-side, needs no toolchain) and **8B-1** (the app). |
 >
-> The Android toolchain question — **no SDK, 2.8 GB free disk** — is
-> **[DECIDE 7] in stage 8A**. It is not restated here. **8B is blocked on it
-> completely**, where 8A is blocked on it only from its Phase 5.
+> **8B-0 started first**, before the toolchain existed, because the caption
+> measurement needs neither an SDK nor an emulator — the finding below is what
+> makes that possible.
+>
+> The Android toolchain question is **[DECIDE 7] in stage 8A** and is not
+> restated here. It has since been settled and the blocker cleared: disk went
+> from 2.8 GB to **24 GiB**, and a full SDK install including the NDK was
+> approved.
 
 ## Aim
 

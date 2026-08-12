@@ -1,26 +1,48 @@
 # Stage 8A: Background Upload
 
-> Status: **draft — not approved.** Seven decisions open: **[DECIDE 1]**–**[DECIDE 7]**.
-> Written 2026-08-13, after Stage 7's backend landed and while its mobile half is
-> still being implemented.
+> Status: **approved — implementation started 2026-08-13.** All seven decisions
+> settled; the answers are recorded below and inline in each section.
 >
-> **Read [DECIDE 1] first.** `PROJECT_PLAN.md`'s stated Aim for this stage and its
-> stated Verification describe two different features with very different costs,
-> and the whole shape of the stage follows from which one is meant.
+> | | Settled as |
+> |---|---|
+> | **[DECIDE 1]** scope | **True background transfer.** The Aim wins over the Verification: the upload continues to S3 while the app is dead, subject to network. That means the Kotlin WorkManager module, not resume-on-relaunch. **This went against the plan's recommendation** — it is the larger of the two features, and the client becomes Kotlin/OkHttp rather than JS. |
+> | **[DECIDE 2]** resume state | **Server-authoritative via `ListParts`.** The client persists identifiers only, never an ETag. Stage 7's uploader docstring promises the opposite and must be corrected. |
+> | **[DECIDE 3]** endpoints | **Both** — the re-presign endpoint *and* a tolerant `CompleteUpload` that can derive its parts from `ListParts`. |
+> | **[DECIDE 4]** abandoned uploads | **All three** — lifecycle rule, explicit `DELETE`, and a manual reaper script. |
+> | **[DECIDE 5]** source file | `DocumentDir` + orphan sweep, existence check as backstop. |
+> | **[DECIDE 6]** interrupt window | Debug-only inter-part delay, so there is something to kill. |
+> | **[DECIDE 7]** toolchain | **Install everything, NDK included.** Disk was freed the same day: **24 GiB now, not 2.8** — the "stop below ~12 GB" fallback is moot. Node 22 via nvm alongside it (RN 0.87 needs ≥22.13; the machine had v20.11). |
 >
-> **Read the finding below second.** It is the reason ~80% of this stage is
-> backend work that has nothing to do with Android.
+> **Real AWS is deferred to a single run at the end**, not used for development.
+> Provisioning is real work, not a flag: compose hardcodes `USE_LOCALSTACK=true`
+> on every service with no `env_file`, and no real bucket, queue or table has
+> ever existed. That one run is also the only chance to test anonymous-access
+> enforcement and Block Public Access, which LocalStack provably cannot.
+>
+> **Read the finding below.** It is the reason ~80% of this stage is
+> backend work that has nothing to do with Android — and that half was started
+> first precisely because it needs no SDK, no emulator and no disk.
 >
 > **Correction, 2026-08-13, same day.** This plan was drafted against a repo
 > state that changed while it was being written. Two things that it originally
 > recorded as missing have since landed from the main session's Stage 7 work, and
 > the affected passages are annotated inline rather than silently rewritten:
-> **`UPLOAD_PART_SIZE` now exists** (`config.go:49,72,79`; `handlers.go:28`;
-> `docker-compose.yml:82` at `262144`), so **[DECIDE 6]**'s first problem is
-> solved and this stage's Phase 1 is deleted; and **Stage 7's mobile uploader now
-> exists** (`mobile/src/upload/`, `mobile/src/storage/`, `mobile/src/hooks/`),
-> which makes **[DECIDE 2]** a sharper question than it was — Stage 7 has already
-> begun building toward the option this plan recommends against.
+> **`UPLOAD_PART_SIZE` now exists** (`config.go`, `handlers.go`), so this
+> stage's Phase 1 is deleted; and **Stage 7's mobile uploader now exists**
+> (`mobile/src/upload/`, `mobile/src/storage/`, `mobile/src/hooks/`), which made
+> **[DECIDE 2]** a sharper question than it was — Stage 7 had already begun
+> building toward the option this plan recommends against, and **[DECIDE 2]**
+> has now been settled against it.
+>
+> **Second correction, later the same day.** The compose value quoted above
+> (`UPLOAD_PART_SIZE=262144`) is **gone, and the reasoning behind it was wrong.**
+> A small part size does not work anywhere: LocalStack enforces S3's 5 MiB
+> minimum exactly as S3 does, and an upload with sub-5 MiB parts uploads every
+> part with a 200 and then fails the whole job at `CompleteMultipartUpload` with
+> `EntityTooSmall`. Values below the minimum are now clamped in config. **This
+> matters to [DECIDE 6]:** exercising the multipart path — and therefore having
+> a multi-part upload to interrupt at all — requires a test clip over 5 MiB, not
+> a smaller part size.
 
 ## Aim
 
