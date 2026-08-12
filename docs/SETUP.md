@@ -161,6 +161,21 @@ design locally, because HLS playlists reference segments by relative path and
 cannot be presigned. Its real-AWS access model is still an open question — see
 `config/free-tier.md`.
 
+**This has already shipped one bug, and it is the shape to watch for.** Stage 6A
+built `thumbnail_url` against `dayreel-processed`, which has no bucket policy and
+no CORS. Every local run served it with a 200 — that bucket is no more protected
+here than any other — so the URL looked correct in the API response, in the app,
+and in 6A's own verification, while being a 403 on real S3. Fixed 2026-08-13 by
+publishing the frame into the HLS bucket instead; the full argument is
+**[DECIDE 6]** in `docs/stage-plans/stage-6a-package-worker.md`.
+
+The generalisation is worth stating on its own: **a URL that resolves locally
+tells you nothing about whether the bucket it names is readable.** Only the
+`dayreel-hls-output` bucket has a read grant, so any client-facing URL built
+against a different one is wrong regardless of what the local stack returns —
+and no test that runs here can tell you so, because the failure it would catch
+does not happen here. Check the bucket in the URL, not the response code.
+
 ### Transcription is mocked by default
 
 `MOCK_TRANSCRIBE=true` in compose. Transcripts read `[mock transcript] segment N`.

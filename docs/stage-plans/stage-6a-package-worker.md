@@ -79,6 +79,7 @@ First stage to write to a third bucket.
 | `dayreel-hls-output` | `{job_id}/720p/playlist.m3u8` + `segment_NNN.ts` | Rendition |
 | `dayreel-hls-output` | `{job_id}/480p/…`, `{job_id}/360p/…` | Renditions |
 | `dayreel-hls-output` | `{job_id}/subs/playlist.m3u8` + `subs_000.vtt` | Subtitle rendition (**[DECIDE 2]**) |
+| `dayreel-hls-output` | `{job_id}/thumbnail.jpg` | Poster frame, copied from `dayreel-processed` (**[DECIDE 6]**) |
 
 **The multi-artifact problem from 4A returns, larger.** A 60s clip at 6s segments
 is ~10 segments × 3 renditions, plus 4 playlists and the subtitles — on the order
@@ -101,14 +102,16 @@ the job's own completion:
   "output": {
     "hls_url": "http://…/dayreel-hls-output/{job_id}/master.m3u8",
     "duration_seconds": 6.02,
-    "thumbnail_url": "http://…/dayreel-processed/{job_id}/frames/frame_001.jpg"
+    "thumbnail_url": "http://…/dayreel-hls-output/{job_id}/thumbnail.jpg"
   }
 }
 ```
 
 `models.OutputInfo` (`job.go:67`) already defines these three fields.
 `duration_seconds` and the thumbnail both come from 4A's extract manifest, so
-this stage reads it rather than re-probing.
+this stage reads it rather than re-probing. The frame itself is republished into
+the HLS bucket first — see **[DECIDE 6]**; it was originally shipped as a URL
+into `dayreel-processed`, which is not readable by a client.
 
 ---
 
@@ -347,6 +350,80 @@ backstop rather than the primary defence.
 
 ---
 
+### [DECIDE 6] — `thumbnail_url` pointed into a bucket no client can read
+
+**RESOLVED 2026-08-13: the poster frame is copied into `dayreel-hls-output` at
+`{job_id}/thumbnail.jpg`, and `thumbnail_url` is built against that bucket.**
+
+Raised after the fact, not before: 6A shipped `thumbnail_url` as
+`{PublicEndpoint}/dayreel-processed/{job_id}/frames/frame_001.jpg` — 4A's frame
+key, resolved against the intermediates bucket. **[DECIDE 4]** settled read
+access for `dayreel-hls-output` and nobody noticed a second bucket had quietly
+been added to the client's reach.
+
+Three separate things are wrong with that URL, and only the first is about
+authorization:
+
+1. `init-aws.sh` grants public-read to `dayreel-hls-output` **only** — verified:
+   `get-bucket-policy` on `dayreel-processed` returns `NoSuchBucketPolicy`, and
+   `get-bucket-cors` returns `NoSuchCORSConfiguration`. Real S3 has Block Public
+   Access on by default, so the URL is a 403 there.
+2. Stage 1A puts `dayreel-processed` on a **7-day delete** and keeps
+   `dayreel-hls-output` indefinitely. Even granted read access, every thumbnail
+   URL would break a week after its job. (No lifecycle rule implements this yet
+   on either bucket — verified — so it is a design intent the fix respects, not
+   a live expiry.)
+3. `dayreel-processed` holds `validated.mp4`, `audio.wav`, the transcript and the
+   whole frame set. Anything that opens it up for a thumbnail opens up the
+   user's source video: an unsigned GET of `{job_id}/validated.mp4` returned
+   **200 and 14.9 MB** locally.
+
+**Why it was invisible** is the same mechanism `docs/SETUP.md` records for the
+upload path — LocalStack serves unsigned GETs to any bucket regardless of
+policy — and it is worth stating plainly that **the 403 cannot be reproduced
+here at all**. No local test, integration or otherwise, can catch this class of
+bug. What can be caught is the construction, so `buildOutput` is pure and the
+test asserts negatively: any bucket other than the HLS one fails, not just the
+one that happened to be wrong.
+
+#### Options, and why the others lose
+
+- **(a) Copy the frame into `dayreel-hls-output`. CHOSEN.** One bucket holds
+  everything a client fetches, under one access model that is already decided
+  and already has CORS. It fixes all three problems above at once, it is what
+  the superseded initial 6A plan specified for exactly reason 2, and PR #7's
+  opt-in public-read switch (`s3:GetObject` on `dayreel-hls-output/*`) covers
+  the thumbnail for free — the same UUID-secrecy argument applies unchanged,
+  since that policy deliberately withholds `s3:ListBucket`.
+- **(b) Presign the thumbnail.** Genuinely workable for one image — there are no
+  relative-path segments to follow, so the objection that kills presigning for
+  HLS does not apply. It loses anyway: the URL is minted once in `Finalize` and
+  **stored in DynamoDB**, so the expiry is baked into persisted state and
+  `/jobs/{id}/reel` starts serving a dead URL. Minting per request moves the
+  concern into 2A's handler and *still* points at an object problem 2 deletes.
+- **(c) Grant `dayreel-processed` public read.** Cheapest edit, worst outcome —
+  see problem 3. Narrowing it to `*/frames/*` avoids the source video but leaves
+  a second public bucket with its own policy to maintain, outside PR #7's
+  switch, still expiring at 7 days.
+- **(d) Drop `thumbnail_url`.** It has consumers: `models.OutputInfo`,
+  `reelResponse` in 2A's handler, `mobile/src/types/api.ts`, and `PlayerScreen`,
+  which renders it as text with a comment explaining it is deliberately *not*
+  fetched because of this very bug. Removing a field defined by 1A and produced
+  by 4A/6A, to avoid a twenty-line fix, trades a working feature for a
+  disclaimer.
+
+#### What this cost in code
+
+`Stage.Finalize` copies `frames[0]` to `{job_id}/thumbnail.jpg` before recording
+the URL, so a stored `thumbnail_url` can never name an object that was not
+written. The copy is best-effort like the manifest read it follows — a failure
+loses the thumbnail, never the finished job — which is why `buildOutput` takes
+whether the copy landed rather than assuming it did. One additive method,
+`storage.CopyObject`, was needed; `MetadataDirective: REPLACE` is load-bearing
+there, since the default silently ignores the `ContentType` passed alongside it.
+
+---
+
 ## Files
 
 | File | Action | Purpose |
@@ -423,7 +500,11 @@ _To be run against LocalStack. Nothing checked off until observed._
 - [x] **`GET /jobs/{id}/reel` returns 200**, not the 409 it returned for every
       job from Stage 2A until now
 - [x] `output.duration_seconds` matches the extract manifest (6.4)
-- [x] `output.thumbnail_url` points at a frame that exists
+- [x] ~~`output.thumbnail_url` points at a frame that exists~~ — **this check was
+      the bug.** Existence was all it asserted, and the frame did exist; nothing
+      asked whether a client could *read* it. See **[DECIDE 6]**. Now: points at
+      `{job_id}/thumbnail.jpg` in the HLS bucket, byte-identical to the source
+      frame (matching ETag) and `Content-Type: image/jpeg`.
 - [x] No message published anywhere — terminal stage
 - [x] `metrics` populated: `total_processing_ms: 3490`, `package_duration_ms: 1036`
 - [x] Rung skipping works on real input: a 640×480 source produced **only** 480p

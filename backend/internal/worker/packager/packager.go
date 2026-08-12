@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -89,6 +90,13 @@ func (s *Stage) OutputBucket() string { return s.hlsBucket }
 // references every rendition playlist, which reference every segment. It is
 // uploaded last, so its existence means the whole tree landed.
 func (s *Stage) OutputKey(jobID string) string { return jobID + "/master.m3u8" }
+
+// thumbnailKey is where the poster frame is published, in the HLS bucket.
+//
+// A fixed name at the job root rather than the source frame's own key: which
+// frame was chosen is extract's business, and copying frames/frame_001.jpg
+// across would imply the rest of the frame set came with it.
+func thumbnailKey(jobID string) string { return jobID + "/thumbnail.jpg" }
 
 // Process transcodes the validated video into an HLS ladder and uploads it.
 func (s *Stage) Process(ctx context.Context, msg *events.StageMessage) (string, error) {
@@ -280,15 +288,13 @@ func (s *Stage) Finalize(ctx context.Context, msg *events.StageMessage, outputKe
 
 	// Duration and thumbnail come from the extract manifest rather than a fresh
 	// probe: extract already recorded both.
-	duration, thumbnailKey := s.outputDetails(ctx, msg.JobID)
+	duration, frameKey := s.outputDetails(ctx, msg.JobID)
 
-	output := &models.OutputInfo{
-		HLSURL:          s.publicURL(s.hlsBucket, outputKey),
-		DurationSeconds: duration,
-	}
-	if thumbnailKey != "" {
-		output.ThumbnailURL = s.publicURL(s.inputBucket, thumbnailKey)
-	}
+	// The URL is recorded only once the object is actually in the HLS bucket,
+	// so a stored thumbnail_url can never name something that was never copied.
+	published := frameKey != "" && s.publishThumbnail(ctx, msg.JobID, frameKey)
+
+	output := buildOutput(s.opts.PublicEndpoint, s.hlsBucket, msg.JobID, outputKey, duration, published)
 
 	var totalMs int64
 	if !job.CreatedAt.IsZero() {
@@ -332,9 +338,55 @@ func (s *Stage) outputDetails(ctx context.Context, jobID string) (float64, strin
 	return manifest.DurationSeconds, thumbnail
 }
 
+// publishThumbnail copies the poster frame into the HLS bucket, reporting
+// whether it landed.
+//
+// Extract writes frames to dayreel-processed, and that bucket is not something
+// a client can be pointed at. It carries no public-read policy and no CORS
+// (init-aws.sh grants both to dayreel-hls-output only), it holds the validated
+// source video and the extracted audio next to the frames, and stage 1A puts it
+// on a 7-day delete while the HLS bucket is kept indefinitely. So a
+// thumbnail_url into it is unreachable on real S3, and stale a week later even
+// if it were reachable.
+//
+// Republishing into the HLS bucket means one bucket holds everything a client
+// fetches, under the access model this project has already decided on — the
+// same one the reel itself needs, so it costs no second policy and nothing new
+// becomes world-readable.
+//
+// Best-effort, matching outputDetails above: a failed copy costs the thumbnail,
+// never the finished job.
+func (s *Stage) publishThumbnail(ctx context.Context, jobID, frameKey string) bool {
+	err := s.s3.CopyObject(ctx, s.inputBucket, frameKey, s.hlsBucket, thumbnailKey(jobID), "image/jpeg")
+	if err != nil {
+		log.Printf("worker[package] job=%s publish thumbnail: %v", jobID, err)
+		return false
+	}
+	return true
+}
+
+// buildOutput assembles the completed job's OutputInfo.
+//
+// Pure, and split out for the same reason collectUploads is: the thing that has
+// actually been wrong here is which bucket a URL is built against, and that is
+// decidable without S3. Every URL handed to a client names hlsBucket, because
+// it is the only bucket whose read access is settled.
+func buildOutput(
+	endpoint, hlsBucket, jobID, masterKey string, duration float64, hasThumbnail bool,
+) *models.OutputInfo {
+	out := &models.OutputInfo{
+		HLSURL:          publicURL(endpoint, hlsBucket, masterKey),
+		DurationSeconds: duration,
+	}
+	if hasThumbnail {
+		out.ThumbnailURL = publicURL(endpoint, hlsBucket, thumbnailKey(jobID))
+	}
+	return out
+}
+
 // publicURL builds a browser-reachable URL for an object.
-func (s *Stage) publicURL(bucket, key string) string {
-	base := strings.TrimSuffix(s.opts.PublicEndpoint, "/")
+func publicURL(endpoint, bucket, key string) string {
+	base := strings.TrimSuffix(endpoint, "/")
 	return fmt.Sprintf("%s/%s/%s", base, bucket, key)
 }
 
