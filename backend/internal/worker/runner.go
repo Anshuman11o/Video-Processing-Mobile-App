@@ -101,14 +101,6 @@ func (r *Runner) handle(ctx context.Context, m queue.Message) {
 
 	log.Printf("worker[%s] job=%s attempt=%d key=%s", stageName, msg.JobID, msg.Attempt, msg.Input.Key)
 
-	if err := r.db.SetStageRunning(ctx, msg.JobID, stageName); err != nil {
-		// The job row is the only record that work started. Losing that write
-		// is transient — let the message come back rather than processing a job
-		// whose state says nothing is happening.
-		log.Printf("worker[%s] job=%s mark running: %v", stageName, msg.JobID, err)
-		return
-	}
-
 	outputKey := r.stage.OutputKey(msg.JobID)
 
 	done, err := r.storage.ObjectExists(ctx, r.stage.OutputBucket(), outputKey)
@@ -118,12 +110,40 @@ func (r *Runner) handle(ctx context.Context, m queue.Message) {
 	}
 
 	if done {
-		// Output already exists, so the media work is finished. Fall through to
-		// completion rather than returning: a crash between uploading the
-		// output and publishing downstream would otherwise leave the pipeline
-		// stalled forever, with the next stage never told to start.
-		log.Printf("worker[%s] job=%s output exists, skipping work", stageName, msg.JobID)
-	} else {
+		// The output exists, but that alone does not say whether this stage
+		// finished. Two situations produce it, and they need opposite handling:
+		//
+		//   1. A pure duplicate delivery of work already completed. Publishing
+		//      again would enqueue the next stage twice for every redelivery.
+		//   2. A crash after uploading the output but before recording
+		//      completion. Here the next stage was never told to start, so
+		//      returning early would stall the pipeline permanently.
+		//
+		// The recorded stage state distinguishes them, which is why this check
+		// runs before SetStageRunning — marking the stage running first would
+		// overwrite the very evidence needed here.
+		alreadyDone, err := r.stageAlreadyCompleted(ctx, msg.JobID)
+		if err != nil {
+			log.Printf("worker[%s] job=%s completion check: %v", stageName, msg.JobID, err)
+			return
+		}
+		if alreadyDone {
+			log.Printf("worker[%s] job=%s already completed, dropping duplicate", stageName, msg.JobID)
+			r.delete(ctx, m)
+			return
+		}
+		log.Printf("worker[%s] job=%s output exists but stage unrecorded, resuming", stageName, msg.JobID)
+	}
+
+	if err := r.db.SetStageRunning(ctx, msg.JobID, stageName); err != nil {
+		// The job row is the only record that work started. Losing that write
+		// is transient — let the message come back rather than processing a job
+		// whose state says nothing is happening.
+		log.Printf("worker[%s] job=%s mark running: %v", stageName, msg.JobID, err)
+		return
+	}
+
+	if !done {
 		outputKey, err = r.stage.Process(ctx, msg)
 		if err != nil {
 			r.fail(ctx, m, msg, err)
@@ -145,6 +165,26 @@ func (r *Runner) handle(ctx context.Context, m queue.Message) {
 
 	r.delete(ctx, m)
 	log.Printf("worker[%s] job=%s done output=%s", stageName, msg.JobID, outputKey)
+}
+
+// stageAlreadyCompleted reports whether this stage is recorded as completed for
+// the job. A missing job is treated as not completed: the message is then
+// handled normally and fails on its own terms rather than being silently
+// dropped here.
+func (r *Runner) stageAlreadyCompleted(ctx context.Context, jobID string) (bool, error) {
+	job, err := r.db.GetJob(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	if job == nil {
+		return false, nil
+	}
+
+	state, ok := job.Stages[r.stage.Name()]
+	if !ok || state == nil {
+		return false, nil
+	}
+	return state.Status == models.StageStatusCompleted, nil
 }
 
 // fail records a stage failure and decides whether the message should retry.
