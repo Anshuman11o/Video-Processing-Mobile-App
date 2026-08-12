@@ -399,38 +399,56 @@ awslocal sqs receive-message --queue-url .../dayreel-package
 
 _To be run against LocalStack. Nothing is checked off until observed._
 
-**Happy path (mock mode)**
+**Happy path (mock mode)** — verified 2026-08-12
 
-- [ ] `worker-transcribe` starts and long-polls without busy-spinning
-- [ ] Full chain upload → validate → extract → transcribe with **no manual SQS
-      publish**
-- [ ] `stages.transcribe` goes `pending → running → completed`, `attempts == 1`
-- [ ] `transcript.vtt` exists, begins with `WEBVTT`, and parses as valid WebVTT
-- [ ] Cue timestamps are monotonic, non-overlapping, and none exceeds the
-      manifest's `duration_seconds`
-- [ ] Exactly one message on `dayreel-package`, pointing at `transcript.vtt`,
-      carrying the **inherited** `trace_id` (now two hops from validate)
-- [ ] `Metrics.TranscribeDurationMs` is populated
+- [x] `worker-transcribe` starts and long-polls without busy-spinning, and
+      announces `MOCK_TRANSCRIBE=true — no model will be run` at startup
+- [x] Full chain upload → validate → extract → transcribe with **no manual SQS
+      publish**, completing in about a second end to end
+- [x] `stages.transcribe` goes `pending → running → completed`, `attempts == 1`
+- [x] `transcript.vtt` exists, begins with `WEBVTT`, and parses
+- [x] Cue timestamps are monotonic and non-overlapping, and the final cue is
+      **clipped to the clip** — a 6.023s video ends its last cue at 6.023, not
+      at 9
+- [x] Exactly one message on `dayreel-package` pointing at `transcript.vtt`,
+      carrying the **inherited** `trace_id`. `c5b00919` and `d4340573` survive
+      validate → extract → transcribe → package, so a trace now spans **three
+      hops**
+- [ ] `Metrics.TranscribeDurationMs` is populated — **NOT DONE.** The field
+      exists on the model and is still never written. Recorded as outstanding
+      rather than quietly dropped; it needs a timing hook in the runner, which
+      is a shared-runner change and did not belong in the same pass as
+      heartbeating.
 
 **Failure and edge paths**
 
-- [ ] **Silent clip:** a job whose manifest has `audio.present == false`
-      completes with a valid empty `WEBVTT`, **never invokes the model**, and
-      still publishes to package (the 4A obligation, discharged)
-- [ ] **Idempotency (duplicate):** replaying the message logs
-      `already completed, dropping duplicate`, writes no new object, and does
-      not double-publish
-- [ ] **Idempotency (crash-resume):** hand-write `transcript.vtt` while
-      `stages.transcribe` is `running`, then publish. Expect
-      `output exists but stage unrecorded, resuming`. **Still unexercised after
-      3A and 4A** — the last untested branch in shared code
-- [ ] **Missing manifest:** publish for a `job_id` with no `extract.json`.
-      Record actual behaviour (expected: transient → DLQ after 3)
-- [ ] **Malformed manifest:** valid JSON, wrong shape. Expect a *permanent*
-      failure — re-reading identical bytes cannot help
-- [ ] **Sidecar down** (if **[DECIDE 1]** = C): expect a **transient** failure
-      and successful retry once it is back, not a permanent one
-- [ ] **SIGTERM mid-transcription** leaves no orphaned process
+- [x] **Silent clip:** the job whose manifest carries `audio.present: false`
+      produced an 8-byte `WEBVTT\n\n` document with zero cues, never fetched
+      audio (none exists in S3), and still published to package. The 4A
+      obligation is discharged and observed, not merely coded.
+- [ ] **Idempotency (duplicate):** **not run for this stage.** The mechanism is
+      in the shared runner and was verified in both 3A and 4A.
+- [ ] **Idempotency (crash-resume):** **still unexercised**, now across three
+      stages. See the note below — this should stop being deferred.
+- [ ] **Missing manifest:** not run.
+- [ ] **Malformed manifest:** covered by a unit test asserting
+      `worker.Permanent`, but not observed end to end.
+- [ ] **Sidecar down:** not applicable — **[DECIDE 1]** chose whisper.cpp in the
+      image, so there is no sidecar.
+- [ ] **SIGTERM mid-transcription:** not run. Mock transcription is
+      instantaneous, so this only becomes meaningful once the real model is in.
+
+### The crash-resume branch has now been deferred three times
+
+`output exists but stage unrecorded, resuming` (`runner.go`) has not executed in
+3A, 4A, or 5A. It is real code in the shared runner, on the path every stage
+takes, and it has never run.
+
+Deferring it a fourth time is not reasonable. Either it gets exercised during 6A
+— it is cheap to force: hand-write the output object while the stage row still
+says `running`, then publish — or it should be covered by a unit test against a
+faked storage layer. A branch that is never verified is worse than one that does
+not exist, because it reads as tested.
 
 **Real model (budgeted — run once)**
 
