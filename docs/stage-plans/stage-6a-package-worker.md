@@ -1,9 +1,9 @@
 # Stage 6A: Package Worker
 
-> Status: **draft — not reviewed.** Five **[DECIDE]** items below are open.
-> **[DECIDE 1]** is the one that matters: nothing in this codebase currently
-> marks a job finished, and this is the stage that has to. No code until
-> reviewed.
+> Status: **approved — ready to implement.** Decisions settled 2026-08-12.
+> Four went as recommended; **[DECIDE 4]** did not — bucket access is applied
+> locally only, with the real-AWS access model left as an explicit open
+> question rather than decided here.
 
 ## Aim
 
@@ -114,6 +114,10 @@ this stage reads it rather than re-probing.
 
 ### [DECIDE 1] — nothing marks a job completed, and this stage must
 
+**RESOLVED: option (B), the optional `Finalizer` interface.** The runner
+type-asserts after `SetStageCompleted`, so the job can never claim completion
+ahead of its own stage row. Separate commit, unit-tested like the heartbeat.
+
 **This is the decision the stage turns on.** The rest is ffmpeg.
 
 #### The gap, precisely
@@ -201,6 +205,9 @@ and unit-tested like the heartbeat was.
 
 ### [DECIDE 2] — how the transcript becomes an HLS subtitle track
 
+**RESOLVED: option (a), hand-assemble the master playlist**, including the
+subtitle rendition.
+
 `PROJECT_PLAN.md` says "Master playlist with VTT subtitle track". Real HLS
 subtitles are not just a `.vtt` file next to the video; they need:
 
@@ -232,6 +239,9 @@ ordering already assumes.
 
 ### [DECIDE 3] — the ladder, and what to do when the source is smaller
 
+**RESOLVED as recommended:** skip renditions above the source height, always
+keeping at least one.
+
 `stage-1a-data-schemas.md` specifies 720p/480p/360p. Two problems:
 
 1. **Upscaling.** Test clips are 640×480. Encoding a 720p rendition from a 480p
@@ -261,6 +271,21 @@ Proposed rungs, to be tuned once measured:
 ---
 
 ### [DECIDE 4] — what `hls_url` actually points at, and whether the bucket is readable
+
+**RESOLVED: public-read applied to LocalStack only. The real-AWS access model is
+deliberately left open.**
+
+Not the recommendation, which was to adopt public-read generally. The chosen
+position is narrower and better: development is unblocked without a
+public-bucket decision being baked into anything that ships. **This is now an
+open question that Stage 7 or any deployment work must answer**, not a settled
+default — a public bucket on real AWS is both a cost and an exposure, and it
+should be an explicit choice made with that in view rather than inherited from a
+local convenience.
+
+Presigning remains ruled out on technical grounds regardless: HLS playlists
+reference segments by relative path, so a signed master is followed by 403s on
+every segment.
 
 `init-aws.sh` sets **CORS** on `dayreel-hls-output` but **no bucket policy and no
 public-read ACL**. So the objects are not currently fetchable by an unauthenticated
@@ -295,6 +320,9 @@ setting rather than inventing a second mechanism.
 ---
 
 ### [DECIDE 5] — transcode time is real here, unlike 5A
+
+**RESOLVED as recommended:** measure first, then set the package queue's
+visibility timeout to roughly 10× the measured worst case.
 
 Transcription measured ~0.1× realtime, which made the visibility timeout a
 non-issue. **Transcoding three renditions is a different order of magnitude**, and
@@ -590,11 +618,10 @@ explicit checklist item, which it now is.
   shape available.
 - **The crash-resume branch is settled here or deleted.** Stated in Verification;
   repeated because it has now slipped three times.
-- **`Metrics` is still never written.** `TotalProcessingMs` and the per-stage
-  durations exist on the model and no code sets them. This stage is the natural
-  place for `TotalProcessingMs`, since it is the only one that knows the job is
-  finished. Not folded into the plan's tasks because it needs a timing hook in
-  shared code, but it should be an explicit yes/no rather than drifting further.
+- **`Metrics` — RESOLVED: populate in 6A.** `TotalProcessingMs` is written when
+  the job completes, and the runner records each stage's own duration. This
+  stops a set of model fields being permanently decorative, at the cost of
+  touching the shared runner alongside the `Finalizer` hook.
 
 ### Deliberately not in scope
 
