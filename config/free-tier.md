@@ -39,9 +39,16 @@ volumes, Elastic IPs left unattached. It does not apply to S3 objects or
 DynamoDB items, which bill by size and are trivial at this scale, though they
 are still worth deleting at the end.
 
-**Teardown check after every AWS run.** The architecture uses only S3 and
-DynamoDB, so every line below should come back empty — this is a check that
-nothing was created by accident, not a list of things we run:
+**One thing that bills nothing per hour and still belongs on this list: a
+public-read policy on the HLS bucket.** `scripts/aws-hls-public.sh enable` is
+opt-in and off by default, and it grants the whole internet `s3:GetObject` until
+something takes it away — legitimate use rounds to $0, a scraped bucket does not.
+It also has a second, larger cost: if account-level Block Public Access is on,
+enabling it removes that guardrail from *every* bucket in the account. Run
+`./scripts/aws-hls-public.sh disable --yes` at the end of the run, and see
+`docs/aws-public-hls.md` for the four-item teardown checklist.
+
+**Teardown check after every AWS run:**
 
 ```bash
 aws ec2 describe-instances --filters Name=instance-state-name,Values=running
