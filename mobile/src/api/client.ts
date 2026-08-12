@@ -1,89 +1,124 @@
-import axios, {AxiosInstance} from 'axios';
+import axios, {AxiosInstance, AxiosError} from 'axios';
+
 import {
-  CreateJobRequest,
-  CreateJobResponse,
   CompleteUploadRequest,
   CompleteUploadResponse,
+  CreateJobRequest,
+  CreateJobResponse,
+  ErrorResponse,
   Job,
   ReelResponse,
 } from '../types/api';
 
-const API_BASE_URL = __DEV__
-  ? 'http://localhost:8080'
-  : 'http://localhost:8080'; // TODO: production URL
+/**
+ * The backend, as seen from the Android emulator.
+ *
+ * `10.0.2.2` is the emulator's alias for the host's loopback interface;
+ * `localhost` inside the emulator is the emulated device itself. This must name
+ * the same client environment as `S3_PUBLIC_ENDPOINT` in
+ * `infra/docker-compose.yml` — the API host and the host that presigned upload
+ * URLs are signed against have to agree, or uploads fail with a signature
+ * error even though the API calls succeed. See docs/SETUP.md.
+ */
+export const API_BASE_URL = 'http://10.0.2.2:8080';
 
 const api: AxiosInstance = axios.create({
   baseURL: API_BASE_URL,
   timeout: 30000,
-  headers: {
-    'Content-Type': 'application/json',
-  },
+  headers: {'Content-Type': 'application/json'},
 });
+
+/**
+ * An error carrying the API's own `{error, code}` body when it sent one.
+ *
+ * The API distinguishes failures by `code` (`NOT_READY`, `VALIDATION_ERROR`,
+ * `NOT_FOUND`, ...) and the UI needs that distinction — `NOT_READY` on the reel
+ * endpoint is an ordinary "not finished yet", not a failure to report.
+ */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code?: string;
+
+  constructor(status: number, message: string, code?: string) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = code;
+  }
+}
+
+function wrap(err: unknown): never {
+  const axiosErr = err as AxiosError<ErrorResponse>;
+  if (axiosErr?.isAxiosError && axiosErr.response) {
+    const body = axiosErr.response.data;
+    throw new ApiError(
+      axiosErr.response.status,
+      body?.error ?? axiosErr.message,
+      body?.code,
+    );
+  }
+  // No response at all: DNS, connection refused, or the 30s timeout. On the
+  // emulator this is nearly always the backend not running, or this constant
+  // pointing at localhost instead of 10.0.2.2.
+  throw new ApiError(0, `cannot reach the API at ${API_BASE_URL}: ${err}`);
+}
 
 export async function createJob(
   request: CreateJobRequest,
 ): Promise<CreateJobResponse> {
-  const response = await api.post<CreateJobResponse>('/jobs', request);
-  return response.data;
+  try {
+    return (await api.post<CreateJobResponse>('/jobs', request)).data;
+  } catch (err) {
+    return wrap(err);
+  }
 }
 
+/**
+ * Finalize the multipart upload.
+ *
+ * This is not bookkeeping. It calls `CompleteMultipartUpload`, whose
+ * `s3:ObjectCreated:CompleteMultipartUpload` event is the only thing that
+ * starts the pipeline. Skip it and the parts sit in S3 forever and no stage
+ * ever runs.
+ */
 export async function completeUpload(
   jobId: string,
   request: CompleteUploadRequest,
 ): Promise<CompleteUploadResponse> {
-  const response = await api.post<CompleteUploadResponse>(
-    `/jobs/${jobId}/complete`,
-    request,
-  );
-  return response.data;
+  try {
+    return (
+      await api.post<CompleteUploadResponse>(`/jobs/${jobId}/complete`, request)
+    ).data;
+  } catch (err) {
+    return wrap(err);
+  }
 }
 
 export async function getJobStatus(jobId: string): Promise<Job> {
-  const response = await api.get<Job>(`/jobs/${jobId}`);
-  return response.data;
+  try {
+    return (await api.get<Job>(`/jobs/${jobId}`)).data;
+  } catch (err) {
+    return wrap(err);
+  }
 }
 
-export async function getReel(jobId: string): Promise<ReelResponse> {
-  const response = await api.get<ReelResponse>(`/jobs/${jobId}/reel`);
-  return response.data;
-}
-
-// Mock data for development before API is ready
-
-const MOCK_JOBS: Job[] = [
-  {
-    job_id: '550e8400-e29b-41d4-a716-446655440000',
-    filename: 'beach-sunset.mp4',
-    status: 'completed',
-    created_at: '2024-01-15T10:30:00Z',
-    updated_at: '2024-01-15T10:35:00Z',
-    stages: {
-      validate: {status: 'complete', retry_count: 0, completed_at: '2024-01-15T10:31:00Z'},
-      extract: {status: 'complete', retry_count: 0, completed_at: '2024-01-15T10:32:00Z'},
-      transcribe: {status: 'complete', retry_count: 0, completed_at: '2024-01-15T10:33:00Z'},
-      package: {status: 'complete', retry_count: 0, completed_at: '2024-01-15T10:34:00Z'},
-    },
-    output: {
-      hls_url: 'http://localhost:4566/dayreel-hls-output/550e8400/master.m3u8',
-      thumbnail_url: 'http://localhost:4566/dayreel-processed/550e8400/frames/frame_001.jpg',
-      duration_ms: 15000,
-    },
-  },
-  {
-    job_id: '660e8400-e29b-41d4-a716-446655440001',
-    filename: 'morning-coffee.mp4',
-    status: 'processing',
-    created_at: '2024-01-15T11:00:00Z',
-    updated_at: '2024-01-15T11:02:00Z',
-    stages: {
-      validate: {status: 'complete', retry_count: 0, completed_at: '2024-01-15T11:01:00Z'},
-      extract: {status: 'processing', retry_count: 0, started_at: '2024-01-15T11:01:05Z'},
-      transcribe: {status: 'pending', retry_count: 0},
-      package: {status: 'pending', retry_count: 0},
-    },
-  },
-];
-
-export function getMockJobs(): Job[] {
-  return MOCK_JOBS;
+/**
+ * Fetch the finished reel.
+ *
+ * Returns `null` when the job is not finished (HTTP 409 `NOT_READY`) so callers
+ * can treat "not yet" as a normal outcome. Note this endpoint reads DynamoDB
+ * directly while `getJobStatus` is served from a 10-second Redis cache, so the
+ * two can disagree briefly — a job can report `completed` here before the
+ * cached status catches up, and vice versa.
+ */
+export async function getReel(jobId: string): Promise<ReelResponse | null> {
+  try {
+    return (await api.get<ReelResponse>(`/jobs/${jobId}/reel`)).data;
+  } catch (err) {
+    const axiosErr = err as AxiosError<ErrorResponse>;
+    if (axiosErr?.isAxiosError && axiosErr.response?.status === 409) {
+      return null;
+    }
+    return wrap(err);
+  }
 }
