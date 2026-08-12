@@ -31,19 +31,23 @@ larger than 5 MiB to exercise the multipart path at all.
 
 ---
 
-## Queue (self-hosted SQLite, not SQS)
+## Queue
 
-The pipeline queue is `data/queue.db`, implemented in `backend/internal/queue/`.
-These are settings we choose rather than limits AWS imposes, but they bind the
-same way: get them wrong and the pipeline stalls or reprocesses.
+`QUEUE_DRIVER` picks the broker: `sqlite` (default, `data/queue.db`) or `sqs`.
+Both are implemented in `backend/internal/queue/`. Most of these are settings we
+choose rather than limits AWS imposes, but they bind the same way: get them wrong
+and the pipeline stalls or reprocesses.
 
-| Setting | Value | Impact on DayReel |
-|---------|-------|-------------------|
-| Message size | No hard limit | Messages carry S3 pointers, not payloads; ~300 bytes typical |
-| Visibility timeout | 5 minutes (`QUEUE_VISIBILITY_TIMEOUT`) | Must exceed the slowest stage; transcribe is the risk |
-| Max deliveries | 3 (`QUEUE_MAX_DELIVERIES`) | Then the row moves to `dayreel-dlq` |
-| Poll interval | 250ms (`QUEUE_POLL_INTERVAL`) | No long-poll in SQLite; this is the latency floor per stage |
-| Concurrent claimers | One writer at a time | SQLite serializes writes; fine at this volume |
+| Setting | SQLite | SQS | Impact on DayReel |
+|---------|--------|-----|-------------------|
+| Message size | No hard limit | 256 KiB per message | Messages carry S3 pointers, not payloads; ~300 bytes typical |
+| Visibility timeout | 5 minutes (`QUEUE_VISIBILITY_TIMEOUT`) | Same, but the **queue's own attribute** is what AWS enforces | Must exceed the slowest stage; transcribe is the risk |
+| Max deliveries | 3 (`QUEUE_MAX_DELIVERIES`) | Same, plus the redrive policy as a backstop | Then the message moves to `dayreel-dlq` |
+| Poll interval | 250ms (`QUEUE_POLL_INTERVAL`) | Not used — long poll, 20s ceiling | On SQLite this is the latency floor per stage |
+| Receive batch | Unbounded | 10 messages maximum | The runner claims one at a time either way |
+| Send delay | Unbounded | 900s maximum | The runner's backoff ceiling is 5m, well inside it |
+| Concurrent claimers | One writer at a time | Unbounded | SQLite serializes writes; fine at this volume |
+| Cost | None | Billed per request | An idle SQS worker long-polls once per 20s per stage |
 
 **At-least-once delivery:** Workers must be idempotent. Check if output S3 key
 exists before processing. This is unchanged from the SQS design — the guarantee

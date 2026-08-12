@@ -20,10 +20,12 @@ const (
 	// initialReceiveBackoff and maxReceiveBackoff bound the wait between failed
 	// receives. A failing receive returns immediately, so without a backoff a
 	// persistent error — a deleted queue file, a corrupt database, a disk that
-	// filled — turns the consume loop into a hot loop hammering SQLite as fast
-	// as the CPU allows. That used to be a billing problem with SQS and is now a
-	// contention problem: every claim takes SQLite's write lock, so a spinning
-	// worker starves the ones doing real work.
+	// filled, a queue that does not exist — turns the consume loop into a hot
+	// loop hammering the broker as fast as the CPU allows. It costs differently
+	// on each driver and is unacceptable on both: on SQLite every claim takes
+	// the write lock, so a spinning worker starves the ones doing real work; on
+	// SQS every failed receive is a billed request, which is how a broken queue
+	// name turns into a bill overnight.
 	initialReceiveBackoff = 1 * time.Second
 	maxReceiveBackoff     = 30 * time.Second
 
@@ -189,20 +191,22 @@ func (r *Runner) handle(ctx context.Context, m queue.Message) {
 
 	msg := m.Stage
 	if msg == nil {
-		// The broker decodes the payload before handing the envelope over, so
-		// this cannot happen with the SQLite driver. It is guarded anyway
+		// Both drivers decode the payload before handing the envelope over, so
+		// this cannot happen with either of them today. It is guarded anyway
 		// because Queue is an interface: a driver that returned an empty
 		// envelope would otherwise take the whole worker down on a nil deref.
-		log.Printf("worker[%s] discarding message %d with no payload", stageName, m.ID)
+		log.Printf("worker[%s] discarding message %s with no payload", stageName, m.Ident())
 		r.deadLetter(ctx, m, "message carried no stage payload")
 		return
 	}
 
 	// Redrive used to belong to the queue: SQS moved a message to the DLQ once
 	// its receive count passed the redrive policy's maxReceiveCount, and the
-	// runner never had to think about it. The SQLite broker deliberately does
-	// not do that — only the worker knows whether a failure is worth another
-	// attempt — so the budget is enforced here instead.
+	// runner never had to think about it. Neither driver is relied on for that
+	// now — only the worker knows whether a failure is worth another attempt —
+	// so the budget is enforced here instead, for both. The redrive policy the
+	// setup script writes on the real SQS queues is a safety net for messages
+	// that escape this loop entirely, not the mechanism.
 	//
 	// The check runs on pickup rather than only on failure because most of the
 	// ways this stage gives up do not go through fail() at all: a failed
@@ -336,11 +340,11 @@ func (r *Runner) heartbeat(ctx context.Context, m queue.Message) func() {
 			// of the stage will report the same thing. Logged separately because
 			// it means the heartbeat was too slow, which is a tuning problem and
 			// not a queue fault.
-			log.Printf("worker[%s] msg=%d heartbeat: lease already lost", r.stage.Name(), m.ID)
+			log.Printf("worker[%s] msg=%s heartbeat: lease already lost", r.stage.Name(), m.Ident())
 		case err != nil:
 			// Not fatal on its own: if the extension genuinely failed the worst
 			// case is a redelivery the idempotency guard handles.
-			log.Printf("worker[%s] msg=%d heartbeat: %v", r.stage.Name(), m.ID, err)
+			log.Printf("worker[%s] msg=%s heartbeat: %v", r.stage.Name(), m.Ident(), err)
 		}
 	})
 }
@@ -544,13 +548,13 @@ func (r *Runner) ack(ctx context.Context, m queue.Message, msg *events.StageMess
 	err := r.queue.Ack(ctx, m)
 	switch {
 	case errors.Is(err, queue.ErrLeaseLost):
-		log.Printf("worker[%s] job=%s msg=%d lease lost before ack: this stage ran longer "+
+		log.Printf("worker[%s] job=%s msg=%s lease lost before ack: this stage ran longer "+
 			"than the lease and another worker has claimed the message; its work is the one that counts",
-			r.stage.Name(), jobID, m.ID)
+			r.stage.Name(), jobID, m.Ident())
 	case err != nil:
 		// The work is done; a failed ack just means one redelivery, which the
 		// idempotency guard absorbs.
-		log.Printf("worker[%s] job=%s ack message %d: %v", r.stage.Name(), jobID, m.ID, err)
+		log.Printf("worker[%s] job=%s ack message %s: %v", r.stage.Name(), jobID, m.Ident(), err)
 	}
 }
 
@@ -560,12 +564,12 @@ func (r *Runner) nack(ctx context.Context, m queue.Message, backoff time.Duratio
 	err := r.queue.Nack(ctx, m, backoff)
 	switch {
 	case errors.Is(err, queue.ErrLeaseLost):
-		log.Printf("worker[%s] msg=%d lease lost before nack; another worker is already retrying it",
-			r.stage.Name(), m.ID)
+		log.Printf("worker[%s] msg=%s lease lost before nack; another worker is already retrying it",
+			r.stage.Name(), m.Ident())
 	case err != nil:
 		// Harmless in isolation: the lease expires on its own and the message
 		// comes back anyway, just later than the backoff asked for.
-		log.Printf("worker[%s] nack message %d: %v", r.stage.Name(), m.ID, err)
+		log.Printf("worker[%s] nack message %s: %v", r.stage.Name(), m.Ident(), err)
 	}
 }
 
@@ -574,11 +578,11 @@ func (r *Runner) deadLetter(ctx context.Context, m queue.Message, reason string)
 	err := r.queue.DeadLetter(ctx, m, reason)
 	switch {
 	case errors.Is(err, queue.ErrLeaseLost):
-		log.Printf("worker[%s] msg=%d lease lost before dead-letter; another worker owns it now",
-			r.stage.Name(), m.ID)
+		log.Printf("worker[%s] msg=%s lease lost before dead-letter; another worker owns it now",
+			r.stage.Name(), m.Ident())
 	case err != nil:
 		// The message stays on its own queue and will be delivered again, where
 		// the budget check rejects it on sight and tries this again.
-		log.Printf("worker[%s] dead-letter message %d: %v", r.stage.Name(), m.ID, err)
+		log.Printf("worker[%s] dead-letter message %s: %v", r.stage.Name(), m.Ident(), err)
 	}
 }

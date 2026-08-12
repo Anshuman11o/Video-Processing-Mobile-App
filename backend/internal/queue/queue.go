@@ -1,11 +1,15 @@
-// Package queue implements a durable, at-least-once message queue for the
-// DayReel pipeline, backed by a single SQLite file.
+// Package queue is DayReel's message broker, with two interchangeable drivers
+// behind one interface: a durable, at-least-once queue backed by a single
+// SQLite file (the default), and Amazon SQS.
 //
-// It replaces Amazon SQS with the subset of SQS semantics the pipeline actually
-// depends on: visibility timeouts, receipt handles, redelivery counts, delayed
-// delivery, long polling and a dead-letter queue. The vocabulary is kept
-// deliberately close to SQS so the pipeline reads the same way it did before and
-// so a future move back to a hosted broker is a driver swap, not a rewrite.
+// The SQLite driver came first and took over from SQS, implementing the subset
+// of SQS semantics the pipeline actually depends on: visibility timeouts,
+// receipt handles, redelivery counts, delayed delivery, long polling and a
+// dead-letter queue. Keeping the vocabulary that close to SQS is what made
+// bringing SQS back a driver, not a rewrite — QUEUE_DRIVER picks between them
+// and nothing above this package knows which one is running. See
+// [FromConfig] for the selection, and CONTEXT.md for where the two genuinely
+// differ.
 //
 // Two "message" types meet in this package and must not be confused:
 //
@@ -21,6 +25,7 @@ package queue
 import (
 	"context"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/anshumanagarwal/dayreel/internal/events"
@@ -36,15 +41,30 @@ import (
 // error would make it look like the queue is broken when it is behaving
 // correctly. Callers should log it and drop the work they just finished — the
 // new lease holder is now responsible for that message.
+//
+// Every driver must produce it for the same condition. SQS says the same thing
+// with a ReceiptHandleIsInvalid (or a bare InvalidParameterValue) API error, and
+// the SQS driver translates those, so the runner's handling is identical on both
+// brokers rather than "works on SQLite, mysterious API error on SQS".
 var ErrLeaseLost = errors.New("queue: lease lost, receipt no longer valid")
 
 // Message is the delivery envelope handed to a worker by Receive. It wraps the
 // producer's payload with everything the worker needs to manage its lease and to
 // emit useful metrics.
 type Message struct {
-	// ID is the SQLite rowid, the equivalent of an SQS MessageId. It is stable
-	// for the lifetime of the message, including a move to the DLQ.
+	// ID is the SQLite rowid. It is stable for the lifetime of the message,
+	// including a move to the DLQ.
+	//
+	// It is zero on any driver that does not number its messages — SQS hands
+	// out a UUID — so nothing outside this package should format it directly.
+	// Use [Message.Ident], which is the identifier whichever driver is running.
 	ID int64
+
+	// MessageID is the broker's own identifier for this message, as text: the
+	// SQLite rowid rendered as a decimal, or the SQS MessageId. Like ID it is
+	// stable across redeliveries, which is what makes it worth logging — every
+	// attempt at the same video carries the same value.
+	MessageID string
 
 	// Queue is the queue this message was claimed from.
 	Queue string
@@ -74,6 +94,20 @@ type Message struct {
 	Stage *events.StageMessage
 }
 
+// Ident names this message in a log line or an error message, using whichever
+// identifier the driver supplies.
+//
+// Callers used to format Message.ID with %d, which was correct while SQLite was
+// the only driver and prints a useless "msg=0" for every SQS delivery. Going
+// through Ident keeps the runner driver-agnostic: it never has to ask which
+// broker is underneath to write a line an operator can grep for.
+func (m Message) Ident() string {
+	if m.MessageID != "" {
+		return m.MessageID
+	}
+	return strconv.FormatInt(m.ID, 10)
+}
+
 // QueueWait reports how long the message sat on the queue before this delivery.
 func (m Message) QueueWait() time.Duration {
 	return m.ClaimedAt.Sub(m.EnqueuedAt)
@@ -101,6 +135,11 @@ type QueueStat struct {
 	// Oldest is the age of the oldest visible message, or zero when nothing is
 	// visible. It is the backlog signal worth alerting on: depth alone does not
 	// distinguish a busy queue from a stuck one.
+	//
+	// It is always zero on the SQS driver. SQS publishes the equivalent
+	// (ApproximateAgeOfOldestMessage) as a CloudWatch metric and not as a queue
+	// attribute, so there is no way to read it from a GetQueueAttributes call;
+	// see CONTEXT.md.
 	Oldest time.Duration
 }
 

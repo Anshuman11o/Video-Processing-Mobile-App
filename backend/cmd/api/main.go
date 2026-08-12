@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -47,11 +46,16 @@ func main() {
 	// Initialize the queue. Unlike S3 and DynamoDB this is not optional: with no
 	// broker the API can accept uploads it can never process, so a failure here
 	// is fatal rather than a degraded mode.
-	queueClient, err := openQueue(cfg)
+	//
+	// Which broker is a QUEUE_DRIVER decision made inside queue.FromConfig. This
+	// file deliberately does not branch on it: the API's only requirement is
+	// that something implements the interface.
+	queueLogger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	queueClient, err := queue.FromConfig(ctx, cfg, queueLogger)
 	if err != nil {
 		log.Fatalf("Failed to open queue: %v", err)
 	}
-	log.Printf("Queue ready at %s", cfg.QueueDBPath)
+	log.Printf("Queue ready (driver %s)", cfg.QueueDriver)
 
 	// Create handler and router
 	handler := api.NewHandler(s3Client, dbClient, jobCache, queueClient, cfg)
@@ -99,30 +103,4 @@ func main() {
 	}
 
 	log.Println("Server exited")
-}
-
-// openQueue creates the queue database directory and opens the broker, wrapped
-// in structured logging so every send is traceable.
-func openQueue(cfg *config.Config) (queue.Queue, error) {
-	// SQLite will not create missing parent directories, and the default path
-	// (./data/queue.db) lives in one that is gitignored and therefore absent on
-	// a fresh checkout.
-	if dir := filepath.Dir(cfg.QueueDBPath); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, err
-		}
-	}
-
-	q, err := queue.Open(queue.Options{
-		Path:              cfg.QueueDBPath,
-		VisibilityTimeout: cfg.QueueVisibilityTimeout,
-		MaxDeliveries:     cfg.QueueMaxDeliveries,
-		PollInterval:      cfg.QueuePollInterval,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	return queue.WithLogging(q, logger), nil
 }

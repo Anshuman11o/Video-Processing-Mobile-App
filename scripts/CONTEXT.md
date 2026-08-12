@@ -9,6 +9,7 @@ through an upload.
 | File | Purpose |
 |------|---------|
 | `dev-setup.sh` | One-time preflight: toolchain, AWS credentials, buckets, table, `.env`, queue directory |
+| `aws-sqs-setup.sh` | `create` / `status` / `teardown` for the five SQS queues, used only when `QUEUE_DRIVER=sqs` |
 
 ## What dev-setup.sh checks
 
@@ -41,6 +42,14 @@ It exits non-zero on any hard failure, so it is safe to chain.
 
 - **Credentials are checked before resources.** A bad key otherwise shows up as
   "bucket missing" three times over, which is a misleading diagnosis.
+
+- **`aws-sqs-setup.sh` is the exception that writes.** `dev-setup.sh` only reads;
+  the SQS script creates and deletes queues, because unlike the SQLite driver
+  those cannot create themselves on first open. It is gated three ways: it
+  refuses to run with `AWS_ENDPOINT_URL` set (there is no emulator, and a stale
+  value creates queues where the workers will never look), `teardown` prompts for
+  the region rather than taking a `--yes` flag, and `create` names every billable
+  queue it made at the end of the run as `config/free-tier.md` requires.
 
 - **Bucket CORS is described, not applied.** The script never writes to the
   account — it only reads. Bucket policy is a one-time decision on a real,

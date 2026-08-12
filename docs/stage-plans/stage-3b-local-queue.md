@@ -6,10 +6,20 @@
 
 ## Aim
 
-Replace SQS with a self-hosted SQLite queue at `data/queue.db` that keeps the
-properties the pipeline actually depends on — visibility timeout, at-least-once
-delivery, redelivery counting, lease heartbeats and dead-lettering — so the
-local stack is two Go processes and a file instead of a container fleet.
+Make a self-hosted SQLite queue at `data/queue.db` the default broker, keeping
+the properties the pipeline actually depends on — visibility timeout,
+at-least-once delivery, redelivery counting, lease heartbeats and dead-lettering
+— so the local stack is two Go processes and a file instead of a container fleet.
+
+> **Superseded in part.** This stage originally replaced SQS outright, and the
+> code shipped that way. SQS was subsequently restored as a *second driver*
+> behind the same `Queue` interface, selected by `QUEUE_DRIVER` (`sqlite` by
+> default, `sqs` opt-in), because "the workers must share a filesystem with the
+> API" is a real ceiling on a single-host queue. Nothing below changed: the
+> interface, the SQLite driver and the message contract are all as planned. What
+> changed is that SQLite is now the default rather than the only option — see
+> `backend/internal/queue/CONTEXT.md` for where the two drivers' semantics
+> differ.
 
 ## Components
 
@@ -18,7 +28,7 @@ local stack is two Go processes and a file instead of a container fleet.
 | `backend/internal/queue/` | Create |
 | `backend/internal/events/` | Reuse — `StageMessage` is the payload, unchanged |
 | `backend/cmd/api/` | Modify — enqueue the validate message on upload complete |
-| `backend/internal/worker/runner.go` | Modify — claim/ack against this instead of SQS |
+| `backend/internal/worker/runner.go` | Modify — claim/ack against the `Queue` interface, whichever driver is behind it |
 | `data/queue.db` | Runtime artifact, gitignored |
 
 ## Boundaries
@@ -95,22 +105,27 @@ var ErrLeaseLost = errors.New("queue: lease lost, receipt no longer valid")
 The vocabulary stays deliberately close to SQS — receipt handles, visibility
 timeout, receive count, long polling — so the pipeline reads the same way it did
 before, and so moving back to a hosted broker is a driver swap rather than a
-rewrite.
+rewrite. That prediction was tested: restoring SQS was `internal/queue/sqs.go`
+plus a factory, with no change to the runner, the stages or the message
+contract.
 
 ### Queue Names
 
-Unchanged from the SQS design — they are now values of the `queue` column, not
-AWS resources. `QueueValidate`, `QueueExtract`, `QueueTranscribe`,
-`QueuePackage`, `QueueDLQ` in `backend/internal/events/messages.go`.
+Unchanged from the SQS design. On the SQLite driver they are values of the
+`queue` column; on the SQS driver they are the SQS queue names that
+`scripts/aws-sqs-setup.sh` creates. `QueueValidate`, `QueueExtract`,
+`QueueTranscribe`, `QueuePackage`, `QueueDLQ` in
+`backend/internal/events/messages.go`.
 
 ### Configuration
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `QUEUE_DB_PATH` | `./data/queue.db` | SQLite file, created on first open. Its **directory must already exist** — `scripts/dev-setup.sh` creates it |
-| `QUEUE_VISIBILITY_TIMEOUT` | `5m` | How long a claim hides a message |
+| `QUEUE_DRIVER` | `sqlite` | Which broker: `sqlite` or `sqs`. Added when SQS returned as a second driver |
+| `QUEUE_DB_PATH` | `./data/queue.db` | SQLite only. The file, created on first open; its parent directory is created by `queue.FromConfig` |
+| `QUEUE_VISIBILITY_TIMEOUT` | `5m` | How long a claim hides a message. On SQS it must match the queue's own attribute |
 | `QUEUE_MAX_DELIVERIES` | `3` | Deliveries before dead-lettering |
-| `QUEUE_POLL_INTERVAL` | `250ms` | Idle re-check interval while long-polling |
+| `QUEUE_POLL_INTERVAL` | `250ms` (sqlite) / `20s` (sqs) | How long one receive waits. A local ticker on SQLite; `WaitTimeSeconds` on SQS, where 250ms would mean a billed short poll |
 
 ## Files
 

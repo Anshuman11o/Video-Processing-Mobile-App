@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	// Pure-Go SQLite driver. It registers itself as "sqlite" (not "sqlite3").
@@ -267,6 +268,7 @@ func (q *SQLiteQueue) claim(ctx context.Context, queue string, max int) ([]Messa
 		}
 
 		m.Receipt = receipt.String
+		m.MessageID = strconv.FormatInt(m.ID, 10)
 		m.EnqueuedAt = fromMillis(createdMS)
 		if claimedMS.Valid {
 			m.ClaimedAt = fromMillis(claimedMS.Int64)
