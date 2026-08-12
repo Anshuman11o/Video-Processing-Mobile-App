@@ -1,9 +1,11 @@
 # Stage 7: Upload Integration
 
-> Status: **approved — ready to implement.** All seven decisions settled
-> 2026-08-12. Two went against the recommendation and are worth reading before
-> the code: the Redis cache is deliberately left unfixed (**[DECIDE 4]**), and
-> playback is pulled into this stage from 8B (**[DECIDE 6]**).
+> Status: **approved — backend complete, mobile in progress.** Decisions 1–7
+> settled 2026-08-12; **[DECIDE 8]** added 2026-08-13 while planning 8A. One
+> went against the recommendation and is worth reading before the code: the
+> Redis cache is deliberately left unfixed (**[DECIDE 4]**). Playback stays in
+> **8B** (**[DECIDE 6]**, re-settled 2026-08-13 — see the correction note
+> there).
 
 ## Aim
 
@@ -27,7 +29,8 @@ renders.
 | Component | Action |
 |-----------|--------|
 | `backend/internal/storage/s3.go` | Modify — presign against the **public** endpoint (**[DECIDE 1]**) |
-| `backend/internal/config/config.go` | **No change** — `PublicEndpoint()` already exists (6A) |
+| `backend/internal/config/config.go` | Modify — `PublicEndpoint()` already exists (6A), but `UPLOAD_PART_SIZE` does not (**[DECIDE 8]**) |
+| `backend/internal/api/handlers.go` | Modify — `partSize` is the hardcoded `5 * 1024 * 1024` on line 21 (**[DECIDE 8]**) |
 | `infra/docker-compose.yml` | Modify — `S3_PUBLIC_ENDPOINT` on the **api** service; it is currently only on `worker-package` |
 | `backend/internal/cache/redis.go` | Modify — the 10s job cache is a floor under polling (**[DECIDE 4]**) |
 | `mobile/src/api/client.ts` | Modify — real base URL, drop the mock data |
@@ -461,14 +464,17 @@ the fix is to write them from the wire.
 
 ### [DECIDE 6] — does Stage 7 include playback?
 
-**RESOLVED: YES — basic playback IS in scope.** Stage 7 absorbs what
-`PROJECT_PLAN.md` scheduled as 8B.
+**RESOLVED: NO — playback stays in Stage 8B.**
 
-This overrides the plan's own recommendation and PROJECT_PLAN's staging. The
-practical consequences: a **second** native dependency (`react-native-video`)
-with its own iOS pod setup, on an app where CocoaPods has never run; and the
-caption defect in **[DECIDE 7]** stops being a measurement exercise and becomes
-something a user can actually see.
+> **Correction, 2026-08-13.** This decision was first recorded here as
+> "RESOLVED: YES — playback IS in scope," and that resolution was never
+> propagated: the components table, the *Deliberately not in scope* section,
+> the **[DECIDE 7]** note and the body of this very section all continued to
+> say 8B. Five passages against two. The contradiction was caught while
+> planning 8A, before any playback code existed — no `react-native-video` in
+> `package.json`, no player on `PlayerScreen`. Re-settled on that basis:
+> because nothing had been built, the cheaper and better-supported reading
+> won. Stage 7 stops at "jobs process."
 
 `PROJECT_PLAN.md` settles this itself. Stage 7, verbatim:
 
@@ -512,7 +518,9 @@ exact RN version is unverified here.
 ### [DECIDE 7] — the caption defect, and what evidence settles it
 
 **RESOLVED: measure first, then fix if the measurement says so.** With playback
-now in scope, the app itself becomes a second oracle alongside Safari.
+back in 8B, there is exactly one oracle in this stage: Safari in the iOS
+Simulator. That is enough to settle the question, and it is the whole reason
+the measurement belongs here rather than in 8B.
 
 6A shipped a known defect: **the first caption cue is dropped, and every other
 cue lands ~112 ms early**, because subtitle timings are offset against the
@@ -552,6 +560,37 @@ because Stage 7 owns the evidence. The *fix* edits
 `backend/internal/media/`, which is 6A's code. If the measurement says a fix is
 needed, it should be its own commit, and arguably its own follow-up stage (6B),
 rather than expanding an integration stage into backend media work.
+
+---
+
+### [DECIDE 8] — the uploader is barely exercised at the budgeted clip size
+
+**RESOLVED 2026-08-13: make the part size configurable, and run a small one
+locally.** Added after the stage was approved, while planning 8A.
+
+`handlers.go:21` hardcodes `partSize = 5 * 1024 * 1024`. A test clip under ten
+seconds is 1–5 MB, so **every local upload is a single part**. That is not only
+8A's problem — it is this stage's. At one part, the uploader's loop never
+iterates twice, the progress aggregation across completed parts never sums
+anything, per-part retry never re-PUTs while holding earlier ETags, and
+`POST /complete` never assembles more than one entry. The parts of
+**[DECIDE 3]** most likely to be wrong are exactly the parts one part cannot
+reach.
+
+Move it to `UPLOAD_PART_SIZE` in config, default 5 MiB, and set roughly
+**256 KiB** on the local `api` service. A 3 MB clip then produces about a dozen
+parts, and the multipart path is genuinely exercised.
+
+**The ≤10s limit in `config/free-tier.md` is a cost constraint on real AWS, not
+a local one.** LocalStack is free, so a larger local fixture is also available
+and costs nothing — but a smaller part size is preferable because it exercises
+the same code paths without a fixture to generate, store, or keep out of git.
+
+S3's own floor is 5 MiB for every part except the last, so a 256 KiB part size
+is **local-only and must not reach a real bucket** — real AWS would reject it
+with `EntityTooSmall` on complete. The default stays 5 MiB for that reason, and
+this is the second setting after `S3_PUBLIC_ENDPOINT` whose value depends on
+where the stack points. Both belong in the same paragraph of `docs/SETUP.md`.
 
 ---
 
