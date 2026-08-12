@@ -72,6 +72,11 @@ services:
       # scripts/verify-presign.sh cannot run from the host against this value.
       # Changing target means restarting this service. See docs/SETUP.md.
       - S3_PUBLIC_ENDPOINT=http://10.0.2.2:4566
+      # UPLOAD_PART_SIZE is deliberately NOT set. It defaults to S3's 5 MiB
+      # minimum, and anything smaller is clamped: LocalStack enforces that
+      # floor exactly as S3 does, so small parts upload with 200s and then
+      # fail the whole job at CompleteMultipartUpload with EntityTooSmall.
+      # To exercise the multipart path, use a test clip larger than 5 MiB.
       - USE_LOCALSTACK=true
       - S3_RAW_BUCKET=dayreel-raw-videos
       - S3_PROCESSED_BUCKET=dayreel-processed

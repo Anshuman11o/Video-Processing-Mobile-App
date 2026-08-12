@@ -1,7 +1,11 @@
 // Package config provides application configuration loaded from environment variables.
 package config
 
-import "os"
+import (
+	"log"
+	"os"
+	"strconv"
+)
 
 // Config holds all configuration values for the API server.
 type Config struct {
@@ -29,6 +33,21 @@ type Config struct {
 	// deliberate open question, not a settled default.
 	S3PublicEndpoint string
 
+	// UploadPartSize is the multipart part size, in bytes, that the API slices
+	// uploads into and presigns one URL per.
+	//
+	// It can only be raised, never lowered: S3 requires every part except the
+	// last to be at least 5 MiB, and LocalStack enforces that floor too, so a
+	// smaller value is clamped rather than honoured.
+	//
+	// This was introduced to make short test clips upload as several parts —
+	// at 5 MiB a <10s clip is a single part, and one part never iterates the
+	// upload loop, sums progress across parts, retries one part while holding
+	// another's ETag, or assembles a multi-entry complete. That did not work:
+	// see the correction in [DECIDE 8]. Exercising the multipart path needs a
+	// test file larger than 5 MiB instead.
+	UploadPartSize int64
+
 	// WhisperModelPath is where the ggml model file lives. The model is
 	// downloaded at runtime rather than baked into the image, so this path is
 	// expected to be a persistent volume mount — without one it re-downloads on
@@ -50,8 +69,42 @@ func Load() *Config {
 		UseLocalStack:     getEnv("USE_LOCALSTACK", "true") == "true",
 		MockTranscribe:    getEnv("MOCK_TRANSCRIBE", "true") == "true",
 		S3PublicEndpoint:  getEnv("S3_PUBLIC_ENDPOINT", ""),
+		UploadPartSize:    getEnvBytes("UPLOAD_PART_SIZE", DefaultUploadPartSize),
 		WhisperModelPath:  getEnv("WHISPER_MODEL_PATH", "/models/ggml-base.bin"),
 	}
+}
+
+// DefaultUploadPartSize is S3's minimum size for a non-final part. Anything
+// smaller is valid to upload but fails at CompleteMultipartUpload on real S3.
+const DefaultUploadPartSize int64 = 5 * 1024 * 1024
+
+// getEnvBytes reads a positive byte count, falling back on anything unusable.
+//
+// A malformed or non-positive value falls back rather than failing: a bad part
+// size would otherwise take the API down at boot, and the fallback is always
+// the value real S3 accepts.
+func getEnvBytes(key string, fallback int64) int64 {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n <= 0 {
+		log.Printf("config: ignoring %s=%q, using %d", key, raw, fallback)
+		return fallback
+	}
+	if n < DefaultUploadPartSize {
+		// Clamped, not merely warned about, because a smaller part size cannot
+		// work anywhere. LocalStack enforces the 5 MiB floor exactly as S3
+		// does — verified 2026-08-13, EntityTooSmall on CompleteMultipartUpload
+		// after all parts uploaded cleanly with 200s. Accepting the value would
+		// configure a system that fails only at the very last step.
+		log.Printf("config: %s=%d is below S3's %d minimum for non-final parts "+
+			"and would fail at CompleteMultipartUpload; using %d",
+			key, n, DefaultUploadPartSize, DefaultUploadPartSize)
+		return fallback
+	}
+	return n
 }
 
 func getEnv(key, fallback string) string {

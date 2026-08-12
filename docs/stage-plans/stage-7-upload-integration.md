@@ -618,8 +618,30 @@ rather than expanding an integration stage into backend media work.
 
 ### [DECIDE 8] — the uploader is barely exercised at the budgeted clip size
 
-**RESOLVED 2026-08-13: make the part size configurable, and run a small one
-locally.** Added after the stage was approved, while planning 8A.
+**RESOLVED 2026-08-13: make the part size configurable — and use a test clip
+larger than 5 MiB.** Added after the stage was approved, while planning 8A.
+
+> **Correction, 2026-08-13, after implementation.** This section originally
+> resolved to "set roughly **256 KiB** on the local `api` service". **That does
+> not work, and the reasoning below about why it is safe locally was wrong.**
+>
+> It was tried. All four parts uploaded with 200s, and the job then died at the
+> last step:
+>
+> ```
+> api error EntityTooSmall: Your proposed upload is smaller than the minimum allowed size
+> ```
+>
+> **LocalStack enforces S3's 5 MiB floor exactly as S3 does.** The claim below
+> that a small part size "works on LocalStack but real S3 will reject it" was
+> asserted from the AWS docs and never tested — the same mistake this project
+> has now made repeatedly, and the reason it keeps insisting on measurement.
+>
+> `UPLOAD_PART_SIZE` still exists and is still worth having, but it can only be
+> raised: a smaller value is **clamped** to 5 MiB with a log line, so a broken
+> part size cannot be configured at all. The way to exercise the multipart path
+> is option **(b)** below — a local test clip over 5 MiB, which costs nothing
+> because LocalStack is free.
 
 `handlers.go:21` hardcodes `partSize = 5 * 1024 * 1024`. A test clip under ten
 seconds is 1–5 MB, so **every local upload is a single part**. That is not only

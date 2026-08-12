@@ -17,10 +17,20 @@ import (
 	"github.com/anshumanagarwal/dayreel/internal/storage"
 )
 
-const (
-	partSize      = 5 * 1024 * 1024 // 5MB per part
-	presignExpiry = 1 * time.Hour
-)
+// presignExpiry bounds how long an upload URL stays usable. There is currently
+// no way to re-issue one, so an upload that outlives this must start over.
+const presignExpiry = 1 * time.Hour
+
+// partSize is the multipart part size for this request.
+//
+// Read from config rather than fixed, so a small clip can still be uploaded as
+// several parts locally — see config.UploadPartSize for why that matters.
+func (h *Handler) partSize() int64 {
+	if h.config.UploadPartSize > 0 {
+		return h.config.UploadPartSize
+	}
+	return config.DefaultUploadPartSize
+}
 
 // Handler holds dependencies for all HTTP handlers.
 type Handler struct {
@@ -111,6 +121,7 @@ func (h *Handler) CreateJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Calculate parts
+	partSize := h.partSize()
 	numParts := int(math.Ceil(float64(req.SizeBytes) / float64(partSize)))
 	if numParts == 0 {
 		numParts = 1
@@ -135,7 +146,7 @@ func (h *Handler) CreateJob(w http.ResponseWriter, r *http.Request) {
 		UploadID:   uploadID,
 		Bucket:     h.config.S3RawBucket,
 		Key:        s3Key,
-		PartSize:   int64(partSize),
+		PartSize:   partSize,
 		TotalParts: numParts,
 	}
 
@@ -151,7 +162,7 @@ func (h *Handler) CreateJob(w http.ResponseWriter, r *http.Request) {
 		JobID:      job.JobID,
 		UploadID:   uploadID,
 		UploadURLs: uploadURLs,
-		PartSize:   int64(partSize),
+		PartSize:   partSize,
 		ExpiresIn:  int(presignExpiry.Seconds()),
 	})
 }
