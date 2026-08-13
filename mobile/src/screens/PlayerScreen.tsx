@@ -1,8 +1,7 @@
-import React, {useCallback, useRef, useState} from 'react';
+import React, {useCallback, useState} from 'react';
 import {
   View,
   Text,
-  TextInput,
   StyleSheet,
   ScrollView,
   ActivityIndicator,
@@ -22,19 +21,12 @@ import Video, {
   type SelectedVideoTrack,
   type SubtitleStyle,
   type TextTrack,
-  type VideoRef,
   type VideoTrack,
 } from 'react-native-video';
 import type {NativeStackScreenProps} from '@react-navigation/native-stack';
 import type {RootStackParamList} from '../navigation/AppNavigator';
 import {useJobPolling} from '../hooks/useJobPolling';
 import {useReel} from '../player/useReel';
-import {
-  type CueBoundary,
-  cueOffsetMs,
-  measureCueBoundary,
-  videoRefProbe,
-} from '../player/captionProbe';
 import {ALL_STAGES, completedStageCount, jobErrorMessage} from '../types/api';
 
 type PlayerScreenProps = NativeStackScreenProps<RootStackParamList, 'Player'>;
@@ -93,33 +85,15 @@ const SUBTITLE_STYLE: SubtitleStyle = {
 };
 
 /**
- * How far either side of the authored cue boundary the probe brackets.
- *
- * Wide enough to contain every offset this pipeline has produced — 6A's
- * original ~112 ms, and the candidates around the X-TIMESTAMP-MAP fix — while
- * staying inside the neighbouring cues so the bracket never lands in a gap.
- */
-const PROBE_BRACKET_SECONDS = 0.15;
-
-/** The mock transcript's first cue boundary; overridable for a real one. */
-const DEFAULT_AUTHORED_BOUNDARY = '3.000';
-
-interface ProbeResult {
-  boundary: CueBoundary;
-  authoredSeconds: number;
-  offsetMs: number;
-}
-
-/**
  * Plays a finished reel, and shows enough of the player's own state to tell
  * apart the ways captions fail.
  *
  * The diagnostics block is not decoration. 6A recorded that a player showing no
  * captions is indistinguishable from a clip with none, and this project has now
- * shipped three bugs whose happy path looked green. Rendering the track list,
- * the cue text the renderer last delivered, and a measured cue boundary turns
- * "no captions" into a three-way diagnosis: no track in the playlist, a track
- * present but not selected, or a track selected that delivers no cues.
+ * shipped three bugs whose happy path looked green. Rendering the track list and
+ * the cue text the renderer last delivered turns "no captions" into a three-way
+ * diagnosis: no track in the playlist, a track present but not selected, or a
+ * track selected that delivers no cues.
  */
 export default function PlayerScreen({route}: PlayerScreenProps) {
   const {jobId} = route.params;
@@ -127,7 +101,6 @@ export default function PlayerScreen({route}: PlayerScreenProps) {
   const isCompleted = job?.status === 'completed';
   const {reel, notReady, error: reelError, refresh} = useReel(jobId, isCompleted);
 
-  const videoRef = useRef<VideoRef | null>(null);
   const [paused, setPaused] = useState(false);
   const [textTracks, setTextTracks] = useState<TextTrack[] | null>(null);
   const [videoTracks, setVideoTracks] = useState<VideoTrack[] | null>(null);
@@ -137,15 +110,6 @@ export default function PlayerScreen({route}: PlayerScreenProps) {
   const [position, setPosition] = useState(0);
   const [duration, setDuration] = useState<number | null>(null);
   const [playbackError, setPlaybackError] = useState<string | null>(null);
-
-  // Read synchronously by the probe between seeks, so it cannot go through
-  // component state — a re-render is not guaranteed to have landed by then.
-  const cueRef = useRef<string | null>(null);
-
-  const [authoredInput, setAuthoredInput] = useState(DEFAULT_AUTHORED_BOUNDARY);
-  const [probing, setProbing] = useState(false);
-  const [probeResult, setProbeResult] = useState<ProbeResult | null>(null);
-  const [probeError, setProbeError] = useState<string | null>(null);
 
   // Going back unmounts this screen and releases the player, but pushing
   // another screen on top does not. Without this, audio keeps playing over the
@@ -173,7 +137,6 @@ export default function PlayerScreen({route}: PlayerScreenProps) {
       // Named `subtitleTracks` on the wire, but it carries the active cue's
       // text — see ReactExoplayerView.onCues. It only fires for NON-empty cue
       // groups, so this value never clears on its own.
-      cueRef.current = e.subtitleTracks;
       setCurrentCue(e.subtitleTracks);
     },
     [],
@@ -192,39 +155,6 @@ export default function PlayerScreen({route}: PlayerScreenProps) {
     setPlaybackError(JSON.stringify(e.error));
   }, []);
 
-  const runProbe = useCallback(async () => {
-    const authoredSeconds = Number.parseFloat(authoredInput);
-    if (!Number.isFinite(authoredSeconds)) {
-      setProbeError(`"${authoredInput}" is not a time in seconds`);
-      return;
-    }
-    setProbing(true);
-    setProbeError(null);
-    setProbeResult(null);
-    // The measurement depends on it: a seek only settles at a definite
-    // position while the player is stopped.
-    setPaused(true);
-    try {
-      const probe = videoRefProbe(
-        seconds => videoRef.current?.seek(seconds),
-        () => cueRef.current,
-      );
-      const boundary = await measureCueBoundary(probe, {
-        lo: authoredSeconds - PROBE_BRACKET_SECONDS,
-        hi: authoredSeconds + PROBE_BRACKET_SECONDS,
-      });
-      setProbeResult({
-        boundary,
-        authoredSeconds,
-        offsetMs: cueOffsetMs(boundary, authoredSeconds),
-      });
-    } catch (err) {
-      setProbeError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setProbing(false);
-    }
-  }, [authoredInput]);
-
   const failure = job ? jobErrorMessage(job) : undefined;
 
   return (
@@ -234,7 +164,6 @@ export default function PlayerScreen({route}: PlayerScreenProps) {
           <Video
             // Re-mounting on a new URL is what makes `refresh` a real retry.
             key={reel.hls_url}
-            ref={videoRef}
             source={{uri: reel.hls_url}}
             style={styles.video}
             paused={paused}
@@ -266,11 +195,6 @@ export default function PlayerScreen({route}: PlayerScreenProps) {
       </View>
 
       <View style={styles.info}>
-        <Text style={styles.label}>Job ID</Text>
-        <Text style={styles.value} selectable>
-          {jobId}
-        </Text>
-
         <Text style={styles.label}>Status</Text>
         <Text style={styles.value}>
           {job ? job.status : 'loading…'}
@@ -293,34 +217,6 @@ export default function PlayerScreen({route}: PlayerScreenProps) {
           </>
         ) : null}
 
-        {/* Dev-only. These are addresses of internal storage, useful for
-            reaching the same stream from another player while debugging and
-            meaningless to anyone else. __DEV__ is a compile-time constant, so
-            the whole block is dropped from a release bundle. */}
-        {reel && __DEV__ ? (
-          <>
-            <Text style={styles.label}>HLS URL</Text>
-            {/* Kept selectable: it is still the fastest way to check the same
-                stream in another player when the two disagree. */}
-            <Text style={styles.url} selectable>
-              {reel.hls_url}
-            </Text>
-            {reel.thumbnail_url ? (
-              <>
-                {/* Shown as text, deliberately NOT loaded as a poster. It
-                    points into dayreel-processed, which has no public-read
-                    policy — it resolves here only because LocalStack serves
-                    unsigned GETs to any bucket, and would 403 on real S3.
-                    See [DECIDE 2]. */}
-                <Text style={styles.label}>Thumbnail (not fetched)</Text>
-                <Text style={styles.url} selectable>
-                  {reel.thumbnail_url}
-                </Text>
-              </>
-            ) : null}
-          </>
-        ) : null}
-
         {reel ? (
           <>
             <VideoTrackPicker
@@ -335,20 +231,6 @@ export default function PlayerScreen({route}: PlayerScreenProps) {
               duration={duration}
               paused={paused}
             />
-            {/* Dev-only: a measuring instrument, not a feature. It seeks the
-                player around and leaves it parked mid-clip. */}
-            {__DEV__ ? (
-              <CaptionOffsetProbe
-                authoredInput={authoredInput}
-                onAuthoredInput={setAuthoredInput}
-                probing={probing}
-                probeResult={probeResult}
-                probeError={probeError}
-                onProbe={runProbe}
-                onResume={() => setPaused(false)}
-                paused={paused}
-              />
-            ) : null}
           </>
         ) : null}
 
@@ -548,82 +430,6 @@ function CaptionDiagnostics({
   );
 }
 
-/**
- * The measured cue boundary. Development-only.
- *
- * The offset number is the reason this stage exists: 6A could not measure its
- * own caption defect because ffmpeg ignores X-TIMESTAMP-MAP, so a real player
- * is the only oracle. See src/player/captionProbe.ts for why it bisects rather
- * than watching the screen.
- */
-function CaptionOffsetProbe({
-  authoredInput,
-  onAuthoredInput,
-  probing,
-  probeResult,
-  probeError,
-  onProbe,
-  onResume,
-  paused,
-}: {
-  authoredInput: string;
-  onAuthoredInput: (v: string) => void;
-  probing: boolean;
-  probeResult: ProbeResult | null;
-  probeError: string | null;
-  onProbe: () => void;
-  onResume: () => void;
-  paused: boolean;
-}) {
-  return (
-    <>
-      <Text style={styles.label}>Caption offset probe</Text>
-      <View style={styles.probeRow}>
-        <TextInput
-          style={styles.probeInput}
-          value={authoredInput}
-          onChangeText={onAuthoredInput}
-          keyboardType="numeric"
-          placeholder="authored boundary (s)"
-          placeholderTextColor="#555555"
-        />
-        <TouchableOpacity
-          style={styles.probeButton}
-          onPress={onProbe}
-          disabled={probing}>
-          <Text style={styles.retryLabel}>{probing ? 'measuring…' : 'Measure'}</Text>
-        </TouchableOpacity>
-        {paused ? (
-          <TouchableOpacity style={styles.probeButton} onPress={onResume}>
-            <Text style={styles.retryLabel}>Resume</Text>
-          </TouchableOpacity>
-        ) : null}
-      </View>
-
-      {probeResult ? (
-        <>
-          <Text style={styles.value} selectable>
-            offset {probeResult.offsetMs >= 0 ? '+' : ''}
-            {probeResult.offsetMs.toFixed(1)} ms (
-            {probeResult.offsetMs >= 0 ? 'late' : 'early'})
-          </Text>
-          <Text style={styles.stageRow} selectable>
-            boundary {probeResult.boundary.seconds.toFixed(4)}s ±
-            {(probeResult.boundary.toleranceSeconds * 1000).toFixed(1)}ms,
-            authored {probeResult.authoredSeconds.toFixed(3)}s,{' '}
-            {probeResult.boundary.probeCount} probes
-          </Text>
-          <Text style={styles.stageRow} selectable>
-            {probeResult.boundary.before ?? 'none'} →{' '}
-            {probeResult.boundary.after ?? 'none'}
-          </Text>
-        </>
-      ) : null}
-      {probeError ? <Text style={styles.error}>{probeError}</Text> : null}
-    </>
-  );
-}
-
 const styles = StyleSheet.create({
   container: {
     flex: 1,
@@ -696,11 +502,6 @@ const styles = StyleSheet.create({
     fontFamily: 'monospace',
     marginTop: 2,
   },
-  url: {
-    color: '#6366f1',
-    fontSize: 13,
-    fontFamily: 'monospace',
-  },
   trackRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -732,29 +533,6 @@ const styles = StyleSheet.create({
     color: '#777777',
     fontSize: 12,
     fontFamily: 'monospace',
-  },
-  probeRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginTop: 4,
-  },
-  probeInput: {
-    flex: 1,
-    color: '#ffffff',
-    fontFamily: 'monospace',
-    fontSize: 14,
-    backgroundColor: '#1a1a1a',
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    marginRight: 8,
-  },
-  probeButton: {
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderRadius: 8,
-    backgroundColor: '#6366f1',
-    marginRight: 8,
   },
   error: {
     color: '#ef4444',
