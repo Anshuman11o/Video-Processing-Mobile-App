@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Anshuman11o/Video-Processing-Mobile-App/raw/main/docs/assets/dayreel-demo.mp4">▶ Watch with sound (MP4, 45s)</a>
+  <a href="https://github.com/Anshuman11o/Video-Processing-Mobile-App/raw/main/docs/assets/dayreel-demo.mp4">▶ Watch with sound (MP4, 1m11s)</a>
 </p>
 
 ---
