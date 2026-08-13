@@ -89,12 +89,19 @@ create_job() {
 # make_fixture writes an 8-second clip well over 5 MiB. The bitrate is forced
 # high on purpose: at a sane bitrate an 8-second clip is under 5 MiB and the
 # whole thing collapses to one part, which exercises nothing.
+#
+# `-f mp4` is not optional. ffmpeg picks a muxer from the output file's
+# extension, and this fixture is deliberately named .bin — to the upload path it
+# is just bytes, and nothing here ever decodes it. Without the flag ffmpeg gives
+# up with "Unable to choose an output format for clip.bin", writes nothing, and
+# the script then measures a zero-byte fixture and exits claiming the bitrate is
+# wrong. That diagnostic sends you to the one line that is not the problem.
 make_fixture() {
   ffmpeg -y -loglevel error \
     -f lavfi -i testsrc2=size=1920x1080:rate=30:duration=8 \
     -f lavfi -i sine=frequency=440:duration=8 \
     -c:v libx264 -preset ultrafast -b:v 12M -pix_fmt yuv420p \
-    -c:a aac -b:a 128k -t 8 "$work/clip.bin"
+    -c:a aac -b:a 128k -t 8 -f mp4 "$work/clip.bin"
 }
 
 # put_part uploads a local part file through a presigned URL. See the
