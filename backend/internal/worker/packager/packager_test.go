@@ -28,9 +28,7 @@ func TestOutputKeyIsTheMasterPlaylist(t *testing.T) {
 }
 
 func TestPublicURL(t *testing.T) {
-	s := &Stage{opts: Options{PublicEndpoint: "http://localhost:4566"}}
-
-	got := s.publicURL("dayreel-hls-output", "job-1/master.m3u8")
+	got := publicURL("http://localhost:4566", "dayreel-hls-output", "job-1/master.m3u8")
 	want := "http://localhost:4566/dayreel-hls-output/job-1/master.m3u8"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -40,10 +38,59 @@ func TestPublicURL(t *testing.T) {
 // A trailing slash on the configured endpoint would otherwise produce a double
 // slash, which some players reject and others silently resolve differently.
 func TestPublicURLTrimsTrailingSlash(t *testing.T) {
-	s := &Stage{opts: Options{PublicEndpoint: "http://localhost:4566/"}}
-
-	if got := s.publicURL("b", "k"); got != "http://localhost:4566/b/k" {
+	if got := publicURL("http://localhost:4566/", "b", "k"); got != "http://localhost:4566/b/k" {
 		t.Errorf("trailing slash not handled: %q", got)
+	}
+}
+
+// The bug this guards against: thumbnail_url was built against the processed
+// bucket, which has no public-read policy and no CORS, and which stage 1A puts
+// on a 7-day delete. It resolved anyway in every local run, because LocalStack
+// Community serves unsigned GETs to any bucket regardless of policy (see
+// docs/SETUP.md). That is why this is asserted here rather than end to end:
+// **the 403 is not reproducible against LocalStack**, so no integration test in
+// this project can catch a URL pointing at an unreadable bucket. Only the
+// construction can be pinned down, and this pins it down negatively — any
+// bucket other than the HLS one is a failure, not just the one that was wrong.
+func TestBuildOutputNeverNamesABucketOtherThanHLS(t *testing.T) {
+	out := buildOutput("http://10.0.2.2:4566", "dayreel-hls-output", "job-1", "job-1/master.m3u8", 6.02, true)
+
+	for name, got := range map[string]string{
+		"hls_url":       out.HLSURL,
+		"thumbnail_url": out.ThumbnailURL,
+	} {
+		if got == "" {
+			t.Fatalf("%s is empty", name)
+		}
+		if !strings.HasPrefix(got, "http://10.0.2.2:4566/dayreel-hls-output/") {
+			t.Errorf("%s = %q, which is not in dayreel-hls-output — "+
+				"a client cannot read any other bucket on real S3", name, got)
+		}
+	}
+
+	if want := "http://10.0.2.2:4566/dayreel-hls-output/job-1/thumbnail.jpg"; out.ThumbnailURL != want {
+		t.Errorf("thumbnail_url = %q, want %q", out.ThumbnailURL, want)
+	}
+}
+
+// The copy into the HLS bucket is best-effort, so the URL must be withheld when
+// it did not happen. Advertising a thumbnail that was never published is worse
+// than advertising none: the field is optional and the client already handles
+// its absence, but it has no way to tell a 404 from a job still settling.
+func TestBuildOutputOmitsThumbnailWhenItWasNotPublished(t *testing.T) {
+	out := buildOutput("http://localhost:4566", "dayreel-hls-output", "job-1", "job-1/master.m3u8", 6.02, false)
+
+	if out.ThumbnailURL != "" {
+		t.Errorf("thumbnail_url = %q, want empty when the copy did not land", out.ThumbnailURL)
+	}
+	if out.HLSURL == "" {
+		t.Error("hls_url must survive a missing thumbnail; the reel is still playable")
+	}
+}
+
+func TestThumbnailKey(t *testing.T) {
+	if got, want := thumbnailKey("job-1"), "job-1/thumbnail.jpg"; got != want {
+		t.Errorf("thumbnailKey = %q, want %q", got, want)
 	}
 }
 

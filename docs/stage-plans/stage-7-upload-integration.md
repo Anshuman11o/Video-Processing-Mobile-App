@@ -1,8 +1,24 @@
 # Stage 7: Upload Integration
 
-> Status: **draft — not approved.** Seven decisions open, listed below.
-> Written 2026-08-12, immediately after 6A landed and the pipeline first
-> produced a playable reel.
+> Status: **VERIFIED end to end on an Android emulator, 2026-08-13.** The stage's
+> observable outcome — *"Mobile uploads work, jobs process"* — is demonstrated,
+> not argued. Evidence in the Verification section below.
+>
+> Decisions 1–7 settled 2026-08-12; **[DECIDE 8]** added 2026-08-13 while
+> planning 8A. One went against the recommendation and is worth reading before
+> the code: the Redis cache is deliberately left unfixed (**[DECIDE 4]**).
+> Playback stays in **8B** (**[DECIDE 6]**, re-settled 2026-08-13 — see the
+> correction note there). **The client target is the Android Emulator**
+> (**[DECIDE 2]**, also re-settled 2026-08-13 on verified toolchain evidence —
+> see the correction note there; it was previously iOS Simulator).
+>
+> **Scope of that verification, stated so it is not read as more than it is.**
+> Everything below ran against **LocalStack**, on **one** emulator, with
+> `MOCK_TRANSCRIBE=true`. **Nothing has ever been provisioned on real AWS** — no
+> bucket, no queue, no table — so every real-AWS claim in this document remains
+> an assumption. The failure-path matrix is **not** fully worked through; the
+> unchecked boxes below are unchecked because they were not run, not because
+> they failed.
 
 ## Aim
 
@@ -26,7 +42,8 @@ renders.
 | Component | Action |
 |-----------|--------|
 | `backend/internal/storage/s3.go` | Modify — presign against the **public** endpoint (**[DECIDE 1]**) |
-| `backend/internal/config/config.go` | **No change** — `PublicEndpoint()` already exists (6A) |
+| `backend/internal/config/config.go` | Modify — `PublicEndpoint()` already exists (6A), but `UPLOAD_PART_SIZE` does not (**[DECIDE 8]**) |
+| `backend/internal/api/handlers.go` | Modify — `partSize` is the hardcoded `5 * 1024 * 1024` on line 21 (**[DECIDE 8]**) |
 | `infra/docker-compose.yml` | Modify — `S3_PUBLIC_ENDPOINT` on the **api** service; it is currently only on `worker-package` |
 | `backend/internal/cache/redis.go` | Modify — the 10s job cache is a floor under polling (**[DECIDE 4]**) |
 | `mobile/src/api/client.ts` | Modify — real base URL, drop the mock data |
@@ -37,7 +54,7 @@ renders.
 | `mobile/src/screens/HomeScreen.tsx` | Modify — the `// TODO: Stage 7` is literally in the file |
 | `mobile/src/screens/JobListScreen.tsx` | Modify — real jobs, real progress |
 | `mobile/src/screens/PlayerScreen.tsx` | Modify — show the real reel URL, **not** play it (**[DECIDE 6]**) |
-| `mobile/ios/` | Modify — pods have never been installed here; possibly ATS (**[DECIDE 2]**) |
+| `mobile/android/` | Build only — SDK/NDK now installed and the build is green (**[DECIDE 2]**; the "never installed" note there is corrected) |
 | `backend/internal/media/` | **Deliberately not touched** — the caption fix is decided here, applied later (**[DECIDE 7]**) |
 
 ## Boundaries
@@ -54,9 +71,20 @@ Read from `backend/internal/api/handlers.go` and `router.go`. Four routes, plus
 ```
 
 All three fields are required and validated: `filename == "" || size_bytes <= 0
-|| content_type == ""` is a 400. This matters — `react-native-document-picker`
-types `size` as `number | null` and `type` as `string | null`, so the client
-must supply fallbacks or it will send a request the API rejects.
+|| content_type == ""` is a 400. This matters — the picker types `size` as
+`number | null` and `type` as `string | null`, so the client must supply
+fallbacks or it will send a request the API rejects.
+
+> **Correction, 2026-08-13.** This paragraph named
+> **`react-native-document-picker`**, which is no longer the picker.
+> **It does not compile against RN 0.87** — it extends `GuardedResultAsyncTask`,
+> which RN 0.87 removed — and it is deprecated with no further versions, so the
+> Android build could not be made to succeed with it at all. Replaced by
+> `@react-native-documents/picker`. The nullable-field hazard above survives the
+> swap unchanged; a second one does not: **`copyTo` is gone**, replaced by a
+> separate `keepLocalCopy()` which **resolves on failure rather than throwing**,
+> reporting the failure in a `status` field. The `copyTo` references elsewhere in
+> this plan predate the swap.
 
 ```json
 {
@@ -111,6 +139,9 @@ is finished; Stage 7 only changes who talks to it.
 
 ### [DECIDE 1] — how a client outside Docker gets a usable presigned URL
 
+**RESOLVED: (a), sign against the public endpoint.** Chosen partly because it is
+a no-op on real AWS, so it constrains a later deploy least.
+
 **This is the stage.** Everything else is a React Native app talking to an HTTP
 API, which is ordinary work. This is not.
 
@@ -149,9 +180,9 @@ s.presignClient.PresignUploadPart(ctx, input,
 
 `WithPresignClientFromClientOptions` exists in the pinned SDK
 (`aws-sdk-go-v2/service/s3 v1.107.1`, `api_client.go:1159`) — verified, not
-assumed. The signature then covers `host: localhost:4566`, which is exactly what
-the client sends, and LocalStack sees that Host header intact through Docker's
-published port.
+assumed. The signature then covers `host: 10.0.2.2:4566` (the committed value —
+see **[DECIDE 2]**), which is exactly what the client sends, and LocalStack sees
+that Host header intact through Docker's published port.
 
 - Signature is valid by construction, because we sign what the client will send.
 - Costs one env var on the `api` service and a few lines in `s3.go`.
@@ -235,37 +266,97 @@ Two consequences to carry:
 
 ### [DECIDE 2] — which client is the target: simulator, emulator, or device
 
+**RESOLVED: Android Emulator.** Device is not committed. iOS is not committed.
+
+> **Correction, 2026-08-13.** This decision was first recorded here as
+> "RESOLVED: iOS Simulator," and the stated reason was that the simulator was
+> *"the one with a verified toolchain"* — a claim repeated in the *Deliberately
+> not in scope* section as the justification for excluding Android. **That claim
+> was false, and nothing had verified it.** Checked on this machine today:
+>
+> - Xcode 16.1 is installed, but `xcrun simctl list runtimes` returns **zero
+>   runtimes** and `xcrun simctl list devices available` returns **zero
+>   devices**. There is no simulator to run.
+> - `pod --version` reports `command not found`. CocoaPods was never installed,
+>   so the `pod install` this plan budgets for could not have run either.
+> - Android is equally bare: no `~/Library/Android/sdk`, no Android Studio, no
+>   `adb`, no `emulator` binary, `ANDROID_HOME` unset.
+>
+> **Neither toolchain was ever verified.** The original decision rested on a
+> comparison that did not exist. With both sides at zero the platform choice was
+> free, and on a free choice Android wins on a reason that is actually written
+> down: `PROJECT_PLAN.md`'s **Stage 8A specifies a Kotlin WorkManager native
+> module**, and 8B specifies ExoPlayer. Committing to iOS here would have meant
+> standing up one toolchain for Stage 7 and the other for Stage 8A.
+>
+> Caught before any client code depended on it. Re-settled on that basis.
+
 Follows directly from **[DECIDE 1]**: the signed host is fixed per API process,
 so this has to be answered, not hedged.
 
 | Target | API host | `S3_PUBLIC_ENDPOINT` | Works today? |
 |---|---|---|---|
-| iOS Simulator | `http://localhost:8080` | `http://localhost:4566` | Yes — simulator shares host loopback, and `localhost` is an unqualified hostname, which the existing ATS config permits |
-| Android Emulator | `http://10.0.2.2:8080` | `http://10.0.2.2:4566` | Yes in principle; `usesCleartextTraffic` is already templated in the manifest. Requires an Android SDK/emulator this machine has not been verified to have |
-| Physical iPhone | `http://<lan-ip>:8080` | `http://<lan-ip>:4566` | **Unknown** — gated on the ATS question in **[DECIDE 1](c)** |
+| **Android Emulator** | `http://10.0.2.2:8080` | `http://10.0.2.2:4566` | **YES — verified 2026-08-13.** Was "not yet, blocked on disk space" when written; the SDK, NDK and system image were installed the same day and a real 14.9 MB upload ran end to end. See `docs/SETUP.md` |
+| iOS Simulator | `http://localhost:8080` | `http://localhost:4566` | **No.** Zero simulator runtimes, zero devices, no CocoaPods. Would need the whole toolchain installed first |
+| Physical iPhone | `http://<lan-ip>:8080` | `http://<lan-ip>:4566` | **Unknown** — gated on the ATS question in **[DECIDE 1](c)**, and moot while iOS is uncommitted |
 
-#### Recommendation: **iOS Simulator as the committed target; physical device as a stretch verification.**
+#### Resolution: **Android Emulator as the committed target.**
 
-Chosen because it is the only row that is *known* to work with the app's
-existing configuration, because this machine has Xcode tooling available and an
-unverified Android toolchain, and because the simulator runs the same AVPlayer
-that **[DECIDE 6]**'s caption verification depends on.
+Chosen because with both toolchains at zero the cost of standing one up is the
+same either way, and Android is the one the rest of the plan already needs:
+Stage 8A is a Kotlin WorkManager module and Stage 8B is ExoPlayer. Picking iOS
+would front-load a toolchain the project abandons one stage later.
 
-The device path costs one env var and one compose restart, so it stays cheap to
-attempt — but it should be attempted **after** the simulator path is green, so a
-failure there is unambiguously a networking failure and not an upload bug.
+Java 21 is installed, which is Android's one satisfied prerequisite. Everything
+else — SDK platform 37/36, build-tools 37.0.0, NDK 27.1.12297006, an emulator
+system image — has to be installed, and **cannot be until host disk is cleared;
+there is 2.8 GB free.** That is now the first plausible place this stage stalls,
+replacing `pod install` in that role. `mobile/android/` pins Gradle 9.4.1,
+Kotlin 2.2.0, `minSdk` 24 and `newArchEnabled=true`.
 
-Flag: `mobile/ios/` has **no `Podfile.lock` and no `Pods/` directory** — CocoaPods
-has never been installed in this repo. The first `pod install` is unbudgeted time
-and the first plausible place this stage stalls.
+> **Outcome, 2026-08-13.** The install happened and the toolchain works. Disk was
+> reclaimed, the full set including the NDK was installed (8.8 GiB), and
+> `:app:assembleDebug` produced a ~147 MiB APK that runs on an AVD named
+> `dayreel-avd`. Three things this paragraph could not have known, recorded in
+> `docs/SETUP.md` in full:
+>
+> - **The SDK platform is `android-37.0`, not `android-37`.** Google moved to
+>   minor-versioned platforms and there is no plain `android-37` to install.
+> - **Node had to be upgraded.** RN 0.87 requires `^22.13.0 || ^24.3.0 || >= 26`;
+>   this machine had v20.11.0. Node 22.23.2 via nvm, pinned in `mobile/.nvmrc`.
+>   `nvm use` fails here because `~/.npmrc` sets a `prefix` —
+>   `nvm use --delete-prefix 22` is the way through.
+> - **The build did not merely stall, it failed.** `react-native-document-picker`
+>   does not compile against RN 0.87 and had to be replaced. The toolchain was
+>   not the only thing standing between this repo and a running app.
+>
+> The disk figure predicted the right *risk* and the wrong *stall*: disk was
+> never what stopped the build.
+
+Two consequences to carry:
+
+1. **`scripts/verify-presign.sh` can no longer run from the host unmodified.**
+   It exercises the presigned-URL matrix from the host, and URLs signed for
+   `10.0.2.2` are not host-routable. Documented in `docs/SETUP.md` with both
+   workarounds (flip `api` back to `localhost` for the run, or alias `10.0.2.2`
+   onto `lo0`). The script is not changed.
+2. **The caption oracle in [DECIDE 7] changes engine**, from AVFoundation to
+   ExoPlayer. See the note there — it is not a like-for-like substitution.
+
+The device path still costs one env var and one compose restart, so it stays
+cheap to attempt — but only **after** the emulator path is green, so a failure
+there is unambiguously a networking failure and not an upload bug.
 
 ---
 
 ### [DECIDE 3] — upload mechanics on the client
 
+**RESOLVED: (a), `react-native-blob-util`.** One native dependency serving both
+the part slicing and the job-index persistence in **[DECIDE 5]**.
+
 #### The constraint
 
-The API always issues a multipart upload with 5 MiB parts. Ten seconds of iPhone
+The API always issues a multipart upload with 5 MiB parts. Ten seconds of phone
 1080p is roughly 20 MB, so **the ordinary case is 4-5 parts, not one.** A design
 that only handles a single part will work against a synthetic test clip and fail
 against the first real recording — the worst possible failure ordering.
@@ -280,7 +371,7 @@ cannot do this — it has no way to send a byte range of a file on disk.
 part to a temp file; `fetch('PUT', url, RNFetchBlob.wrap(partPath))` streams it
 natively with an `uploadProgress` callback; `res.info().headers.ETag` gives the
 ETag back.
-- One new native dependency, which means a pod install and an Android rebuild.
+- One new native dependency, which means an Android rebuild through Gradle.
 - Temp slices are real files on a real device and **must be deleted in a
   `finally`**, or a few uploads fill the cache directory.
 - The same library's `fs.writeFile` also solves **[DECIDE 5]**'s persistence
@@ -316,14 +407,29 @@ byte range; base64 inflates it 33% and drags every megabyte across the bridge. A
   a 403 as "upload expired, start over" rather than as an opaque failure.
 
 Also required, and easy to miss: `HomeScreen.tsx` currently calls
-`pick({type: ['video/*']})` and uses `result.uri`. On iOS that URI is
-security-scoped and may not be readable by a native uploader. The picker
-supports `copyTo: 'cachesDirectory'`, which populates `fileCopyUri` — **use that
-path**, and check `copyError`.
+`pick({type: ['video/*']})` and uses `result.uri`. On Android that URI is a
+`content://` document reference backed by a provider, not a filesystem path, and
+a native uploader that expects a real file cannot open it. The picker supports
+`copyTo: 'cachesDirectory'`, which materialises a real file and populates
+`fileCopyUri` — **use that path**, and check `copyError`. (The same fix applies
+on iOS, where the URI is security-scoped instead.)
 
 ---
 
 ### [DECIDE 4] — how the client learns the job is done
+
+**RESOLVED: (a), poll every 2s — and deliberately DO NOT fix the cache.**
+
+Not the recommendation, and the consequence should be stated plainly rather than
+discovered: with a 10s cache TTL, no worker invalidation, and a ~4s pipeline, the
+UI will usually jump from `uploading` to `completed` having shown no intermediate
+stage at all. **The stage-progress display is therefore structurally unable to
+show progress most of the time.**
+
+That means `PROJECT_PLAN.md`'s stated verification for this stage — *"See job
+move through pipeline stages"* — cannot be satisfied as written. It is recorded
+as a known limitation rather than quietly reworded, and the cache-coherence gap
+stays open for a later stage to close.
 
 #### What the API supports today
 
@@ -383,6 +489,15 @@ pipeline that takes minutes; this one takes four seconds.
 
 ### [DECIDE 5] — the job list has no endpoint, and the types are already wrong
 
+**RESOLVED: (a), a local job index on the device**, plus regenerating the types
+from the Go structs by hand with a guard against future drift.
+
+**Carrying limitation, to be documented in the setup guide:** the job index lives
+only on the device. Reinstalling the app, clearing its data, or switching
+emulators **loses the entire job history**, even though those jobs still exist
+server-side and are still reachable by ID. This is a direct consequence of there
+being no `GET /jobs` endpoint, and it is a known trade rather than an oversight.
+
 Two problems that have to be solved together, because both are about the list
 screen.
 
@@ -430,6 +545,18 @@ the fix is to write them from the wire.
 
 ### [DECIDE 6] — does Stage 7 include playback?
 
+**RESOLVED: NO — playback stays in Stage 8B.**
+
+> **Correction, 2026-08-13.** This decision was first recorded here as
+> "RESOLVED: YES — playback IS in scope," and that resolution was never
+> propagated: the components table, the *Deliberately not in scope* section,
+> the **[DECIDE 7]** note and the body of this very section all continued to
+> say 8B. Five passages against two. The contradiction was caught while
+> planning 8A, before any playback code existed — no `react-native-video` in
+> `package.json`, no player on `PlayerScreen`. Re-settled on that basis:
+> because nothing had been built, the cheaper and better-supported reading
+> won. Stage 7 stops at "jobs process."
+
 `PROJECT_PLAN.md` settles this itself. Stage 7, verbatim:
 
 > **Deliverables:**
@@ -471,6 +598,23 @@ exact RN version is unverified here.
 
 ### [DECIDE 7] — the caption defect, and what evidence settles it
 
+**RESOLVED: measure first, then fix if the measurement says so.** With playback
+back in 8B, this stage still gets a real player in front of the output for the
+first time, and that is the whole reason the measurement belongs here rather
+than in 8B.
+
+> **Knock-on from [DECIDE 2], 2026-08-13.** This section was written around a
+> single oracle — **Safari in the iOS Simulator**, chosen because it plays HLS
+> through AVFoundation, the same engine `react-native-video` uses on iOS. With
+> the target switched to the Android emulator, **that oracle is not available**
+> (there are no simulator runtimes on this machine) and its replacement is not
+> equivalent: the emulator's browser and ExoPlayer are a different HLS
+> implementation, and **whether ExoPlayer honours `X-TIMESTAMP-MAP` the same way
+> AVFoundation does is exactly the kind of thing that differs between players.**
+> Since 8B ships ExoPlayer, measuring against ExoPlayer is now the more relevant
+> measurement — but it is a *different* measurement, not the one this section
+> originally specified. Record which player produced any number.
+
 6A shipped a known defect: **the first caption cue is dropped, and every other
 cue lands ~112 ms early**, because subtitle timings are offset against the
 MPEG-TS start PTS. `-muxdelay 0 -muxpreload 0` already cut this from ~1.4s to
@@ -484,15 +628,16 @@ player test, which is Stage 7 territory."*
 
 **Stage 7 is where a real player finally enters, so this is where the evidence
 gets collected — even though playback is out of scope.** The oracle is not the
-app. It is **Safari in the iOS Simulator**, which plays HLS through AVFoundation
-— the same engine `react-native-video` will use in 8B. It reaches
-`http://localhost:4566/...`, needs no dependency, and costs one paste.
+app. It is **Chrome in the Android emulator**, which reaches
+`http://10.0.2.2:4566/...`, needs no dependency, and costs one paste. It is not
+the same engine `react-native-video` will use in 8B, so if the numbers matter,
+re-measure once ExoPlayer is actually in the app.
 
 Options once the measurement exists:
 
-- **(a) Do nothing.** Legitimate if AVPlayer shows correct sync — that would mean
-  the defect is in ffmpeg's *reader*, not in the output, and 6A's observation was
-  an artefact of the only tool available to it.
+- **(a) Do nothing.** Legitimate if the player shows correct sync — that would
+  mean the defect is in ffmpeg's *reader*, not in the output, and 6A's
+  observation was an artefact of the only tool available to it.
 - **(b) Emit `X-TIMESTAMP-MAP`** with `MPEGTS` derived from the real start PTS.
   The spec-sanctioned mechanism, and the reason it was unverifiable is removed
   the moment a real player is in the loop.
@@ -509,6 +654,59 @@ because Stage 7 owns the evidence. The *fix* edits
 `backend/internal/media/`, which is 6A's code. If the measurement says a fix is
 needed, it should be its own commit, and arguably its own follow-up stage (6B),
 rather than expanding an integration stage into backend media work.
+
+---
+
+### [DECIDE 8] — the uploader is barely exercised at the budgeted clip size
+
+**RESOLVED 2026-08-13: make the part size configurable — and use a test clip
+larger than 5 MiB.** Added after the stage was approved, while planning 8A.
+
+> **Correction, 2026-08-13, after implementation.** This section originally
+> resolved to "set roughly **256 KiB** on the local `api` service". **That does
+> not work, and the reasoning below about why it is safe locally was wrong.**
+>
+> It was tried. All four parts uploaded with 200s, and the job then died at the
+> last step:
+>
+> ```
+> api error EntityTooSmall: Your proposed upload is smaller than the minimum allowed size
+> ```
+>
+> **LocalStack enforces S3's 5 MiB floor exactly as S3 does.** The claim below
+> that a small part size "works on LocalStack but real S3 will reject it" was
+> asserted from the AWS docs and never tested — the same mistake this project
+> has now made repeatedly, and the reason it keeps insisting on measurement.
+>
+> `UPLOAD_PART_SIZE` still exists and is still worth having, but it can only be
+> raised: a smaller value is **clamped** to 5 MiB with a log line, so a broken
+> part size cannot be configured at all. The way to exercise the multipart path
+> is option **(b)** below — a local test clip over 5 MiB, which costs nothing
+> because LocalStack is free.
+
+`handlers.go:21` hardcodes `partSize = 5 * 1024 * 1024`. A test clip under ten
+seconds is 1–5 MB, so **every local upload is a single part**. That is not only
+8A's problem — it is this stage's. At one part, the uploader's loop never
+iterates twice, the progress aggregation across completed parts never sums
+anything, per-part retry never re-PUTs while holding earlier ETags, and
+`POST /complete` never assembles more than one entry. The parts of
+**[DECIDE 3]** most likely to be wrong are exactly the parts one part cannot
+reach.
+
+Move it to `UPLOAD_PART_SIZE` in config, default 5 MiB, and set roughly
+**256 KiB** on the local `api` service. A 3 MB clip then produces about a dozen
+parts, and the multipart path is genuinely exercised.
+
+**The ≤10s limit in `config/free-tier.md` is a cost constraint on real AWS, not
+a local one.** LocalStack is free, so a larger local fixture is also available
+and costs nothing — but a smaller part size is preferable because it exercises
+the same code paths without a fixture to generate, store, or keep out of git.
+
+S3's own floor is 5 MiB for every part except the last, so a 256 KiB part size
+is **local-only and must not reach a real bucket** — real AWS would reject it
+with `EntityTooSmall` on complete. The default stays 5 MiB for that reason, and
+this is the second setting after `S3_PUBLIC_ENDPOINT` whose value depends on
+where the stack points. Both belong in the same paragraph of `docs/SETUP.md`.
 
 ---
 
@@ -532,7 +730,7 @@ rather than expanding an integration stage into backend media work.
 | `mobile/src/screens/JobListScreen.tsx` | Modify | Real jobs, upload progress, stage progress |
 | `mobile/src/screens/PlayerScreen.tsx` | Modify | Show the real `hls_url`; **no player** (**[DECIDE 6]**) |
 | `mobile/package.json` | Modify | `react-native-blob-util` |
-| `mobile/ios/Podfile.lock`, `mobile/ios/Pods/` | Create | First pod install in this repo |
+| `mobile/android/local.properties` | Create | `sdk.dir`, once an Android SDK exists on this machine |
 | `mobile/CONTEXT.md` | Modify | It currently says "no real API calls yet" |
 | `docs/stage-plans/stage-6a-package-worker.md` | Modify | Record the caption-sync measurement against its known-defect section |
 
@@ -544,8 +742,11 @@ rather than expanding an integration stage into backend media work.
        `POST /jobs`, PUT the part to the returned URL, `POST /complete`, watch
        the pipeline run. **If this does not work, nothing downstream can.**
 3. [ ] Cache TTL (**separate commit**, backend).
-4. [ ] `pod install`; add `react-native-blob-util`; get the app building on the
-       simulator. Do this **before** writing client code, not after.
+4. [x] Install the Android SDK/NDK and an emulator image (~~blocked on disk~~ —
+       **done 2026-08-13**); add `react-native-blob-util`; get the app building
+       on the emulator. Do this **before** writing client code, not after.
+       *Was not done before, and the cost showed: the picker replacement was
+       discovered by the first build, after the client code existed.*
 5. [ ] `mobile/src/types/api.ts` regenerated from `models/job.go`.
 6. [ ] `config/index.ts`, `api/client.ts` — real calls, mocks deleted.
 7. [ ] `upload/uploader.ts` + tests.
@@ -553,10 +754,10 @@ rather than expanding an integration stage into backend media work.
 9. [ ] `hooks/useJobPolling.ts`.
 10. [ ] Screens: Home (pick → upload → navigate), JobList (real + progress),
         Player (reel URL).
-11. [ ] End to end on the simulator.
+11. [ ] End to end on the emulator.
 12. [ ] Failure paths — all of them in Verification, none skipped.
-13. [ ] **Caption sync in Safari on the simulator** (**[DECIDE 7]**); record the
-        measurement in the 6A plan.
+13. [ ] **Caption sync in the emulator's browser** (**[DECIDE 7]**); record the
+        measurement in the 6A plan, naming the player that produced it.
 14. [ ] Physical device attempt (stretch).
 15. [ ] `mobile/CONTEXT.md`.
 
@@ -564,6 +765,11 @@ rather than expanding an integration stage into backend media work.
 
 ```bash
 # 0. Prove the endpoint fix from the HOST, before any app exists.
+#
+# NOTE: the committed S3_PUBLIC_ENDPOINT is http://10.0.2.2:4566, which the host
+# cannot route to. To run this proof from the host, either flip the api service
+# to http://localhost:4566 for the duration, or alias the address onto loopback
+# (`sudo ifconfig lo0 alias 10.0.2.2`). See docs/SETUP.md.
 cd infra && docker compose up -d --build api
 
 JOB_JSON=$(curl -s -X POST localhost:8080/jobs \
@@ -571,7 +777,9 @@ JOB_JSON=$(curl -s -X POST localhost:8080/jobs \
   -d '{"filename":"clip.mp4","size_bytes":1048576,"content_type":"video/mp4"}')
 
 echo "$JOB_JSON" | jq -r '.upload_urls[0].url'
-# EXPECT: http://localhost:4566/...   NOT http://localstack:4566/...
+# EXPECT: the configured public host, NOT http://localstack:4566/...
+#   committed value  -> http://10.0.2.2:4566/...
+#   host-test value  -> http://localhost:4566/...
 
 JOB=$(echo "$JOB_JSON" | jq -r .job_id)
 URL=$(echo "$JOB_JSON" | jq -r '.upload_urls[0].url')
@@ -587,53 +795,94 @@ sleep 8
 curl -s localhost:8080/jobs/$JOB | jq '{status, stages}'
 curl -s localhost:8080/jobs/$JOB/reel | jq
 
-# 1. Then, and only then, the app.
-cd ../mobile && npx react-native run-ios
+# 1. Then, and only then, the app. (Restore 10.0.2.2 on api first if you flipped it.)
+cd ../mobile && npx react-native run-android
 ```
 
 ## Verification
 
-_Nothing checked off until observed. Simulator unless stated._
+_Nothing checked off until observed. Android emulator unless stated._
+
+> **Results, 2026-08-13.** The reference run is job
+> `4bd59394-a104-453b-90d0-fdd363ad1dba` — `18.mp4`, **14,947,952 bytes**,
+> uploaded **from the app** as **3 parts** at the 5 MiB default, `completed` in
+> 36.7 s across all four stages, `hls_url` returned and played. Everything below
+> that is checked was observed on that run or on the build that produced it.
+> Everything unchecked was **not run**; none of it failed.
 
 **The blocker itself**
 
-- [ ] `POST /jobs` returns URLs whose host is `localhost:4566`, not
-      `localstack:4566`
+- [x] `POST /jobs` returns URLs whose host is the configured public endpoint
+      (`10.0.2.2:4566` as committed), not `localstack:4566` — proven by the
+      emulator upload succeeding, which is only possible if the signed host is
+      the one the client sends
 - [ ] A `curl PUT` **from the host** to that URL returns 200 with an ETag —
-      the step that has required a container since Stage 3A
-- [ ] With `S3_SKIP_SIGNATURE_VALIDATION=0` set on localstack, the same PUT still
-      returns 200 — i.e. the signature is genuinely valid, not merely unchecked
-- [ ] The API's own S3 calls (`CreateMultipartUpload`, `CompleteMultipartUpload`)
+      the step that has required a container since Stage 3A. **Requires the
+      host-routable value**, so run this with `api` temporarily on
+      `localhost:4566` or with `10.0.2.2` aliased onto `lo0`. **Not run in this
+      form.** The emulator upload is strictly stronger evidence for the same
+      claim — an out-of-Docker client PUT that lands — so this box is now a
+      convenience check, not the stage's gate
+- [x] With `S3_SKIP_SIGNATURE_VALIDATION=0` set on localstack, the same PUT still
+      returns 200 — i.e. the signature is genuinely valid, not merely unchecked.
+      The setting is committed in compose and was in force for the run
+- [x] The API's own S3 calls (`CreateMultipartUpload`, `CompleteMultipartUpload`)
       still succeed — the internal endpoint was not broken by the override
 
 **Happy path, from the app**
 
-- [ ] App builds and launches on the simulator after `pod install`
-- [ ] Picking a video yields a readable `fileCopyUri`, a non-null size, and a
-      non-null MIME type — all three, since the API 400s on any of them missing
-- [ ] `POST /jobs` succeeds from the app; the job ID appears in the local index
-- [ ] Every part PUTs and returns an ETag; **a >5 MB clip uploads as multiple
-      parts**, not one (a one-part-only bug is invisible on a small test clip)
-- [ ] Upload progress advances monotonically 0 → 100% and is not fabricated
-- [ ] `POST /complete` returns 200 and the validate queue receives the S3 event
-- [ ] The job list shows the job advancing, and reaches `completed`
-- [ ] `GET /jobs/{id}/reel` returns 200 **to the app**, and `PlayerScreen`
-      displays the real `hls_url`
-- [ ] Killing and relaunching the app still shows the job in the list
+- [x] App builds and launches on the emulator once the Android SDK/NDK exist —
+      `:app:assembleDebug`, ~147 MiB debug APK, installed and launched on
+      `dayreel-avd`, reaching the API at `10.0.2.2:8080`
+- [x] Picking a video yields a readable local path, a non-null size, and a
+      non-null MIME type — all three, since the API 400s on any of them missing.
+      The job record carries `size_bytes: 14947952` and
+      `content_type: "video/mp4"`, so all three arrived. **Note the picker is no
+      longer `react-native-document-picker`** — see the correction below
+- [x] `POST /jobs` succeeds from the app; the job ID appears in the local index
+- [x] Every part PUTs and returns an ETag; **a >5 MB clip uploads as multiple
+      parts**, not one — 14.9 MB at a 5 MiB part size gave `total_parts: 3`, and
+      `CompleteMultipartUpload` accepted them. This is the check that would have
+      been vacuous on a small synthetic clip, and it was run on a real one
+- [ ] Upload progress advances monotonically 0 → 100% and is not fabricated —
+      not systematically observed
+- [x] `POST /complete` returns 200 and the validate queue receives the S3 event —
+      `upload.completed_at` is set and `validate` started 0.1 s later
+- [x] The job list shows the job advancing, and reaches `completed`
+- [x] `GET /jobs/{id}/reel` returns 200 **to the app**, and `PlayerScreen`
+      displays the real `hls_url` — and, per 8B, plays it
+- [ ] Killing and relaunching the app still shows the job in the list — not run
 
 **Caption sync — the first real player in this project**
 
-- [ ] `master.m3u8` opens in **Safari inside the iOS Simulator** and plays
-- [ ] Captions appear at all (they may not; a player showing no captions looks
-      identical to a clip with none — check the track picker, not just the video)
-- [ ] **The cue that starts at t=0 is present**, or confirmed dropped
-- [ ] Measured offset between spoken/expected cue time and displayed cue time,
-      written down as a number, not as "seems fine"
-- [ ] Same check with `X-TIMESTAMP-MAP` present, if **[DECIDE 7]** proceeds to a
-      fix — the comparison is the entire point
-- [ ] Result recorded in `stage-6a-package-worker.md`'s known-defect section
+> **Correction, 2026-08-13.** This block was written expecting **Chrome inside
+> the Android emulator** to be the oracle, after **[DECIDE 2]**'s platform switch
+> took Safari/AVFoundation away. That is not what happened, and the substitution
+> was unnecessary: the HLS URL is unsigned and its segment references are
+> relative, so the master can be played from the **host** with the emulator out
+> of the loop entirely. 8B found this and used a headless AVFoundation probe,
+> which reports the cue presentation time as a number rather than requiring
+> someone to eyeball a browser. Both halves — measurement and fix — moved to 8B
+> (**8B [DECIDE 3]**), so these boxes were satisfied there rather than here.
 
-**Failure paths**
+- [x] `master.m3u8` plays, and the player is recorded — **AVFoundation** on the
+      host for the measurement, **ExoPlayer** in the app for playback. Not Chrome
+      in the emulator
+- [x] Captions appear at all — the track picker lists `#0 en English`, checked
+      rather than inferred from the video surface
+- [x] **The cue that starts at t=0 is present.** It was never dropped; 6A's
+      report of a missing first cue was an artefact of ffmpeg's reader
+- [x] Measured offset written down as a number — **66.667 ms early** before the
+      fix, **0.333 ms late** after, on AVFoundation, on a 30 fps source
+- [x] Same check with `X-TIMESTAMP-MAP` present — the before/after was run on
+      identical media, which is what makes the number mean anything
+- [x] Result recorded in `stage-6a-package-worker.md`'s known-defect section
+- [ ] **The same measurement on ExoPlayer.** UNKNOWN, and not interchangeable
+      with the AVFoundation figure: the fix anchors on the video start PTS, and a
+      player seeding from the container start would read ~21.3 ms early instead
+
+**Failure paths** — _none of these were run. The stage's happy path is verified;
+its failure behaviour is not, and should not be assumed from the happy path._
 
 - [ ] **Network drop mid-upload:** kill LocalStack (or disable the host network)
       between parts. Expect: the in-flight part retries 3× with backoff, then a
@@ -661,7 +910,7 @@ _Nothing checked off until observed. Simulator unless stated._
 **Cost and disk**
 
 - [ ] `docker system df` before and after; the 8 GB ceiling holds
-- [ ] Temp part slices are deleted from the simulator's cache directory after
+- [ ] Temp part slices are deleted from the emulator's cache directory after
       each upload
 - [ ] Nothing was provisioned on real AWS. If anything was, name it and tear it
       down per `config/free-tier.md`
@@ -687,12 +936,18 @@ the *client* is the slow one.
 0b. docker builder prune -f
 0c. docker compose ps                     # 6 containers healthy after 6A
 0d. curl -s localhost:8080/health         # API up
-0e. xcodebuild -version && xcrun simctl list devices available | grep iPhone
-0f. cd mobile && ls ios/Podfile.lock      # EXPECT MISSING. pod install is unbudgeted
-0g. node --version                        # package.json requires >= 22.11
-0h. ATS reality check, BEFORE costing the device path: run a trivial
-    fetch('http://<lan-ip>:8080/health') from the app and see whether iOS
-    blocks it. This is the only unknown in DECIDE 2 and it is a two-minute test
+0e. df -h /System/Volumes/Data            # STALE as written ("EXPECT ~2.8Gi").
+                                          # The SDK is installed now and the
+                                          # volume sits around 6 GiB free
+0f. echo $ANDROID_HOME && which adb emulator && java -version
+    # STALE as written ("EXPECT: unset, both missing"). The SDK now exists at
+    # ~/Library/Android/sdk; ANDROID_HOME still has to be exported per shell
+0g. node --version   # EXPECT v22.13+. package.json says >= 22.11, which is
+                     # LOOSER than RN 0.87's own ^22.13.0 — trust RN's, not ours
+0h. Cleartext reality check, BEFORE costing the device path: run a trivial
+    fetch('http://<lan-ip>:8080/health') from the app. usesCleartextTraffic is
+    templated in the manifest, but confirm it survives the release/debug config
+    actually used. Two-minute test
 0i. Confirm LocalStack's S3_SKIP_SIGNATURE_VALIDATION default. If it skips,
     every local upload result is uninformative about signature validity
 0j. Confirm DECIDE 1 is settled — phases 2 onward are meaningless without it
@@ -705,7 +960,8 @@ Phase 1: The blocker, backend only, verified by curl   <-- DO NOT SKIP AHEAD
 1.  storage/s3.go: presign with BaseEndpoint overridden via
     s3.WithPresignClientFromClientOptions
 2.  handlers.go: pass cfg.PublicEndpoint()
-3.  docker-compose.yml: S3_PUBLIC_ENDPOINT on the api service
+3.  docker-compose.yml: S3_PUBLIC_ENDPOINT on the api service (10.0.2.2; flip to
+    localhost only while running the host-side curl proof)
 4.  s3_test.go: presigned host is public; internal calls unchanged
 5.  go build ./... && go vet ./... && go test ./internal/storage/
 6.  docker compose up -d --build api
@@ -718,9 +974,10 @@ Phase 2: Cache TTL   <-- SEPARATE COMMIT
 10. COMMIT separately.
 
 Phase 3: Mobile toolchain   <-- slow, do it before writing code
-11. npm i react-native-blob-util
-12. cd ios && pod install       (first ever in this repo)
-13. npx react-native run-ios    (an unmodified app, to isolate build failures)
+11. Clear disk, then install Android SDK 37/36, build-tools 37.0.0,
+    NDK 27.1.12297006 and an emulator image; set ANDROID_HOME
+12. npm i react-native-blob-util
+13. npx react-native run-android  (an unmodified app, to isolate build failures)
 
 Phase 4: Client foundations (parallel writes)
 14a. src/config/index.ts
@@ -741,10 +998,11 @@ Phase 6: Screens (parallel writes)
 18d. src/screens/PlayerScreen.tsx
 
 Phase 7: End to end and failure paths
-19. Simulator: pick -> upload -> stages -> completed -> reel URL
+19. Emulator: pick -> upload -> stages -> completed -> reel URL
 20. EVERY failure path in Verification. The network-drop one especially:
     it is the one that will actually happen to a user
-21. Caption sync in Safari on the simulator; record the number in the 6A plan
+21. Caption sync in the emulator's browser; record the number AND the player
+    that produced it, in the 6A plan
 22. Physical device attempt (stretch, gated on 0h)
 23. CONTEXT.md; record results in this file
 ```
@@ -767,14 +1025,17 @@ The pattern that has paid off — `pkt_pts_time` in 4A, the exit-0-on-corrupt-in
 trap in 5A, the HLS ladder in 6A — is delegating **empirical research with a
 verbose, slow feedback loop**, never authoring.
 
-- **Worth an agent:** the `pod install` + first simulator build (phase 3). It is
-  slow, extremely verbose, and has a long tail of toolchain failures unrelated to
-  anything in this plan. Exactly 2B's argument for delegating `react-native init`.
-- **Worth an agent:** determining empirically whether iOS ATS permits cleartext
-  to a LAN IP under `NSAllowsLocalNetworking` (0h), and what LocalStack's
-  signature-validation default actually is (0i). Both are yes/no questions with
-  expensive answers and cheap delegation. **Require the exact commands and exact
-  output, not conclusions** — this is where a confident wrong answer costs most.
+- **Worth an agent:** the Android SDK install + first Gradle build (phase 3). It
+  is slow, extremely verbose, and has a long tail of toolchain failures unrelated
+  to anything in this plan. Exactly 2B's argument for delegating
+  `react-native init`.
+- **Worth an agent:** determining empirically whether the app's manifest config
+  actually permits cleartext to a LAN IP in the build variant used (0h), and what
+  LocalStack's signature-validation default actually is (0i). Both are yes/no
+  questions with expensive answers and cheap delegation. **Require the exact
+  commands and exact output, not conclusions** — this is where a confident wrong
+  answer costs most, and **[DECIDE 2]**'s correction note is the standing example
+  of what an unverified toolchain claim costs.
 - **Not worth an agent:** the Go change, the uploader, the screens, the types.
   These are small, and the types in particular need to be written by whoever read
   `models/job.go`.
@@ -787,11 +1048,12 @@ Give any agent an explicit file boundary and the 8 GB disk warning, as in 4A–6
 |---|---|
 | **Presigned URL still rejected after the endpoint override** | Fall back to **[DECIDE 1](b)**, the API upload proxy. It contradicts a 2A principle, so it is a last resort — but it is a *known-working* last resort |
 | **LocalStack does not validate signatures, so local success proves nothing** | Set `S3_SKIP_SIGNATURE_VALIDATION=0` for the verification run. Same trap 6A flagged for bucket policies: local 200 ≠ AWS 200 |
-| **`pod install` fails** — never run in this repo | First plausible stall. Delegate it, budget real time, and do it before any client code |
-| **RN 0.87 New Architecture vs `react-native-blob-util`** | Unverified pairing. If it breaks, fall back to **[DECIDE 3](b)** (XHR, single part) and accept a backend `part_size` change with the retry loss stated |
+| ~~**The Android SDK does not fit on disk**~~ — **CLEARED 2026-08-13.** Disk was reclaimed, the SDK/NDK/system image installed (8.8 GiB), and the build is green | The real stall was elsewhere: `react-native-document-picker` does not compile against RN 0.87, and Node had to go from v20.11 to 22.23. Neither was on this table |
+| **`scripts/verify-presign.sh` cannot run from the host** | Expected, not a bug: `10.0.2.2` is not host-routable. Flip `api` to `localhost:4566` for the run, or `sudo ifconfig lo0 alias 10.0.2.2`. Documented in `docs/SETUP.md` |
+| ~~**RN 0.87 New Architecture vs `react-native-blob-util`**~~ | **RESOLVED 2026-08-13: it works.** So does `react-native-video` v6. The fallback to **[DECIDE 3](b)** was not needed |
 | **Pipeline finishes inside the 10s cache, so no stages are ever observed** | **[DECIDE 4](i)**. Without it, `PROJECT_PLAN`'s own verification for this stage cannot be satisfied |
 | **Stage-status string mismatch** (`complete` vs `completed`) | **[DECIDE 5]**. Silent: the progress bar reads 0/4 through a perfectly successful job |
-| **iOS ATS blocks the LAN IP** | Device path only. Falls back to simulator scope, which **[DECIDE 2]** already commits to |
+| **Cleartext to the LAN IP is blocked on the device** | Device path only. Falls back to emulator scope, which **[DECIDE 2]** already commits to |
 | **`MOCK_TRANSCRIBE=true` is the default** | Captions will read `[mock transcript] segment N`. Fine for upload verification; **the caption-sync measurement should still use the mock**, since its cue at t=0 is precisely what exposes the defect |
 | **Docker 8 GB ceiling** | Only the `api` image rebuilds here, so this stage is lighter than 6A. Prune before starting anyway |
 
@@ -800,7 +1062,8 @@ Give any agent an explicit file boundary and the 8 GB disk warning, as in 4A–6
 - Phase 1 (the blocker, backend + curl proof): ~30 minutes, **high variance** —
   this is the only genuinely unknown part
 - Phase 2 (cache TTL): ~10 minutes
-- Phase 3 (pod install, first build): ~30 minutes, high variance, delegable
+- Phase 3 (Android SDK install, first build): ~30 minutes at best, **very high
+  variance and currently blocked on disk space**, delegable
 - Phase 4 (client foundations): ~20 minutes
 - Phase 5 (uploader + tests): ~35 minutes
 - Phase 6 (screens): ~30 minutes
@@ -832,9 +1095,12 @@ passing says nothing about whether the seam holds.
 
 ### Risks and inherited tensions
 
-- **Inherited from 6A: the caption defect.** ~112 ms early, first cue dropped,
-  fix unverifiable server-side. Stage 7 inherits the evidence-gathering, not
-  necessarily the fix (**[DECIDE 7]**).
+- **~~Inherited from 6A: the caption defect.~~ CLOSED in 8B, 2026-08-13.** The
+  inherited description — *"~112 ms early, first cue dropped"* — was wrong on
+  both counts. Measured: 66.667 ms, varying as `2/fps`; the first cue was never
+  dropped. `X-TIMESTAMP-MAP` is emitted and the residual is 0.333 ms on
+  AVFoundation. The evidence-gathering this stage was to inherit happened in 8B
+  instead, because the oracle turned out not to need the emulator at all.
 - **Inherited from 6A: the public-read HLS bucket is local-only, and the
   real-AWS access model is an explicit open question.** Stage 7 does not answer
   it and should not pretend to — the app displays a URL rather than fetching
@@ -864,24 +1130,40 @@ passing says nothing about whether the seam holds.
 - **Auth.** There is none, anywhere, and adding it here would be inventing a
   requirement.
 - **A `GET /jobs` list endpoint** — **[DECIDE 5]**, solved client-side instead.
-- **Android.** Not because it cannot work, but because **[DECIDE 2]** says one
-  signed host at a time and the simulator is the one with a verified toolchain.
+- **iOS.** Not because it cannot work, but because **[DECIDE 2]** says one signed
+  host at a time and the committed target is the Android emulator. The iOS
+  toolchain is absent on this machine anyway — no simulator runtimes, no
+  CocoaPods — so `mobile/ios/` is untouched by this stage.
 
 ### Uncertain, flagged rather than smoothed over
 
-- **Whether LocalStack validates presigned signatures by default.** If it does
-  not, the central verification of this stage is vacuous unless the setting is
-  forced. This is the single most important thing to establish first.
-- **Whether iOS ATS permits cleartext to an RFC1918 IP literal** under
-  `NSAllowsLocalNetworking: true`. Apple's documentation names unqualified
-  hostnames and `.local`; it does not name private-range literals. Untested here.
-- **Whether `react-native-blob-util` works under RN 0.87's New Architecture.**
-  Unverified pairing; it gates **[DECIDE 3]**.
-- **Whether AVPlayer honours `X-TIMESTAMP-MAP` the way the spec says.** It
-  should. ffmpeg demonstrably does not, which is why 6A could not find out.
-- **Real-device video sizes.** The 5 MiB part size and "4-5 parts" figure come
-  from a 1080p bitrate estimate, not from a measured file off this phone. If
-  clips are 4K the part count and upload time both change materially.
-- **Whether anything in `mobile/` still builds.** The last commit touching it is
-  `5ce5a4e` (Stage 2A/2B). It has not been run since, and RN 0.87 with React
-  19.2 is a recent stack.
+_Updated 2026-08-13. Most of this list is now answered; the answers are kept with
+the questions so the change is visible._
+
+- **RESOLVED — whether LocalStack validates presigned signatures by default.** It
+  is forced off-by-default risk rather than a default: `S3_SKIP_SIGNATURE_VALIDATION=0`
+  is committed in compose and was in force for the verified run, so the 200s mean
+  something. LocalStack still does **not** check whether a request is
+  authenticated *at all* — see `docs/SETUP.md`. That gap is untouched.
+- **RESOLVED — whether the app's cleartext config holds for `10.0.2.2`.** It
+  does, in the debug variant: the app reached `10.0.2.2:8080` and PUT parts to
+  `10.0.2.2:4566`. **The LAN-IP half is still UNKNOWN** — no physical device was
+  attempted — and so is the release variant.
+- **RESOLVED — `react-native-blob-util` under RN 0.87's New Architecture.** It
+  builds and runs with `newArchEnabled=true`. So does `react-native-video` v6,
+  which was 8B **[DECIDE 1]**'s open gate.
+- **STILL UNKNOWN — whether ExoPlayer honours `X-TIMESTAMP-MAP` the way the spec
+  says.** ExoPlayer renders the caption track, so it is not ignoring the
+  subtitle rendition, but **no offset has been measured on it.** AVFoundation's
+  figures (66.667 ms early → 0.333 ms late) are AVFoundation's alone, and may not
+  transfer: the fix anchors on the video start PTS rather than the container's.
+- **PARTLY ANSWERED — real-device video sizes.** The "4-5 parts" figure was an
+  estimate. The first real clip, 10 s at 1280x720, was **14.9 MB → 3 parts**. The
+  multipart path is genuinely exercised, which was the point; the estimate was
+  simply high. 4K clips remain unmeasured.
+- **RESOLVED, badly, then fixed — whether anything in `mobile/` still builds.**
+  It did **not**. `react-native-document-picker@9.3.1` fails to compile against
+  RN 0.87 and is deprecated with no successor version, so the first Android build
+  in the project's life failed outright and the dependency had to be replaced
+  (see the correction under `POST /jobs`). This line was the right thing to
+  flag, and the answer was worse than "probably fine".

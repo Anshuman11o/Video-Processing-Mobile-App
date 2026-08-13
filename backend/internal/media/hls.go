@@ -34,6 +34,11 @@ type EncodedRendition struct {
 
 	// Codecs is the RFC 6381 string for this rendition, e.g. "avc1.4d401f,mp4a.40.2".
 	Codecs string
+
+	// StartPTS is the first video presentation timestamp in the first segment,
+	// in 90 kHz ticks. It is never zero in practice — see
+	// SubtitleTimestampAnchor for what it is for and why it is measured.
+	StartPTS int64
 }
 
 // EncodeHLSLadder transcodes inPath into one HLS rendition per entry in
@@ -165,9 +170,10 @@ func buildVarStreamMap(renditions []Rendition) string {
 // ffprobeStream is the subset of ffprobe's JSON output used here.
 type ffprobeStream struct {
 	Streams []struct {
-		Width  int `json:"width"`
-		Height int `json:"height"`
-		Level  int `json:"level"`
+		Width    int   `json:"width"`
+		Height   int   `json:"height"`
+		Level    int   `json:"level"`
+		StartPTS int64 `json:"start_pts"`
 	} `json:"streams"`
 }
 
@@ -193,7 +199,7 @@ func measureRenditions(
 		cmd := exec.CommandContext(ctx, "ffprobe",
 			"-v", "error",
 			"-select_streams", "v:0",
-			"-show_entries", "stream=width,height,level",
+			"-show_entries", "stream=width,height,level,start_pts",
 			"-of", "json",
 			segment,
 		)
@@ -221,6 +227,7 @@ func measureRenditions(
 			ActualWidth:  s.Width,
 			ActualHeight: s.Height,
 			Codecs:       CodecsString(s.Level),
+			StartPTS:     s.StartPTS,
 		})
 	}
 

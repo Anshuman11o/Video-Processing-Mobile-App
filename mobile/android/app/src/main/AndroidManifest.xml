@@ -1,6 +1,21 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!--
+      The upload keeps running when the app does not (stage 8A [DECIDE 1]).
+
+      FOREGROUND_SERVICE_DATA_SYNC is required from API 34 for the service type
+      the upload worker asks for, and POST_NOTIFICATIONS from API 33 for its
+      notification to be visible. Note the split: without POST_NOTIFICATIONS the
+      service still runs and the bytes still go up, the user just cannot see it.
+      The permission is declared but never requested at runtime, because a
+      notification the user did not ask for is not worth blocking an upload on.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
       android:name=".MainApplication"
@@ -23,5 +38,18 @@
             <category android:name="android.intent.category.LAUNCHER" />
         </intent-filter>
       </activity>
+      <!--
+        WorkManager declares this service; the foreground type is added here.
+        Android 14+ throws MissingForegroundServiceTypeException if a worker calls
+        setForeground with a type the manifest never declared, and the failure
+        surfaces as a crash inside WorkManager rather than as anything about the
+        upload.
+      -->
+        <service
+          android:name="androidx.work.impl.foreground.SystemForegroundService"
+          android:foregroundServiceType="dataSync"
+          tools:replace="android:foregroundServiceType"
+          tools:node="merge" />
+
     </application>
 </manifest>

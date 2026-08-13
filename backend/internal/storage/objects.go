@@ -73,6 +73,39 @@ func (s *S3Client) UploadFile(ctx context.Context, bucket, key, srcPath, content
 	return nil
 }
 
+// CopyObject copies an object between buckets without the bytes leaving S3.
+//
+// Used to republish an artifact from a bucket a client cannot read into one it
+// can. Download-then-upload would do the same thing, but it needs a temp file
+// on a worker's disk in a code path that is deliberately best-effort, which
+// adds two more ways to fail for no gain.
+//
+// MetadataDirective REPLACE is required for ContentType to be honoured: the
+// default, COPY, carries the source object's metadata over and ignores the
+// ContentType given here.
+func (s *S3Client) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey, contentType string) error {
+	// CopySource is one "bucket/key" string, not two fields, and the key half
+	// must be URL-encoded while the separating slashes must not be — so no
+	// blanket url.QueryEscape over the whole thing, which would encode them.
+	// Every key this project produces is a UUID plus fixed ASCII names
+	// (events.ExtractFrameKey, Stage.OutputKey), so nothing here needs
+	// encoding; a key with a space would fail loudly with NoSuchKey rather than
+	// copy the wrong object.
+	source := srcBucket + "/" + srcKey
+
+	_, err := s.client.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:            aws.String(dstBucket),
+		Key:               aws.String(dstKey),
+		CopySource:        aws.String(source),
+		ContentType:       aws.String(contentType),
+		MetadataDirective: types.MetadataDirectiveReplace,
+	})
+	if err != nil {
+		return fmt.Errorf("copy %s/%s to %s/%s: %w", srcBucket, srcKey, dstBucket, dstKey, err)
+	}
+	return nil
+}
+
 // ObjectExists reports whether an object is present.
 //
 // A missing object is (false, nil), not an error — the distinction matters

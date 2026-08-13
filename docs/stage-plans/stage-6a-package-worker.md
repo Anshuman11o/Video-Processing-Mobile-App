@@ -79,6 +79,7 @@ First stage to write to a third bucket.
 | `dayreel-hls-output` | `{job_id}/720p/playlist.m3u8` + `segment_NNN.ts` | Rendition |
 | `dayreel-hls-output` | `{job_id}/480p/…`, `{job_id}/360p/…` | Renditions |
 | `dayreel-hls-output` | `{job_id}/subs/playlist.m3u8` + `subs_000.vtt` | Subtitle rendition (**[DECIDE 2]**) |
+| `dayreel-hls-output` | `{job_id}/thumbnail.jpg` | Poster frame, copied from `dayreel-processed` (**[DECIDE 6]**) |
 
 **The multi-artifact problem from 4A returns, larger.** A 60s clip at 6s segments
 is ~10 segments × 3 renditions, plus 4 playlists and the subtitles — on the order
@@ -101,14 +102,16 @@ the job's own completion:
   "output": {
     "hls_url": "http://…/dayreel-hls-output/{job_id}/master.m3u8",
     "duration_seconds": 6.02,
-    "thumbnail_url": "http://…/dayreel-processed/{job_id}/frames/frame_001.jpg"
+    "thumbnail_url": "http://…/dayreel-hls-output/{job_id}/thumbnail.jpg"
   }
 }
 ```
 
 `models.OutputInfo` (`job.go:67`) already defines these three fields.
 `duration_seconds` and the thumbnail both come from 4A's extract manifest, so
-this stage reads it rather than re-probing.
+this stage reads it rather than re-probing. The frame itself is republished into
+the HLS bucket first — see **[DECIDE 6]**; it was originally shipped as a URL
+into `dayreel-processed`, which is not readable by a client.
 
 ---
 
@@ -347,6 +350,80 @@ backstop rather than the primary defence.
 
 ---
 
+### [DECIDE 6] — `thumbnail_url` pointed into a bucket no client can read
+
+**RESOLVED 2026-08-13: the poster frame is copied into `dayreel-hls-output` at
+`{job_id}/thumbnail.jpg`, and `thumbnail_url` is built against that bucket.**
+
+Raised after the fact, not before: 6A shipped `thumbnail_url` as
+`{PublicEndpoint}/dayreel-processed/{job_id}/frames/frame_001.jpg` — 4A's frame
+key, resolved against the intermediates bucket. **[DECIDE 4]** settled read
+access for `dayreel-hls-output` and nobody noticed a second bucket had quietly
+been added to the client's reach.
+
+Three separate things are wrong with that URL, and only the first is about
+authorization:
+
+1. `init-aws.sh` grants public-read to `dayreel-hls-output` **only** — verified:
+   `get-bucket-policy` on `dayreel-processed` returns `NoSuchBucketPolicy`, and
+   `get-bucket-cors` returns `NoSuchCORSConfiguration`. Real S3 has Block Public
+   Access on by default, so the URL is a 403 there.
+2. Stage 1A puts `dayreel-processed` on a **7-day delete** and keeps
+   `dayreel-hls-output` indefinitely. Even granted read access, every thumbnail
+   URL would break a week after its job. (No lifecycle rule implements this yet
+   on either bucket — verified — so it is a design intent the fix respects, not
+   a live expiry.)
+3. `dayreel-processed` holds `validated.mp4`, `audio.wav`, the transcript and the
+   whole frame set. Anything that opens it up for a thumbnail opens up the
+   user's source video: an unsigned GET of `{job_id}/validated.mp4` returned
+   **200 and 14.9 MB** locally.
+
+**Why it was invisible** is the same mechanism `docs/SETUP.md` records for the
+upload path — LocalStack serves unsigned GETs to any bucket regardless of
+policy — and it is worth stating plainly that **the 403 cannot be reproduced
+here at all**. No local test, integration or otherwise, can catch this class of
+bug. What can be caught is the construction, so `buildOutput` is pure and the
+test asserts negatively: any bucket other than the HLS one fails, not just the
+one that happened to be wrong.
+
+#### Options, and why the others lose
+
+- **(a) Copy the frame into `dayreel-hls-output`. CHOSEN.** One bucket holds
+  everything a client fetches, under one access model that is already decided
+  and already has CORS. It fixes all three problems above at once, it is what
+  the superseded initial 6A plan specified for exactly reason 2, and PR #7's
+  opt-in public-read switch (`s3:GetObject` on `dayreel-hls-output/*`) covers
+  the thumbnail for free — the same UUID-secrecy argument applies unchanged,
+  since that policy deliberately withholds `s3:ListBucket`.
+- **(b) Presign the thumbnail.** Genuinely workable for one image — there are no
+  relative-path segments to follow, so the objection that kills presigning for
+  HLS does not apply. It loses anyway: the URL is minted once in `Finalize` and
+  **stored in DynamoDB**, so the expiry is baked into persisted state and
+  `/jobs/{id}/reel` starts serving a dead URL. Minting per request moves the
+  concern into 2A's handler and *still* points at an object problem 2 deletes.
+- **(c) Grant `dayreel-processed` public read.** Cheapest edit, worst outcome —
+  see problem 3. Narrowing it to `*/frames/*` avoids the source video but leaves
+  a second public bucket with its own policy to maintain, outside PR #7's
+  switch, still expiring at 7 days.
+- **(d) Drop `thumbnail_url`.** It has consumers: `models.OutputInfo`,
+  `reelResponse` in 2A's handler, `mobile/src/types/api.ts`, and `PlayerScreen`,
+  which renders it as text with a comment explaining it is deliberately *not*
+  fetched because of this very bug. Removing a field defined by 1A and produced
+  by 4A/6A, to avoid a twenty-line fix, trades a working feature for a
+  disclaimer.
+
+#### What this cost in code
+
+`Stage.Finalize` copies `frames[0]` to `{job_id}/thumbnail.jpg` before recording
+the URL, so a stored `thumbnail_url` can never name an object that was not
+written. The copy is best-effort like the manifest read it follows — a failure
+loses the thumbnail, never the finished job — which is why `buildOutput` takes
+whether the copy landed rather than assuming it did. One additive method,
+`storage.CopyObject`, was needed; `MetadataDirective: REPLACE` is load-bearing
+there, since the default silently ignores the `ContentType` passed alongside it.
+
+---
+
 ## Files
 
 | File | Action | Purpose |
@@ -423,7 +500,11 @@ _To be run against LocalStack. Nothing checked off until observed._
 - [x] **`GET /jobs/{id}/reel` returns 200**, not the 409 it returned for every
       job from Stage 2A until now
 - [x] `output.duration_seconds` matches the extract manifest (6.4)
-- [x] `output.thumbnail_url` points at a frame that exists
+- [x] ~~`output.thumbnail_url` points at a frame that exists~~ — **this check was
+      the bug.** Existence was all it asserted, and the frame did exist; nothing
+      asked whether a client could *read* it. See **[DECIDE 6]**. Now: points at
+      `{job_id}/thumbnail.jpg` in the HLS bucket, byte-identical to the source
+      frame (matching ETag) and `Content-Type: image/jpeg`.
 - [x] No message published anywhere — terminal stage
 - [x] `metrics` populated: `total_processing_ms: 3490`, `package_duration_ms: 1036`
 - [x] Rung skipping works on real input: a 640×480 source produced **only** 480p
@@ -460,23 +541,186 @@ _To be run against LocalStack. Nothing checked off until observed._
       `rungs × (ceil(duration/6) + 1) + 3`; worst case at `MaxDuration` 60s and
       3 rungs is **36 PUTs**, ~32 MB.
 
-### Known defect: the first caption is dropped
+### Known defect: caption timing — MEASURED AND FIXED in 8B, 2026-08-13
 
-Captions round-trip through the master, but **shifted about 112 ms early, and a
-cue starting at t=0 is lost entirely.** Observed: the mock's `0→3s` cue is
-absent, and its `3→6s` cue surfaces at `00:02.888`.
+**Status: fixed on AVFoundation, still open on ExoPlayer.** The offset was real,
+the dropped first cue was not, and `X-TIMESTAMP-MAP` fixes it — verified against
+a real player, which is exactly what 6A said it needed. But "a real player" turned
+out to mean *one* real player: the 8B measurement on ExoPlayer reads the same
+media **66.8 ms late**, so the header lands the cues correctly on Apple's stack
+and mirrors the original error on Android's.
 
-The cause is the MPEG-TS start PTS, which subtitle cues are offset against.
-`-muxdelay 0 -muxpreload 0` already cuts this from ~1.4s to ~0.07s — without
-those flags the whole track would sit over a second early. The residual is small
-but it reliably eats the first cue, and the mock always starts one at zero.
+#### What 6A originally recorded, kept for the record
 
-Not fixed here, deliberately. The candidate fix is emitting `X-TIMESTAMP-MAP` in
-the VTT, and **ffmpeg ignores that header entirely** — four different values
-produced byte-identical output during research — so it cannot be verified in this
-environment while real players do honour it. Shipping an unverifiable fix for a
-subtitle-sync bug risks trading a 112 ms shift for a much worse one. It needs a
-real player test, which is Stage 7 territory.
+> Captions round-trip through the master, but **shifted about 112 ms early, and a
+> cue starting at t=0 is lost entirely.** Observed: the mock's `0→3s` cue is
+> absent, and its `3→6s` cue surfaces at `00:02.888`.
+>
+> The cause is the MPEG-TS start PTS, which subtitle cues are offset against.
+> `-muxdelay 0 -muxpreload 0` already cuts this from ~1.4s to ~0.07s. Not fixed
+> here, deliberately: the candidate fix is `X-TIMESTAMP-MAP` and **ffmpeg ignores
+> that header entirely** — four different values produced byte-identical output —
+> so it could not be verified with the only tool 6A had.
+
+#### The oracle
+
+**A headless Swift program using AVFoundation** (`AVURLAsset` +
+`AVPlayerItemLegibleOutput`), Xcode 16.1 / Swift 6.0.2, loading the master over
+`http://localhost:4566`. It reports the **item-timeline position at which the
+player presents each cue**, as a number, to microsecond resolution.
+
+Deliberately **not ffmpeg**: ffmpeg is the instrument that produced 6A's reading,
+and it ignores the very header under evaluation. ffprobe was used only to
+establish ground truth about PTS values in the TS bytes, never to conclude what a
+player would display.
+
+**Limitations, stated plainly.** AVFoundation is one player. It is Safari's HLS
+engine on macOS and the iOS player's engine, so the headless probe is strictly
+more precise than the Safari check Stage 7 and 8B both planned — but everything
+in *this* section is an AVFoundation result and must not be recorded as an
+Android one. ExoPlayer was measured separately and **disagrees**; see
+"ExoPlayer, measured" below.
+
+#### The measurement — a controlled before/after on identical media
+
+Authored cue times in `subs_000.vtt` (`MOCK_TRANSCRIBE=true`, 640×480, 30fps,
+10s): `0.000`, `3.000`, `6.000`, `9.000`. Same job, same segments, the only
+difference being whether the VTT carries the header:
+
+| Authored | No `X-TIMESTAMP-MAP` (before) | `MPEGTS:6000` (after) |
+|---|---|---|
+| `0.000` | **`-0.066667`** | `+0.000333` |
+| `3.000` | `2.933333` | `3.000333` |
+| `6.000` | `5.933333` | `6.000333` |
+| `9.000` | `8.933333` | `9.000333` |
+| **offset** | **66.667 ms early** | **0.333 ms late** |
+
+**Two corrections to the original diagnosis:**
+
+1. **The first cue is NOT dropped.** It is delivered at a *negative* item time
+   and therefore displayed from the very start of playback. Verified by seeking:
+   at `t = 0.5`, `1.5` and `2.8` the player reports `segment 1` as current, and
+   only at `t = 2.95` does it advance to `segment 2`. **The dropped-first-cue
+   half of 6A's finding was an artefact of ffmpeg's reader**, which discards a
+   cue that begins before the stream does. A player does not.
+2. **The offset is not a constant, and not 112 ms.** It is exactly the TS start
+   PTS, which is the encoder's B-frame reorder delay: measured `has_b_frames=2`,
+   so `2/fps`. A 30fps source gives 6000 ticks (66.7 ms); the **same code on a
+   24fps source gives 7500 ticks (83.3 ms)** — verified by running both. Anything
+   that baked 112 ms, or any other constant, into the packager would have been
+   wrong for most sources.
+
+#### Which candidate, and why
+
+**(b) — emit `X-TIMESTAMP-MAP` with `MPEGTS` derived from the measured start
+PTS.** Implemented in `media/subtitles.go`, wired in `packager.go`.
+
+- **(a) do nothing** is refuted: the player is *not* fine. It is reliably
+  66.7 ms early, and the error grows as frame rate falls.
+- **(c) shift the cue timestamps** would work but bakes an environment-specific
+  constant into stored content, and the 24fps run shows the constant is not even
+  stable across sources on this machine.
+- **(d) force the start PTS to zero** cannot actually reach zero. The shift is
+  `max(video reorder delay, AAC priming)`; `-avoid_negative_ts make_zero` already
+  applies (min DTS is 0 — PTS is still 6000), and killing the video term needs
+  `-bf 0`, which costs compression and still leaves the 1920-tick (21.3 ms) AAC
+  priming delay. Verified from the packet timestamps: the first audio PTS is
+  exactly `startPTS − 1920` in both the 30fps and 24fps jobs.
+
+The anchor is the **video** start PTS, not the container's. That distinction was
+measured, not assumed: `MPEGTS:6000` landed every cue exactly on its authored
+time, while `MPEGTS:4080` — the container start, lower because AAC priming sits
+earlier — left them 21.3 ms early.
+
+#### ExoPlayer, measured — 8B, 2026-08-13. It does NOT agree.
+
+**`+66.8 ms late`, on two boundaries independently:**
+
+| Authored | ExoPlayer reports | Offset |
+|---|---|---|
+| `3.000` | `3.0668 s` ± 1.2 ms | **+66.8 ms** |
+| `6.000` | `6.0668 s` ± 1.2 ms | **+66.8 ms** |
+
+| Player | Anchor it behaves as if it used | Offset |
+|---|---|---|
+| AVFoundation | video start PTS (6000) | **0.333 ms late** |
+| ExoPlayer | zero | **66.8 ms late** |
+
+Two separate bisections, 9 probes each, agreeing to within the probe's
+resolution — so the error is a **constant shift**, not something specific to one
+cue. That matters: a constant is a packaging problem with a single fix, where a
+drifting error would have meant something else entirely.
+
+`6000 / 90000 = 66.667 ms` — the `MPEGTS` value in the header, to within the
+probe's resolution. ExoPlayer behaves as if it **adds** the `MPEGTS` value to
+every cue rather than treating it as the anchor that cancels the stream's own
+start PTS. (That the arithmetic matches is **VERIFIED**; that this is the
+mechanism inside `WebvttExtractor` is **inferred**, not read from ExoPlayer's
+source.)
+
+**This is materially different, and it is worse than either option [DECIDE 3]
+anticipated.** That question offered two outcomes — 0.33 ms late if ExoPlayer
+seeded from the video start, 21.3 ms early if from the container start. It did
+neither. The error is the same *magnitude* as the original defect this fix was
+written to remove (66.667 ms), with the sign flipped: **on Android the header
+moves the cues from 66.7 ms early to 66.7 ms late.** For ExoPlayer alone, the
+fix is worth approximately nothing; it trades one 66.7 ms error for another.
+
+The header is still right for AVFoundation, so this is not a regression to
+revert on the spot — it is a genuine **player-dependent anchoring** result, and
+the disagreement is itself the finding [DECIDE 3] asked for. Deciding what to
+emit for both players at once is a packager question, not a playback one, and is
+left to whoever owns 6A next. Worth noting for them: no single `MPEGTS` value
+satisfies both, since the two players differ by exactly the start PTS.
+
+**Instrument.** The in-app probe — `mobile/src/player/captionProbe.ts` driven
+from `PlayerScreen`'s dev-only "caption offset probe". With the player paused, a
+seek settles at a definite media time, so "which cue is active at T" is a
+race-free question; bisecting T locates the boundary. Not a screen recording:
+adb screencap round trips are hundreds of ms and the offsets here are tens.
+
+**Conditions.** `emulator-5554`, react-native-video v6 / ExoPlayer under RN
+0.87 New Architecture, job `4bd59394-a104-453b-90d0-fdd363ad1dba` — the same
+mock transcript (`3.000 / 6.000 / 9.000`) and the same `MPEGTS:6000` header the
+AVFoundation numbers above were taken against. Brackets `[2.85, 3.15]` and
+`[5.85, 6.15]`, 9 probes each, both converging interior to the bracket rather
+than onto an edge. Video track on **AUTO** both times.
+
+**A measurement defect was found and fixed to get this number, and it is worth
+recording because it is this project's usual shape.** The probe originally read
+the cue once after a fixed 400 ms wait. On the emulator that is too short: the
+read returns the cue from *before* the seek, the bisection accepts it as fact,
+and the first run reported a confident `-148.8 ms` whose `before → after` pair
+was `segment 4 → segment 1` — not the `segment 1 → segment 2` transition it
+claimed to have measured. A second run with a warm player then failed the
+opposite way, reporting "no cue change" for a bracket that plainly straddles
+one, while the screen showed the changed cue. The probe now polls until the cue
+actually changes and treats the fixed delay as a cap, not a delay.
+
+**Not established.** Two boundaries, not four: `0.000` cannot be bracketed from
+below, and `9.000` was not run. One device, an emulator, one source. Nothing
+here touches a physical device or real AWS. The **mechanism** remains inferred
+from arithmetic rather than read out of ExoPlayer's `WebvttExtractor`, which is
+enough to record the number and act on it but not enough to predict what a
+different `MPEGTS` value would do without measuring again.
+
+#### Residual, and what is still unknown
+
+- **VERIFIED:** a deterministic **0.33 ms** residual (30 ticks at 90 kHz),
+  reproducible across three runs of the same job, sign varying by source
+  (+0.33 ms at 30fps, −0.33 ms at 24fps). Cause **UNKNOWN**. It is 200× smaller
+  than the defect it replaced and far below any perceptual or spec threshold, so
+  it is recorded rather than chased.
+- **VERIFIED:** a cue-less `WEBVTT` carrying the new header still loads, still
+  lists **English** in the player's track picker, and plays through without error
+  or crash. **The first time any client has consumed the silent-clip path** — 6A
+  verified only that the file was valid.
+- **RESOLVED in 8B, and not in either direction this bullet predicted:**
+  ExoPlayer anchors on neither the video start nor the container start. It reads
+  these cues **66.8 ms late**, the header's own `MPEGTS` value. See "ExoPlayer,
+  measured" above. The guess recorded here — "still an improvement on 66.7 ms" —
+  was wrong: it is the same 66.7 ms, mirrored.
+- **UNKNOWN:** anything about real AWS. Unchanged by this work.
 
 ### The crash-resume branch: settled
 

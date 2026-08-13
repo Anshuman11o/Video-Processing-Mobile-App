@@ -111,6 +111,13 @@ dependencies {
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
 
+    // The mechanism behind stage 8A [DECIDE 1]: WorkManager persists the work
+    // request itself, so an upload survives this process being killed instead of
+    // dying with it. OkHttp is not declared here on purpose — react-android
+    // exposes it as an `api` dependency, and pinning a second version is how a
+    // duplicate-class failure gets manufactured out of nothing.
+    implementation("androidx.work:work-runtime-ktx:2.10.0")
+
     if (hermesEnabled.toBoolean()) {
         implementation("com.facebook.react:hermes-android")
     } else {

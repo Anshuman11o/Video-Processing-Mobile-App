@@ -6,6 +6,7 @@ import com.facebook.react.ReactApplication
 import com.facebook.react.ReactHost
 import com.facebook.react.ReactNativeApplicationEntryPoint.loadReactNative
 import com.facebook.react.defaults.DefaultReactHost.getDefaultReactHost
+import com.dayreel.upload.DayReelUploadPackage
 
 class MainApplication : Application(), ReactApplication {
 
@@ -14,8 +15,11 @@ class MainApplication : Application(), ReactApplication {
       context = applicationContext,
       packageList =
         PackageList(this).packages.apply {
-          // Packages that cannot be autolinked yet can be added manually here, for example:
-          // add(MyReactNativePackage())
+          // Added by hand because it is an app-local module, not an autolinked
+          // library. Note this list is only built when a React instance is
+          // created — the background process WorkManager starts to run an
+          // upload never gets here, which is the point.
+          add(DayReelUploadPackage())
         },
     )
   }

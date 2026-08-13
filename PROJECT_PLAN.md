@@ -369,12 +369,14 @@ ffplay http://localhost:4566/hls-output/job-123/master.m3u8
 
 **Deliverables:**
 - React Native project scaffolded
-- Video picker (react-native-image-picker)
+- ~~Video picker (react-native-image-picker)~~ — the picker is
+  `@react-native-documents/picker`. It went via `react-native-document-picker`,
+  which **does not compile against RN 0.87** and is deprecated with no successor.
 - Job list screen (mock data initially)
 - API client stub
 
 **Verification:**
-- App runs in Android emulator
+- App runs in Android emulator *(first achieved 2026-08-13, at Stage 7)*
 - Can pick video from gallery
 - Job list renders
 
@@ -401,6 +403,10 @@ ffplay http://localhost:4566/hls-output/job-123/master.m3u8
 
 **Observable outcome:** Mobile uploads work, jobs process.
 
+> **DONE, 2026-08-13.** Verified on an Android emulator: a 14.9 MB video picked
+> in the app, uploaded as 3 real multipart parts, processed to `completed`.
+> LocalStack only. See `docs/stage-plans/stage-7-upload-integration.md`.
+
 ---
 
 ### Phase 4: Polish (Parallel)
@@ -410,25 +416,42 @@ ffplay http://localhost:4566/hls-output/job-123/master.m3u8
 
 **Deliverables:**
 - Kotlin WorkManager native module
-- Chunked upload with ETag persistence
+- ~~Chunked upload with ETag persistence~~ — **superseded 2026-08-13.** 8A
+  **[DECIDE 2]** settled the opposite: resume state is **server-authoritative via
+  `ListParts`**, and the client persists identifiers only, never an ETag. A
+  client-held ETag array is wrong in the one case that matters — killed after the
+  last part but before `POST /complete` — and asking S3 what landed is right in
+  all of them.
 - Resume from last successful part
 
 **Verification:**
 - Start upload, kill app, reopen
 - Upload continues from where it left off
 
+> **NOT DONE.** The backend half is built and tested; the WorkManager module
+> compiles and ships in the APK but **JavaScript cannot resolve it**, so the app
+> silently falls back to the foreground uploader. The verification above has
+> never been run.
+
 #### Stage 8B: HLS Playback
 **Aim:** Play reels in app.
 
 **Deliverables:**
 - react-native-video with ExoPlayer
-- Play completed reels from CloudFront/LocalStack
+- Play completed reels from ~~CloudFront/~~LocalStack — **CloudFront is not
+  testable in this project.** It is LocalStack Pro-only (`config/free-tier.md`),
+  so that half of the sentence is aspirational, not a deliverable.
 
 **Verification:**
 - Completed job shows play button
 - Tap plays HLS stream with captions
 
-**FINAL:** Both 8A and 8B complete = **Full E2E demo.**
+> **DONE, 2026-08-13** — a reel plays in-app with captions rendering, on
+> LocalStack, on one emulator. The caption *offset* on ExoPlayer is still
+> unmeasured; the published figures are AVFoundation's.
+
+**FINAL:** Both 8A and 8B complete = **Full E2E demo.** *8B is complete; 8A is
+not, so this is not yet claimable.*
 
 ---
 
@@ -518,8 +541,12 @@ Append as we go. Same problem never debugged twice.
 1. **Test videos:** Do you have sample videos, or should we generate/download them?
    Ideally 3-5 clips: various codecs (H.264, HEVC), durations (10s, 60s), resolutions.
 
-2. **HLS local playback:** We'll try LocalStack S3 first. If CORS or other issues
-   block ExoPlayer, we'll flag and discuss (per your preference).
+2. **HLS local playback:** ~~We'll try LocalStack S3 first. If CORS or other
+   issues block ExoPlayer, we'll flag and discuss.~~ **ANSWERED 2026-08-13:** it
+   works. ExoPlayer plays the master from LocalStack, with the subtitle rendition
+   listed and rendering. No CORS problem arose. **This says nothing about real
+   AWS** — LocalStack serves unsigned GETs to any bucket, so the access model
+   behind it is untested (`docs/SETUP.md`).
 
 3. **Mock transcription:** Confirmed: implement both real faster-whisper and
    `MOCK_TRANSCRIBE=true` mode for fast iteration.

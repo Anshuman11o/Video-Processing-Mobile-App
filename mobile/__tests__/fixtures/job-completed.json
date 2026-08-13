@@ -1,0 +1,60 @@
+{
+    "pk": "JOB#ac530264-eec1-461f-a775-77531c7deff2",
+    "sk": "METADATA",
+    "job_id": "ac530264-eec1-461f-a775-77531c7deff2",
+    "filename": "multi.mp4",
+    "size_bytes": 14947952,
+    "content_type": "video/mp4",
+    "status": "completed",
+    "created_at": "2026-08-12T19:35:05.68642272Z",
+    "updated_at": "2026-08-12T19:35:10.998589291Z",
+    "upload": {
+        "upload_id": "1PIA8w8_L8snq5pGYI8NmNtYbt8_5e5yOn2mCaeqMXh6BR8fp3OywmMcPlJB47XWEh5TolkWutGSUU_E58uH2BsryXYN940jhaswu4FW5CQ27qM3GG6qWknvrNdMmsqc",
+        "bucket": "dayreel-raw-videos",
+        "key": "ac530264-eec1-461f-a775-77531c7deff2/multi.mp4",
+        "part_size": 5242880,
+        "total_parts": 3
+    },
+    "stages": {
+        "extract": {
+            "status": "completed",
+            "started_at": "2026-08-12T19:35:08.271671471Z",
+            "completed_at": "2026-08-12T19:35:08.808554596Z",
+            "attempts": 1,
+            "output_key": "ac530264-eec1-461f-a775-77531c7deff2/extract.json"
+        },
+        "package": {
+            "status": "completed",
+            "started_at": "2026-08-12T19:35:08.899807846Z",
+            "completed_at": "2026-08-12T19:35:10.957307375Z",
+            "attempts": 1,
+            "output_key": "ac530264-eec1-461f-a775-77531c7deff2/master.m3u8"
+        },
+        "transcribe": {
+            "status": "completed",
+            "started_at": "2026-08-12T19:35:08.824641846Z",
+            "completed_at": "2026-08-12T19:35:08.847061346Z",
+            "attempts": 1,
+            "output_key": "ac530264-eec1-461f-a775-77531c7deff2/transcript.vtt"
+        },
+        "validate": {
+            "status": "completed",
+            "started_at": "2026-08-12T19:35:07.749559429Z",
+            "completed_at": "2026-08-12T19:35:08.246763471Z",
+            "attempts": 1,
+            "output_key": "ac530264-eec1-461f-a775-77531c7deff2/validated.mp4"
+        }
+    },
+    "output": {
+        "hls_url": "http://10.0.2.2:4566/dayreel-hls-output/ac530264-eec1-461f-a775-77531c7deff2/master.m3u8",
+        "duration_seconds": 10,
+        "thumbnail_url": "http://10.0.2.2:4566/dayreel-processed/ac530264-eec1-461f-a775-77531c7deff2/frames/frame_001.jpg"
+    },
+    "metrics": {
+        "total_processing_ms": 5312,
+        "validate_duration_ms": 449,
+        "extract_duration_ms": 517,
+        "transcribe_duration_ms": 8,
+        "package_duration_ms": 1883
+    }
+}

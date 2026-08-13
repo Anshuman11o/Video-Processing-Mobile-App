@@ -1,0 +1,194 @@
+package com.dayreel.upload
+
+import android.net.Uri
+import androidx.work.BackoffPolicy
+import androidx.work.Constraints
+import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import com.facebook.react.bridge.Arguments
+import com.facebook.react.bridge.Promise
+import com.facebook.react.bridge.ReactApplicationContext
+import com.facebook.react.bridge.ReactContextBaseJavaModule
+import com.facebook.react.bridge.ReactMethod
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+
+/**
+ * The JavaScript handle on a background upload.
+ *
+ * Deliberately thin. The upload does not run here, it is not driven from here,
+ * and it does not stop when this module is torn down — the module only enqueues
+ * work and reads WorkManager's record of it. That separation is the feature:
+ * everything this module can do, the OS can also do with no JavaScript alive.
+ *
+ * It deliberately does **not** implement `TurboModule`. It has no codegen spec —
+ * app-level codegen is configured through a `codegenConfig` block in
+ * `mobile/package.json`, and that file is owned by concurrent work — and without
+ * one the New Architecture's TurboModule path cannot bind a Java module to JSI
+ * at all. `DayReelUploadPackage` explains the measurement that established this.
+ * Resolution therefore goes through the legacy interop binding, which reflects
+ * over the `@ReactMethod` annotations below. Implementing `TurboModule` here
+ * would make `ReactPackageTurboModuleManagerDelegate.getLegacyModule` reject the
+ * module and put it back in the hole it came from.
+ *
+ * The consequence for callers: argument lists are not compile-time checked
+ * against `nativeUploader.ts`. They are kept in step by reading both.
+ */
+class DayReelUploadModule(context: ReactApplicationContext) :
+    ReactContextBaseJavaModule(context) {
+
+    companion object {
+        const val NAME = "DayReelUpload"
+    }
+
+    // WorkManager's futures complete on its own executor; resolving a Promise
+    // from there is fine, but the listener must not run on the JS thread.
+    private val callbackExecutor = Executors.newSingleThreadExecutor()
+
+    override fun getName() = NAME
+
+    /**
+     * Enqueue the upload for a job that already exists server-side.
+     *
+     * The job is created in JavaScript (`POST /jobs`) and handed here by id. The
+     * worker deliberately ignores the upload URLs that call returned and asks
+     * `/upload-urls` for its own — one code path for a fresh upload and a
+     * resumed one, and no presigned URL that has been sitting in a Data blob
+     * since whenever the job was created.
+     *
+     * KEEP, not REPLACE: if this job's upload is already enqueued or running,
+     * asking again must not restart it. That makes calling this on every app
+     * launch a safe idempotent way to make sure nothing was dropped.
+     */
+    @ReactMethod
+    fun startUpload(
+        jobId: String,
+        apiBaseUrl: String,
+        filePath: String,
+        debugPartDelayMs: Double,
+        promise: Promise,
+    ) {
+        try {
+            val constraints =
+                Constraints.Builder()
+                    // The stage's own words: the upload continues "subject to
+                    // network availability". This is that clause. WorkManager
+                    // stops the worker when connectivity goes and re-runs it
+                    // when it returns, so airplane mode is a pause, not a
+                    // failure, and nothing retries against a dead radio.
+                    .setRequiredNetworkType(NetworkType.CONNECTED)
+                    .build()
+
+            val request =
+                OneTimeWorkRequestBuilder<UploadWorker>()
+                    .setInputData(
+                        uploadInputData(
+                            jobId = jobId,
+                            apiBaseUrl = apiBaseUrl,
+                            filePath = normalizePath(filePath),
+                            debugPartDelayMs = debugPartDelayMs.toLong(),
+                        )
+                    )
+                    .setConstraints(constraints)
+                    // 30s is WorkManager's floor for the first retry rounded up
+                    // a little; the per-part 1s/2s/4s inside the worker handles
+                    // the short blips, so this only fires for whole-run
+                    // failures where waiting longer is the right answer.
+                    .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+                    .addTag(UploadWorker.workName(jobId))
+                    .build()
+
+            WorkManager.getInstance(reactApplicationContext)
+                .enqueueUniqueWork(
+                    UploadWorker.workName(jobId),
+                    ExistingWorkPolicy.KEEP,
+                    request,
+                )
+
+            promise.resolve(request.id.toString())
+        } catch (e: Exception) {
+            promise.reject("ENQUEUE_FAILED", e.message, e)
+        }
+    }
+
+    /**
+     * What WorkManager currently believes about this job's upload.
+     *
+     * Polled from JS rather than pushed as events. That is not laziness: the
+     * upload's state lives in WorkManager and in S3, and a stream of events
+     * would create a third copy in JavaScript that is wrong every time the app
+     * was not running to receive one. Asking is always correct; being told is
+     * only correct while somebody is listening.
+     */
+    @ReactMethod
+    fun getUploadStatus(jobId: String, promise: Promise) {
+        val future =
+            WorkManager.getInstance(reactApplicationContext)
+                .getWorkInfosForUniqueWork(UploadWorker.workName(jobId))
+
+        future.addListener(
+            {
+                try {
+                    // The most recently enqueued run is the one that matters;
+                    // earlier entries are superseded attempts.
+                    val info: WorkInfo? = future.get().lastOrNull()
+                    promise.resolve(describe(info))
+                } catch (e: Exception) {
+                    promise.reject("STATUS_FAILED", e.message, e)
+                }
+            },
+            callbackExecutor,
+        )
+    }
+
+    /** Cancels the work. Does not abort the upload server-side — that is a separate call. */
+    @ReactMethod
+    fun cancelUpload(jobId: String, promise: Promise) {
+        try {
+            WorkManager.getInstance(reactApplicationContext)
+                .cancelUniqueWork(UploadWorker.workName(jobId))
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("CANCEL_FAILED", e.message, e)
+        }
+    }
+
+    private fun describe(info: WorkInfo?): com.facebook.react.bridge.WritableMap {
+        val map = Arguments.createMap()
+        if (info == null) {
+            // No record at all. Distinct from "failed": it means this device has
+            // never been asked to upload this job, which after a reinstall is
+            // the normal state and not an error to report.
+            map.putString("state", "NONE")
+            return map
+        }
+
+        map.putString("state", info.state.name)
+        map.putBoolean("finished", info.state.isFinished)
+
+        // Progress is only populated while a run is in flight; the output data
+        // is what survives it. Reading both means a caller that polls slowly
+        // still sees the final numbers.
+        val source = if (info.progress.keyValueMap.isEmpty()) info.outputData else info.progress
+        map.putInt("uploadedParts", source.getInt(UploadWorker.KEY_PROGRESS_UPLOADED, 0))
+        map.putInt("totalParts", source.getInt(UploadWorker.KEY_PROGRESS_TOTAL, 0))
+        map.putDouble("fraction", source.getDouble(UploadWorker.KEY_PROGRESS_FRACTION, 0.0))
+        map.putInt("runAttemptCount", info.runAttemptCount)
+
+        info.outputData.getString(UploadWorker.KEY_FAILURE_REASON)?.let {
+            map.putString("failureReason", it)
+        }
+        return map
+    }
+
+    /** The picker hands JavaScript a `file://` URI; RandomAccessFile wants a path. */
+    private fun normalizePath(filePath: String): String =
+        if (filePath.startsWith("file://")) {
+            Uri.parse(filePath).path ?: filePath.removePrefix("file://")
+        } else {
+            filePath
+        }
+}
