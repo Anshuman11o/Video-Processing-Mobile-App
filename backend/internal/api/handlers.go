@@ -11,12 +11,15 @@ import (
 	"sort"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 
 	"github.com/anshumanagarwal/dayreel/internal/cache"
 	"github.com/anshumanagarwal/dayreel/internal/config"
 	"github.com/anshumanagarwal/dayreel/internal/db"
+	"github.com/anshumanagarwal/dayreel/internal/events"
 	"github.com/anshumanagarwal/dayreel/internal/models"
+	"github.com/anshumanagarwal/dayreel/internal/queue"
 	"github.com/anshumanagarwal/dayreel/internal/storage"
 )
 
@@ -43,16 +46,21 @@ func (h *Handler) partSize() int64 {
 type Handler struct {
 	s3     *storage.S3Client
 	db     *db.DynamoDBClient
-	cache  *cache.RedisClient
+	cache  *cache.Cache
+	queue  queue.Queue
 	config *config.Config
 }
 
 // NewHandler creates a new Handler with the given dependencies.
-func NewHandler(s3 *storage.S3Client, db *db.DynamoDBClient, cache *cache.RedisClient, cfg *config.Config) *Handler {
+func NewHandler(
+	s3 *storage.S3Client, db *db.DynamoDBClient,
+	jobCache *cache.Cache, q queue.Queue, cfg *config.Config,
+) *Handler {
 	return &Handler{
 		s3:     s3,
 		db:     db,
-		cache:  cache,
+		cache:  jobCache,
+		queue:  q,
 		config: cfg,
 	}
 }
@@ -266,12 +274,19 @@ func (h *Handler) ResumeUpload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// CompleteUpload handles POST /jobs/{id}/complete — completes the multipart upload.
+// CompleteUpload handles POST /jobs/{id}/complete — completes the multipart
+// upload and hands the job to the pipeline.
 //
-// The parts array is now optional. When it is absent or empty the list is
-// derived from ListParts, which gets ascending order and matching ETags for
-// free and removes the last reason for a client to persist an ETag at all.
-// A supplied array still works: stage 7's uploader sends one.
+// The parts array is optional. When it is absent or empty the list is derived
+// from ListParts, which gets ascending order and matching ETags for free and
+// removes the last reason for a client to persist an ETag at all. A supplied
+// array still works: stage 7's uploader sends one.
+//
+// This is now the only thing that starts processing. An S3 ObjectCreated
+// notification used to trigger the validate queue, but real S3 cannot notify a
+// SQLite file, so a job that is not enqueued here is a video that silently never
+// gets processed — which is why a failed enqueue is a 500 the client retries and
+// not a logged warning.
 func (h *Handler) CompleteUpload(w http.ResponseWriter, r *http.Request) {
 	jobID := mux.Vars(r)["id"]
 
@@ -282,11 +297,24 @@ func (h *Handler) CompleteUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	job, ok := h.loadResumableJob(w, r, jobID)
+	job, ok := h.loadJobWithUpload(w, r, jobID)
 	if !ok {
 		return
 	}
 	upload := job.Upload
+
+	// A retry whose only failure was the enqueue must reach the enqueue again,
+	// so "already complete" is a resumption point here rather than the 409 the
+	// other two upload routes answer with.
+	//
+	// Every S3 step is skipped on this path, not merely tolerated: ListParts and
+	// CompleteMultipartUpload both report NoSuchUpload for an upload that
+	// finished, and a second trip through them could only turn a retry that must
+	// succeed into a 410 telling the client to upload the whole video again.
+	if uploadIsComplete(job) {
+		h.startPipeline(w, r, job)
+		return
+	}
 
 	// The client may name the upload it believes it is completing, but it does
 	// not get to choose one. This was previously passed straight through to S3
@@ -302,6 +330,17 @@ func (h *Handler) CompleteUpload(w http.ResponseWriter, r *http.Request) {
 		uploaded, err := h.s3.ListParts(r.Context(), upload.Key, upload.UploadID)
 		if err != nil {
 			if storage.IsNoSuchUpload(err) {
+				// The upload is gone, and it is gone for one of two opposite
+				// reasons: it was aborted or reaped, or it completed. The job
+				// record normally settles that — see uploadIsComplete — but it is
+				// written after the S3 call and that write can fail, which is
+				// exactly the state a retry lands in. Ask the bucket, because it
+				// is the only answer that cannot be stale.
+				if h.uploadAlreadyAssembled(r, job) {
+					log.Printf("job %s: upload already assembled, resuming at the enqueue", jobID)
+					h.startPipeline(w, r, job)
+					return
+				}
 				writeError(w, http.StatusGone,
 					"the upload no longer exists; create a new job", "UPLOAD_GONE")
 				return
@@ -345,6 +384,11 @@ func (h *Handler) CompleteUpload(w http.ResponseWriter, r *http.Request) {
 
 	// Persisted, not just set in memory. Without this the next read cannot tell
 	// a finished upload from an abandoned one — see db.MarkUploadComplete.
+	//
+	// Written before the enqueue on purpose: it is what makes the retry above
+	// find its way back here. If the enqueue fails and this write had not
+	// happened, the retry would go looking for a multipart upload that S3 has
+	// already assembled and consumed.
 	if err := h.db.MarkUploadComplete(r.Context(), jobID, time.Now().UTC()); err != nil {
 		log.Printf("ERROR: mark upload complete: %v", err)
 	}
@@ -352,8 +396,49 @@ func (h *Handler) CompleteUpload(w http.ResponseWriter, r *http.Request) {
 	// Invalidate cache
 	_ = h.cache.InvalidateJob(r.Context(), jobID)
 
+	h.startPipeline(w, r, job)
+}
+
+// uploadAlreadyAssembled reports whether the finished object is in the bucket.
+//
+// Deliberately fails closed: an error asking the question is not evidence that
+// the object is there, and answering "yes" on a HeadObject that never succeeded
+// would enqueue a job whose input does not exist.
+func (h *Handler) uploadAlreadyAssembled(r *http.Request, job *models.Job) bool {
+	exists, err := h.s3.ObjectExists(r.Context(), h.config.S3RawBucket, job.Upload.Key)
+	if err != nil {
+		log.Printf("WARN: head %s for job %s: %v", job.Upload.Key, job.JobID, err)
+		return false
+	}
+	return exists
+}
+
+// startPipeline publishes the validate message and writes the response.
+//
+// Split out because two paths reach it: a fresh completion, and a retry of one
+// whose S3 work already succeeded. Both must end with a message on the validate
+// queue, because nothing else in the system will ever put one there.
+func (h *Handler) startPipeline(w http.ResponseWriter, r *http.Request, job *models.Job) {
+	msg := events.NewStageMessage(
+		job.JobID,
+		models.StageValidate,
+		events.S3Ref{Bucket: h.config.S3RawBucket, Key: job.Upload.Key},
+		1,
+		traceID(r),
+	)
+
+	if err := h.queue.Send(r.Context(), events.QueueValidate, msg, 0); err != nil {
+		log.Printf("ERROR: enqueue validate for job %s: %v", job.JobID, err)
+		// A 500 rather than a 200 with a warning: the bytes are in S3 and
+		// nothing but another call to this endpoint will start the pipeline, so
+		// the client has to be told to come back.
+		writeError(w, http.StatusInternalServerError,
+			"failed to queue job for processing", "QUEUE_ERROR")
+		return
+	}
+
 	writeJSON(w, http.StatusOK, completeUploadResponse{
-		JobID:   jobID,
+		JobID:   job.JobID,
 		Status:  string(models.JobStatusProcessing),
 		Message: "Upload complete, processing started",
 	})
@@ -405,7 +490,9 @@ func (h *Handler) AbortUpload(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetJobStatus(w http.ResponseWriter, r *http.Request) {
 	jobID := mux.Vars(r)["id"]
 
-	// Check Redis cache first
+	// Check the in-process cache first. It exists for exactly this handler: the
+	// app polls it every second or two for the whole length of a job, and a 10s
+	// TTL turns that into one DynamoDB read per job per ten seconds.
 	job, err := h.cache.GetJob(r.Context(), jobID)
 	if err != nil {
 		log.Printf("WARN: cache get: %v", err)
@@ -520,17 +607,17 @@ func uploadIsComplete(job *models.Job) bool {
 	return job.Status == models.JobStatusProcessing || job.Status == models.JobStatusCompleted
 }
 
-// loadResumableJob fetches a job and rejects the states in which there is no
-// live upload to act on, writing the error response itself.
+// loadJobWithUpload fetches a job and rejects the states in which there is no
+// upload to act on at all, writing the error response itself.
 //
-// Shared by all three upload routes so they cannot drift into disagreeing about
-// what "already complete" means. The client's recovery differs per code, which
-// is why they are distinct and not one 400.
+// Shared by all four upload routes so they cannot drift into disagreeing about
+// what "no upload" means. The client's recovery differs per code, which is why
+// they are distinct and not one 400.
 //
 // Reads DynamoDB directly rather than through the cache: this decides whether a
 // client re-uploads a video, and a stale cached job is exactly the input that
 // makes that decision wrong.
-func (h *Handler) loadResumableJob(w http.ResponseWriter, r *http.Request, jobID string) (*models.Job, bool) {
+func (h *Handler) loadJobWithUpload(w http.ResponseWriter, r *http.Request, jobID string) (*models.Job, bool) {
 	job, err := h.db.GetJob(r.Context(), jobID)
 	if err != nil {
 		log.Printf("ERROR: get job: %v", err)
@@ -543,6 +630,20 @@ func (h *Handler) loadResumableJob(w http.ResponseWriter, r *http.Request, jobID
 	}
 	if job.Upload == nil {
 		writeError(w, http.StatusConflict, "this job has no upload", "NO_UPLOAD")
+		return nil, false
+	}
+	return job, true
+}
+
+// loadResumableJob additionally rejects an upload that has already finished.
+//
+// Used by the routes that can only act on an upload still in flight: re-issuing
+// URLs for a completed upload, or aborting it, are both meaningless. Completion
+// itself deliberately does not use this — see CompleteUpload, where an
+// already-complete upload is a retry to be finished rather than an error.
+func (h *Handler) loadResumableJob(w http.ResponseWriter, r *http.Request, jobID string) (*models.Job, bool) {
+	job, ok := h.loadJobWithUpload(w, r, jobID)
+	if !ok {
 		return nil, false
 	}
 	if uploadIsComplete(job) {
@@ -562,4 +663,16 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, message, code string) {
 	writeJSON(w, status, errorResponse{Error: message, Code: code})
+}
+
+// traceID returns the caller's trace header, or a fresh ID. It rides on the
+// StageMessage through every stage, so a single video's whole journey — API,
+// queue, worker logs — can be grepped with one value.
+func traceID(r *http.Request) string {
+	for _, header := range []string{"X-Trace-Id", "X-Request-Id"} {
+		if v := r.Header.Get(header); v != "" {
+			return v
+		}
+	}
+	return uuid.NewString()
 }

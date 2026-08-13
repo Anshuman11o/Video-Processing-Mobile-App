@@ -14,11 +14,16 @@ import {
  * The backend, as seen from the Android emulator.
  *
  * `10.0.2.2` is the emulator's alias for the host's loopback interface;
- * `localhost` inside the emulator is the emulated device itself. This must name
- * the same client environment as `S3_PUBLIC_ENDPOINT` in
- * `infra/docker-compose.yml` — the API host and the host that presigned upload
- * URLs are signed against have to agree, or uploads fail with a signature
- * error even though the API calls succeed. See docs/SETUP.md.
+ * `localhost` inside the emulator is the emulated device itself.
+ *
+ * This used to have to name the same client environment as `S3_PUBLIC_ENDPOINT`
+ * in the compose file, because uploads went to an emulated S3 reachable under a
+ * different name from each client, and a mismatch failed the upload with a
+ * signature error while every API call succeeded. That constraint is gone with
+ * the emulator: uploads are presigned against real S3's regional endpoint,
+ * which resolves identically everywhere. Only the API is host-relative now.
+ *
+ * See docs/SETUP.md, "Presigned URLs are bound to the host they were signed for".
  */
 export const API_BASE_URL = 'http://10.0.2.2:8080';
 

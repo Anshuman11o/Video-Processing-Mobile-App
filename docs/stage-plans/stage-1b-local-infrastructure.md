@@ -1,5 +1,14 @@
 # Stage 1B: Local Infrastructure (Docker + LocalStack)
 
+> **SUPERSEDED.** Docker Compose, LocalStack and Redis have been removed from the
+> project. S3 and DynamoDB now point at a real AWS account, SQS is replaced by a
+> SQLite queue (`docs/stage-plans/stage-3b-local-queue.md`), and Redis by an
+> in-process TTL cache. Everything below describes infrastructure that no longer
+> exists; it is kept as the record of what was tried and why it went.
+> See `infra/CONTEXT.md` for what replaced it, and `PROJECT_PLAN.md` Stage 1B
+> for the stage as it now stands: creating three buckets and one table in a real
+> account, once.
+
 > **Run in parallel with:** Stage 1A (Data Schemas)
 > **Estimated time:** 20 minutes
 > **Blocks:** All subsequent stages (nothing runs without infra)

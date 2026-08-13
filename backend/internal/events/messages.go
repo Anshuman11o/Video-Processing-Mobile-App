@@ -1,4 +1,4 @@
-// Package events contains SQS message types and queue/bucket constants for the DayReel pipeline.
+// Package events contains stage message types and queue/bucket constants for the DayReel pipeline.
 package events
 
 import (
@@ -7,7 +7,12 @@ import (
 	"github.com/anshumanagarwal/dayreel/internal/models"
 )
 
-// Queue name constants for SQS queues.
+// Queue name constants.
+//
+// These are values of the `queue` column in the local SQLite broker, not AWS
+// resources — nothing resolves them to a URL any more. They kept their SQS-era
+// spelling so log lines, docs and the message bodies already in flight all still
+// say the same thing.
 const (
 	QueueValidate   = "dayreel-validate"
 	QueueExtract    = "dayreel-extract"
@@ -29,7 +34,10 @@ type S3Ref struct {
 	Key    string `json:"key"`
 }
 
-// StageMessage represents a message sent to an SQS queue to trigger a processing stage.
+// StageMessage represents a message sent to a queue to trigger a processing stage.
+//
+// It is the payload, owned by the producer. The broker stores it verbatim and
+// wraps it in a queue.Message envelope on delivery.
 type StageMessage struct {
 	JobID     string           `json:"job_id"`
 	Stage     models.StageName `json:"stage"`

@@ -17,25 +17,27 @@
 #   ./scripts/abort-stale-uploads.sh --abort         # abort everything listed
 #   ./scripts/abort-stale-uploads.sh --older-than 60 # only those over 60 min old
 #   BUCKET=other ./scripts/abort-stale-uploads.sh --abort
-#   TARGET=aws ./scripts/abort-stale-uploads.sh      # against real S3
+#
+# It talks to real S3 with your ambient credentials. There is no TARGET switch
+# any more: it used to default to `localstack` and shell out to
+# `docker exec dayreel-localstack awslocal`, so the plain invocation documented
+# above failed once the containers went. Real AWS was the opt-in path; it is now
+# the only one.
 #
 # Listing is the default and aborting is opt-in, because an upload in this list
 # may be one a client is still working through — age is the only signal
 # separating "abandoned" from "in progress", and it is a guess.
 #
-# WHAT THIS DOES NOT PROVE: that the lifecycle rule in
-# infra/localstack/init-aws.sh works. It does not, locally. LocalStack accepts
-# the rule, reads it back verbatim, and never acts on it — verified 2026-08-13
-# by leaving an incomplete upload under a DaysAfterInitiation=0 rule and
-# watching it survive, and by leaving an object whose Expiration Date was in
-# 2020 and watching that survive too. This script is the mechanism that
-# genuinely reaps here. On real AWS the lifecycle rule is the safety net for the
-# case this script cannot cover: nobody ever runs it.
+# The bucket lifecycle rule is the safety net for the case this script cannot
+# cover: nobody ever runs it. Note that the rule has never been observed to
+# work — under the emulator it was accepted, read back verbatim, and never
+# acted on (verified 2026-08-13: an incomplete upload survived a
+# DaysAfterInitiation=0 rule, and an object survived an Expiration date in
+# 2020). Whether real S3 honours it here is unverified, so treat this script as
+# the mechanism that actually reaps and the rule as a hope.
 set -uo pipefail
 
 BUCKET="${BUCKET:-dayreel-raw-videos}"
-TARGET="${TARGET:-localstack}"
-CONTAINER="${CONTAINER:-dayreel-localstack}"
 
 abort=0
 older_than_min=0
@@ -44,24 +46,19 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --abort)      abort=1 ;;
     --older-than) older_than_min="${2:?--older-than needs minutes}"; shift ;;
-    -h|--help)    sed -n '2,35p' "$0" | sed 's/^#\ \?//'; exit 0 ;;
+    -h|--help)    sed -n '2,37p' "$0" | sed 's/^#\ \?//'; exit 0 ;;
     *)            echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
 
-# One indirection for both targets so the commands below read the same either
-# way. awslocal inside the container avoids needing credentials or an endpoint
-# override on the host.
+# Kept as a one-line wrapper rather than inlined at all four call sites: it is
+# the single place an endpoint override would go if a proxy ever needs one.
 s3api() {
-  if [ "$TARGET" = "aws" ]; then
-    aws s3api "$@"
-  else
-    docker exec "$CONTAINER" awslocal s3api "$@"
-  fi
+  aws s3api "$@"
 }
 
-echo "in-flight multipart uploads — bucket=$BUCKET target=$TARGET"
+echo "in-flight multipart uploads — bucket=$BUCKET"
 
 listing="$(s3api list-multipart-uploads --bucket "$BUCKET" --output json 2>/dev/null)"
 if [ -z "$listing" ]; then

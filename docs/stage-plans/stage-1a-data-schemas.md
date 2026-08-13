@@ -1,6 +1,11 @@
 # Stage 1A: Data Schemas (DynamoDB + SQS)
 
-> **Run in parallel with:** Stage 1B (Docker/LocalStack)
+> **Still current, with one renaming.** The message schemas below are unchanged
+> and in use. They are no longer carried by SQS — the transport is a local
+> SQLite queue (`stage-3b-local-queue.md`) which stores the same JSON as an
+> opaque body. Read "SQS message" as "stage message" throughout.
+
+> **Run in parallel with:** Stage 1B (AWS resources)
 > **Estimated time:** 30 minutes
 > **Blocks:** Stage 2A (Go API), all workers
 

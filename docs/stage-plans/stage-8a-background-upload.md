@@ -51,6 +51,22 @@
 > ever existed. That one run is also the only chance to test anonymous-access
 > enforcement and Block Public Access, which LocalStack provably cannot.
 >
+> **Substrate superseded, 2026-08-13.** The paragraph directly above is now
+> historical on both counts. Docker Compose, LocalStack, Redis and SQS are gone —
+> S3 and DynamoDB are real AWS on every run, and the queue is a local SQLite file
+> (`infra/CONTEXT.md`). There is no `USE_LOCALSTACK` flag to hardcode and no
+> emulator to defer away from: the buckets and the jobs table were created on
+> 2026-08-12 and every run uses them.
+>
+> This stage depended on the emulator only through the endpoints it uploads to,
+> and that dependency was the awkward one — presigned URLs were signed for a host
+> the developer machine could not route to. Real S3's regional endpoint resolves
+> identically from the phone, the emulator and the host, so the host-binding
+> workaround this stage inherited from Stage 7 is simply gone. Anonymous-access
+> enforcement and Block Public Access are still unasserted, but they are now one
+> script run away (`scripts/verify-presign.sh`) rather than blocked on
+> provisioning that had never happened.
+>
 > **Read the finding below.** It is the reason ~80% of this stage is
 > backend work that has nothing to do with Android — and that half was started
 > first precisely because it needs no SDK, no emulator and no disk.
