@@ -361,6 +361,7 @@ does and which decisions are non-obvious. Start there, not in the code.
 | [`PROJECT_PLAN.md`](PROJECT_PLAN.md) | Architecture, design invariants, staging, and what was deliberately deferred |
 | [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) | Every non-trivial bug: symptom, cause, fix, prevention |
 | [`docs/SETUP.md`](docs/SETUP.md) | Provisioning walkthrough |
+| [`docs/METRICS.md`](docs/METRICS.md) | The four project metrics, measured on real AWS — and which two the sample cannot support |
 | [`docs/aws-public-hls.md`](docs/aws-public-hls.md) | Why presigning cannot serve HLS, and the opt-in access model — including how to turn it off |
 | [`docs/stage-plans/`](docs/stage-plans/) | One plan per stage, written *before* implementation |
 | [`config/aws-limits.md`](config/aws-limits.md) | Service constraints the design had to bend around |
