@@ -123,6 +123,7 @@ out/
 # rules above; this exception is scoped to one directory on purpose, so a stray
 # 500 MB source video cannot be added by accident.
 !docs/assets/*.mp4
+!docs/assets/*.gif
 *.m3u8
 # HLS transport-stream segments. Scoped to output dirs so this does not
 # swallow TypeScript sources (mobile/src/**/*.ts).
