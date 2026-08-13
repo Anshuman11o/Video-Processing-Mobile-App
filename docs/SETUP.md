@@ -78,23 +78,25 @@ by hand does not read `.env`**. It falls back to the defaults in
 `internal/config/config.go`, which name a region and three bucket names you may
 not own. Prefer `make api` and `make worker`.
 
-**Not every target sources it, and that shows up as a path or a name that does
-not match.** `LOAD_ENV` is a per-recipe shell prefix, so it applies to `api`,
-`worker`, `workers` and the three `sqs-*` targets and to nothing else. Read out
-of `make -n`, which is where this is easiest to see rather than argue about:
+**Every target sources it now, which was not true until recently.** `LOAD_ENV`
+is a per-recipe shell prefix and it used to be on `api`, `worker`, `workers` and
+the `sqs-*` targets only. `queue-peek`, `queue-reset` and `verify` went without,
+so they read the Makefile's own defaults: `queue-peek` looked for
+`data/queue.db` at the project root and reported no queue database while the
+pipeline was visibly draining `backend/data/queue.db`, and `verify` checked
+three bucket names somebody else owns rather than yours. Both now read `.env`.
 
-| Target | Reads `.env`? | Consequence |
-|---|---|---|
-| `api`, `worker`, `workers` | yes | run with `cd backend`, so a relative `QUEUE_DB_PATH` or `WHISPER_MODEL_PATH` resolves under `backend/` |
-| `queue-peek`, `queue-reset` | no | look for `data/queue.db` at the project root — not the `backend/data/queue.db` the API just created |
-| `verify` | no | checks the bucket and table names hard-coded as Makefile defaults, not the ones in `.env` |
+Relative paths still need care, because `make api` and `make worker` do `cd
+backend` first. `QUEUE_DB_PATH=./data/queue.db` therefore means
+`backend/data/queue.db`, and `queue-peek` resolves it the same way deliberately.
+`WHISPER_MODEL_PATH` has the same shape but one reader that does *not* follow
+the rule — `scripts/dev-setup.sh` checks it against whatever directory you ran
+the script from. An absolute path in `.env` removes the ambiguity everywhere.
 
-Two ways out, both of them yours to pick: export the variables into make's own
-environment (`export $(grep -v '^#' .env | xargs)` before running it), or use
-absolute paths in `.env` so no target can disagree about where a file is. The
-symptom to recognise is `make queue-peek` insisting there is no queue database
-while the pipeline is visibly draining one, and `make verify` reporting the
-default buckets missing on an account where yours exist.
+One precedence surprise worth knowing: `set -a; . ./.env` overwrites variables
+that are already exported, so `.env` beats the surrounding environment rather
+than the other way round. `S3_RAW_BUCKET=x make verify` loses to whatever `.env`
+says. Edit `.env` to change what these targets see.
 
 Every setting is documented inline in `.env.example`. Nothing in the repository
 contains credentials, and `.env` is git-ignored.

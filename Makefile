@@ -10,7 +10,20 @@
 
 .PHONY: api worker workers queue-peek queue-reset sqs-setup sqs-status sqs-teardown verify test help
 
-# Overridable so these stay in step with .env without duplicating it.
+# Fallbacks only. LOAD_ENV below sources .env into each recipe's shell, so a
+# name set there wins over these; they exist so the targets still do something
+# sensible before .env is created.
+#
+# Recipes read them as shell variables ("$${VAR:-$(VAR)}") rather than as make
+# variables ("$(VAR)"), which is what lets .env win. A bare $(VAR) expands at
+# parse time, before LOAD_ENV has run, baking the default in — that was the bug
+# where `make queue-peek` reported an empty queue while the pipeline drained one.
+#
+# Precedence is .env > environment > these defaults. Note the middle one: `set
+# -a; . ./.env` overwrites variables already exported, so `S3_RAW_BUCKET=x make
+# verify` loses to a value in .env rather than overriding it. That has always
+# been how the run targets behave; it is now how all of them behave. Edit .env,
+# or comment the line out there, to change what these check.
 QUEUE_DB_PATH ?= data/queue.db
 S3_RAW_BUCKET ?= dayreel-raw-videos
 S3_PROCESSED_BUCKET ?= dayreel-processed
@@ -79,25 +92,34 @@ workers:
 # Columns must match the schema in backend/internal/queue/sqlite.go: this reads
 # `messages(id, queue, receive_count, visible_at, receipt)` and treats
 # `visible_at` as epoch milliseconds. Change the schema, change this query.
+# QUEUE_DB_PATH is resolved the same way the API resolves it, which is the whole
+# point of sourcing .env here: the API is started by `make api`, which does
+# `cd backend` first, so a relative path in .env lands under backend/. This
+# looked in the project root instead and reported an empty queue while the
+# pipeline was visibly draining one.
 queue-peek:
-	@test -f "$(QUEUE_DB_PATH)" || { echo "No queue database at $(QUEUE_DB_PATH). Start the API or worker first."; exit 1; }
-	@command -v sqlite3 >/dev/null 2>&1 || { echo "sqlite3 CLI not installed (brew install sqlite / apt install sqlite3)."; exit 1; }
-	@echo "Queue: $(QUEUE_DB_PATH)"
-	@echo ""
-	@sqlite3 -header -column "$(QUEUE_DB_PATH)" \
+	@$(LOAD_ENV) db="$${QUEUE_DB_PATH:-$(QUEUE_DB_PATH)}"; \
+	case "$$db" in /*) ;; *) db="backend/$${db#./}" ;; esac; \
+	test -f "$$db" || { echo "No queue database at $$db. Start the API or worker first."; exit 1; }; \
+	command -v sqlite3 >/dev/null 2>&1 || { echo "sqlite3 CLI not installed (brew install sqlite / apt install sqlite3)."; exit 1; }; \
+	echo "Queue: $$db"; \
+	echo ""; \
+	sqlite3 -header -column "$$db" \
 		"SELECT id, queue, receive_count, \
 		        datetime(visible_at/1000, 'unixepoch') AS visible_at, \
 		        CASE WHEN receipt IS NULL THEN '' ELSE 'leased' END AS state \
-		   FROM messages ORDER BY queue, id;"
-	@echo ""
-	@echo "Depth by queue:"
-	@sqlite3 -header -column "$(QUEUE_DB_PATH)" \
+		   FROM messages ORDER BY queue, id;"; \
+	echo ""; \
+	echo "Depth by queue:"; \
+	sqlite3 -header -column "$$db" \
 		"SELECT queue, COUNT(*) AS depth FROM messages GROUP BY queue ORDER BY queue;"
 
 # Wipe the queue. The file is recreated on next start.
 queue-reset:
-	@rm -f "$(QUEUE_DB_PATH)" "$(QUEUE_DB_PATH)-wal" "$(QUEUE_DB_PATH)-shm"
-	@echo "Removed $(QUEUE_DB_PATH)."
+	@$(LOAD_ENV) db="$${QUEUE_DB_PATH:-$(QUEUE_DB_PATH)}"; \
+	case "$$db" in /*) ;; *) db="backend/$${db#./}" ;; esac; \
+	rm -f "$$db" "$$db-wal" "$$db-shm"; \
+	echo "Removed $$db."
 
 # The SQS driver's equivalents of the two targets above. They shell out rather
 # than inline the aws calls: creating a queue set means a redrive policy that
@@ -120,27 +142,33 @@ sqs-teardown:
 	@$(LOAD_ENV) ./scripts/aws-sqs-setup.sh teardown
 
 # Confirm the real AWS resources this project needs actually exist.
+# Sources .env for the same reason queue-peek does: bucket names are globally
+# unique, so the defaults below are names somebody else owns. Checking those
+# instead of yours reports three missing buckets on an account where all three
+# exist.
 verify:
-	@echo "Verifying AWS access..."
-	@echo ""
-	@echo "=== Credentials ==="
-	@aws sts get-caller-identity --output text --query 'Arn' || { echo "AWS credentials are not working. Check .env / ~/.aws/credentials."; exit 1; }
-	@echo ""
-	@echo "=== S3 Buckets ==="
-	@for b in $(S3_RAW_BUCKET) $(S3_PROCESSED_BUCKET) $(S3_HLS_BUCKET); do \
+	@$(LOAD_ENV) \
+	echo "Verifying AWS access..."; \
+	echo ""; \
+	echo "=== Credentials ==="; \
+	aws sts get-caller-identity --output text --query 'Arn' || { echo "AWS credentials are not working. Check .env / ~/.aws/credentials."; exit 1; }; \
+	echo ""; \
+	echo "=== S3 Buckets ==="; \
+	for b in "$${S3_RAW_BUCKET:-$(S3_RAW_BUCKET)}" "$${S3_PROCESSED_BUCKET:-$(S3_PROCESSED_BUCKET)}" "$${S3_HLS_BUCKET:-$(S3_HLS_BUCKET)}"; do \
 		if aws s3api head-bucket --bucket "$$b" 2>/dev/null; then \
 			echo "  OK      $$b"; \
 		else \
 			echo "  MISSING $$b"; \
 		fi; \
-	done
-	@echo ""
-	@echo "=== DynamoDB Table ==="
-	@aws dynamodb describe-table --table-name $(DYNAMODB_TABLE) \
+	done; \
+	echo ""; \
+	echo "=== DynamoDB Table ==="; \
+	t="$${DYNAMODB_TABLE:-$(DYNAMODB_TABLE)}"; \
+	aws dynamodb describe-table --table-name "$$t" \
 		--query 'Table.[TableName,TableStatus]' --output text 2>/dev/null \
-		|| echo "  MISSING $(DYNAMODB_TABLE)"
-	@echo ""
-	@echo "Verification complete."
+		|| echo "  MISSING $$t"; \
+	echo ""; \
+	echo "Verification complete."
 
 # Go test suite
 test:

@@ -27,11 +27,13 @@ func TestOutputKeyIsTheMasterPlaylist(t *testing.T) {
 	}
 }
 
+// An explicit endpoint addresses buckets path-style, because the thing it names
+// is a proxy in front of many buckets rather than S3 itself.
 func TestPublicURL(t *testing.T) {
-	s := &Stage{opts: Options{PublicEndpoint: "http://localhost:4566"}}
+	s := &Stage{opts: Options{PublicEndpoint: "https://media.example.com"}}
 
 	got := s.publicURL("dayreel-hls-output", "job-1/master.m3u8")
-	want := "http://localhost:4566/dayreel-hls-output/job-1/master.m3u8"
+	want := "https://media.example.com/dayreel-hls-output/job-1/master.m3u8"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
@@ -40,10 +42,40 @@ func TestPublicURL(t *testing.T) {
 // A trailing slash on the configured endpoint would otherwise produce a double
 // slash, which some players reject and others silently resolve differently.
 func TestPublicURLTrimsTrailingSlash(t *testing.T) {
-	s := &Stage{opts: Options{PublicEndpoint: "http://localhost:4566/"}}
+	s := &Stage{opts: Options{PublicEndpoint: "https://media.example.com/"}}
 
-	if got := s.publicURL("b", "k"); got != "http://localhost:4566/b/k" {
+	if got := s.publicURL("b", "k"); got != "https://media.example.com/b/k" {
 		t.Errorf("trailing slash not handled: %q", got)
+	}
+}
+
+// The real-AWS case, and the one that was broken: S3_PUBLIC_ENDPOINT is
+// documented as empty there, which used to format as "/bucket/key" — a URL with
+// no scheme and no host, which is what every completed job returned as hls_url.
+// The bucket belongs in the host on real S3, not in the path.
+func TestPublicURLEmptyEndpointUsesRegionalS3Host(t *testing.T) {
+	s := &Stage{opts: Options{Region: "eu-west-1"}}
+
+	got := s.publicURL("dayreel-hls-output", "job-1/master.m3u8")
+	want := "https://dayreel-hls-output.s3.eu-west-1.amazonaws.com/job-1/master.m3u8"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// Guards the property that actually matters to a player, independently of the
+// exact host: the URL has to be absolute.
+func TestPublicURLIsAbsolute(t *testing.T) {
+	for _, opts := range []Options{
+		{Region: "us-east-1"},
+		{}, // no region either — the hand-built-Options fallback
+		{PublicEndpoint: "https://media.example.com"},
+	} {
+		s := &Stage{opts: opts}
+		got := s.publicURL("bucket", "job-1/master.m3u8")
+		if !strings.HasPrefix(got, "http://") && !strings.HasPrefix(got, "https://") {
+			t.Errorf("publicURL(%+v) = %q, which no player can resolve", opts, got)
+		}
 	}
 }
 

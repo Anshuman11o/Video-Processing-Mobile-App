@@ -111,7 +111,7 @@ func buildStage(
 		return packager.New(
 			s3Client, dbClient,
 			cfg.S3HLSBucket, cfg.S3ProcessedBucket,
-			packager.DefaultOptions(cfg.PublicEndpoint()),
+			packager.DefaultOptions(cfg.PublicEndpoint(), cfg.AWSRegion),
 		), nil
 	default:
 		return nil, unknownStageError(name)

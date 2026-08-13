@@ -10,9 +10,17 @@ model for `dayreel-hls-output` on real AWS: why presigning cannot serve HLS, wha
 the script changes, what Block Public Access actually does at each level, what it
 costs, how to tear it down, and the alternative that was deliberately not built.
 
-Nothing in this document is on by default. No real AWS bucket has ever been
-provisioned for this project. Read [VERIFIED vs ASSUMED](#verified-vs-assumed) at
-the bottom before acting on any of it.
+Nothing in this document is on by default. The `dayreel-hls-output` bucket has
+never had a public-read access model applied to it, and no step in this document
+has been executed against a real bucket. Read
+[VERIFIED vs ASSUMED](#verified-vs-assumed) at the bottom before acting on any of
+it.
+
+(This paragraph used to say no real AWS bucket had ever been provisioned for the
+project at all. That stopped being true on 2026-08-12, when the three buckets and
+the jobs table were created by hand — the CORS failure recorded in
+`TROUBLESHOOTING.md` happened against the real `dayreel-raw-videos`. The buckets
+exist; what remains unexercised is everything below.)
 
 ---
 
@@ -34,16 +42,22 @@ Presign the master and the player fetches it fine, then resolves
 HLS **unless every URI in every playlist is individually rewritten**, which is the
 alternative discussed [below](#the-alternative-that-was-not-built).
 
-### Why this has never been visible locally
+### Why this was never visible locally
 
-**LocalStack Community serves unsigned GETs to any bucket.** Playback works on the
-emulator today for a reason that will not hold on real S3 — not because the access
-model is right, but because there is no access model. This is recorded in
-`docs/SETUP.md` under "LocalStack does not enforce bucket authorization", and it is
-why `infra/localstack/init-aws.sh` is deliberately **not** the place to configure
-any of this: LocalStack accepts `put-bucket-policy` and `put-public-access-block`,
-reads both back verbatim, and enforces neither. Configuring it there would
-manufacture confidence rather than provide it.
+**LocalStack Community served unsigned GETs to any bucket.** Playback worked on
+the emulator for a reason that will not hold on real S3 — not because the access
+model was right, but because there was no access model. It accepted
+`put-bucket-policy` and `put-public-access-block`, read both back verbatim, and
+enforced neither, so provisioning code that set them looked correct while proving
+nothing.
+
+The emulator is gone, and so is the init script that would otherwise have been
+the tempting place to configure this. What the episode leaves behind is the
+reason this document is opt-in and manual: the access model is a one-time
+decision on a real, billed account, and the local stack never had any way to
+tell you whether you had got it right. `docs/SETUP.md`, under "Bucket
+authorization has to be asserted, not assumed", carries the same lesson for the
+upload path.
 
 ---
 
@@ -366,8 +380,7 @@ for its VTT URI.
 ### The third option, for completeness
 
 **CloudFront with an Origin Access Control** in front of a private bucket is the
-actual production answer, and it is what the comment in
-`infra/localstack/init-aws.sh` already gestures at. It is not pursued here for two
+actual production answer. It is not pursued here for two
 reasons: CloudFront is LocalStack **Pro-only** (`config/free-tier.md`, parity table),
 so it cannot be exercised locally at all; and a distribution is one more real resource
 to remember to tear down, against a $20 budget and a project with a handful of runs
@@ -407,15 +420,18 @@ never tested turned out wrong.
 ### ASSUMED
 
 - **That the script has the intended effect on real S3.** It has never been run
-  against a real AWS account. **No real bucket has ever been provisioned for this
-  project**, and spending is budgeted at $20 total, so it was not run to find out.
-  The effect of `enable` — that an anonymous GET returns 200 afterwards — and of
-  `disable` — that it returns 403 again — is **unverified**.
-- **That LocalStack cannot substitute for that verification.** This is not a gap that
-  effort would close: LocalStack Community **stores bucket policies and
-  public-access-block settings and then ignores them entirely** — verified twice in
-  this project and recorded in `docs/SETUP.md` and `infra/localstack/init-aws.sh`.
-  Both calls succeed, both read back verbatim, and an unsigned request still succeeds.
+  against a real AWS account. The buckets themselves do exist as of 2026-08-12,
+  but no access model has been applied to `dayreel-hls-output` and spending is
+  budgeted at $20 total, so it was not run to find out. The effect of `enable` —
+  that an anonymous GET returns 200 afterwards — and of `disable` — that it
+  returns 403 again — is **unverified**.
+- **That the emulator could never have substituted for that verification.** This
+  was not a gap effort would have closed: LocalStack Community **stored bucket
+  policies and public-access-block settings and then ignored them entirely** —
+  verified twice in this project and recorded in `docs/SETUP.md`. Both calls
+  succeeded, both read back verbatim, and an unsigned request still succeeded.
+  Now that the emulator is gone there is no local substitute at all, which is
+  clearer if less convenient: the only way to know is to run it once.
   Running the script against LocalStack would print an unbroken column of successes
   and prove nothing, which is why the script refuses to run there.
 - **That this account has no account-level BPA and is not in an Organizations BPA

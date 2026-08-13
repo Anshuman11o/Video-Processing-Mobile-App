@@ -83,7 +83,9 @@ if ! command -v whisper-cli &> /dev/null; then
     print_warning "  required for MOCK_TRANSCRIBE=false. See docs/SETUP.md."
 elif [ ! -f "$WHISPER_MODEL_PATH" ]; then
     print_warning "whisper-cli found, but no model at $WHISPER_MODEL_PATH."
-    print_warning "  Download it before setting MOCK_TRANSCRIBE=false. See docs/SETUP.md."
+    print_warning "  The worker downloads it on first use, so this is not fatal — but the"
+    print_warning "  ~141 MB fetch then happens inside the first job's lease. See docs/SETUP.md."
+    print_warning "  Note this path is resolved from here; the worker resolves it under backend/."
 else
     print_status "whisper-cli and model are present (real transcription available)"
 fi

@@ -40,23 +40,32 @@ type Options struct {
 	Ladder         []media.Rendition
 	SegmentSeconds int
 
-	// PublicEndpoint is the base URL a player will use to fetch HLS output.
+	// PublicEndpoint is the base URL a player will use to fetch HLS output,
+	// when that is not the endpoint S3 itself serves the bucket on.
 	//
-	// This is the same unresolved problem as the presigned-URL finding from 4A.
 	// Reels are served straight out of the HLS bucket with no CDN in front, so
 	// the host a player must reach — a bucket website endpoint, a custom domain,
-	// eventually a distribution — is a deployment decision. Left as
-	// configuration rather than solved here, because the access model is a
-	// deliberate open question.
+	// eventually a distribution — is a deployment decision. It stays
+	// configurable for that reason.
+	//
+	// Empty is the normal setting on real AWS and means "S3's own endpoint for
+	// this bucket", which publicURL derives from Region. It used to mean
+	// something much worse: the formatted URL began with a bare "/", so the
+	// hls_url handed to the client had no scheme and no host at all.
 	PublicEndpoint string
+
+	// Region is the bucket's AWS region, used only to derive the endpoint when
+	// PublicEndpoint is empty. Ignored when PublicEndpoint is set.
+	Region string
 }
 
-// DefaultOptions returns options for the given public endpoint.
-func DefaultOptions(publicEndpoint string) Options {
+// DefaultOptions returns options for the given public endpoint and region.
+func DefaultOptions(publicEndpoint, region string) Options {
 	return Options{
 		Ladder:         DefaultLadder,
 		SegmentSeconds: SegmentSeconds,
 		PublicEndpoint: publicEndpoint,
+		Region:         region,
 	}
 }
 
@@ -335,7 +344,32 @@ func (s *Stage) outputDetails(ctx context.Context, jobID string) (float64, strin
 }
 
 // publicURL builds a browser-reachable URL for an object.
+//
+// An explicit PublicEndpoint is treated as a prefix in front of the bucket,
+// because that is what a proxy or an emulator needs: one host serving many
+// buckets, addressed path-style.
+//
+// Empty means real S3, and there the bucket is not a path segment — it is part
+// of the host. Formatting it path-style against an empty base produced
+// "/dayreel-hls-output/<job>/master.m3u8": no scheme, no host, and no way for a
+// player to resolve it. Since S3_PUBLIC_ENDPOINT is documented as empty on real
+// AWS, that was the URL every completed job actually handed back.
+//
+// Virtual-hosted style is the form S3 wants: path-style addressing is
+// deprecated for buckets created after September 2020, so deriving the
+// path-style URL instead would have been a second, slower bug.
 func (s *Stage) publicURL(bucket, key string) string {
+	if s.opts.PublicEndpoint == "" {
+		region := s.opts.Region
+		if region == "" {
+			// Only reachable if a caller built Options by hand. us-east-1 is
+			// wrong for a bucket elsewhere, but it is a resolvable host that
+			// fails loudly on a redirect, rather than a path that resolves to
+			// nothing anywhere.
+			region = "us-east-1"
+		}
+		return fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", bucket, region, key)
+	}
 	base := strings.TrimSuffix(s.opts.PublicEndpoint, "/")
 	return fmt.Sprintf("%s/%s/%s", base, bucket, key)
 }
