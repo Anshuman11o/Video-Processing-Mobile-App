@@ -14,53 +14,56 @@ waiting the next time you open the app.
 - [2. The solution](#2-the-solution)
 - [3. Architecture](#3-architecture)
   - [3.1 What each component does](#31-what-each-component-does)
-  - [3.2 The distributed-systems parts, in tandem](#32-the-distributed-systems-parts-in-tandem)
-  - [3.3 Data flow, end to end](#33-data-flow-end-to-end)
-- [4. Key features](#4-key-features)
-- [5. Technical challenges](#5-technical-challenges)
-- [6. What works today](#6-what-works-today)
-- [7. Tech stack, and why](#7-tech-stack-and-why)
-- [8. Running it](#8-running-it)
-- [9. Navigating the repo](#9-navigating-the-repo)
+  - [3.2 Data flow, end to end](#32-data-flow-end-to-end)
+- [4. Queue guarantees, and how each is enforced](#4-queue-guarantees-and-how-each-is-enforced)
+- [5. Key features](#5-key-features)
+- [6. Technical challenges](#6-technical-challenges)
+- [7. What works today](#7-what-works-today)
+- [8. Tech stack, and why](#8-tech-stack-and-why)
+- [9. Running it](#9-running-it)
+- [10. Navigating the repo](#10-navigating-the-repo)
 
 ---
 
 ## 1. The problem
 
-Two problems meet in the middle, and each makes the other worse.
+Uploading video from a mobile device fails in two ways, and each makes the other
+harder to solve.
 
-**Mobile networks are unreliable, and video is large.** A 60-second 1080p clip is
-tens of megabytes. On a train, in a lift, on rural data, a naive upload fails at
-90% and starts again from zero. Users respond by not uploading.
+**Networks are unreliable and video files are large.** A 60-second 1080p clip
+runs to tens of megabytes. On a train, in a lift, or on rural data, a
+single-request upload that fails at 90 percent restarts from zero. Users respond
+by not uploading.
 
-**Video processing is too heavy for the device.** Producing an adaptive-bitrate
-stream means encoding the same clip three times, plus speech-to-text against a
-model of several hundred megabytes. That is minutes of sustained CPU, thermal
-throttling and battery drain — on hardware the user is holding. And both mobile
-platforms cap what an app may do once the user leaves it, so "process it in the
-background" is not a promise the OS lets you keep.
+**Processing video on the device is impractical.** Adaptive-bitrate streaming
+requires encoding the same clip at three resolutions, plus speech-to-text against
+a model of several hundred megabytes. That is minutes of sustained CPU on
+hardware the user is holding, and both mobile platforms restrict what an
+application may do once it leaves the foreground.
 
-The naive fix — upload in the foreground, process on the device — produces an app
-that only works on good Wi-Fi while you stare at a progress bar.
+The naive design, uploading in the foreground and processing on-device, produces
+an application that works only on strong Wi-Fi with the screen open.
 
 ---
 
 ## 2. The solution
 
-Split the work at the point where the guarantees change.
+Separate the work at the boundary where the guarantees differ.
 
-**On the device:** never lose upload progress. The clip is cut into 5 MiB parts,
-each uploaded independently and checkpointed to a local ledger the instant it
-succeeds. The upload is owned by the OS scheduler, not the app process, so it
-survives the app being killed and resumes at the first part that has not landed.
+**On the device: never lose upload progress.** The clip is divided into 5 MiB
+parts, each uploaded independently and recorded to a local ledger as soon as it
+succeeds. The transfer is owned by the operating system's scheduler rather than
+the application process, so it survives termination and resumes at the first part
+that has not landed.
 
-**On the backend:** a four-stage pipeline where every stage is stateless and
-restartable. Messages carry pointers, never payloads; the database is the only
-source of truth; every stage checks whether its own output already exists before
-doing any work. A worker can die mid-encode and the job continues.
+**On the backend: make every stage restartable.** A four-stage pipeline processes
+each clip. Messages carry pointers rather than payloads, the database holds the
+only authoritative state, and each stage checks whether its own output already
+exists before doing any work. A worker can fail mid-encode without the job being
+lost or duplicated.
 
-The result is an app that accepts a clip on a bad connection, finishes the upload
-whenever the network allows, and has a finished reel waiting when you return.
+The result accepts a clip on a poor connection, finishes the upload whenever the
+network allows, and has a completed reel ready when the user returns.
 
 ---
 
@@ -68,7 +71,7 @@ whenever the network allows, and has a finished reel waiting when you return.
 
 ```mermaid
 flowchart TB
-    subgraph device["📱 Device — Android"]
+    subgraph device["📱 Device (Android)"]
         picker["Video picker"]
         ledger[("Local ledger<br/>URI · uploadId · part ETags")]
         wm["WorkManager uploader<br/><i>outlives the app process</i>"]
@@ -76,10 +79,10 @@ flowchart TB
         picker --> ledger --> wm
     end
 
-    subgraph backend["⚙️ Backend — two Go binaries, no containers"]
+    subgraph backend["⚙️ Backend (two Go binaries)"]
         api["HTTP API<br/><i>never touches video bytes</i>"]
         queue[("SQLite queue<br/>visible_at · receipt · receive_count")]
-        subgraph workers["Worker — one binary, WORKER_STAGE selects"]
+        subgraph workers["Worker: one binary, WORKER_STAGE selects"]
             direction LR
             v["validate"] --> e["extract"] --> t["transcribe"] --> p["package"]
         end
@@ -87,12 +90,12 @@ flowchart TB
         queue <-->|"claim · ack · heartbeat"| workers
     end
 
-    subgraph aws["☁️ AWS — the only remote dependency"]
+    subgraph aws["☁️ AWS (the only remote dependency)"]
         s3[("S3<br/>raw · processed · hls")]
         ddb[("DynamoDB<br/>job + stage state")]
     end
 
-    wm ==>|"PUT parts — presigned, direct"| s3
+    wm ==>|"PUT parts: presigned, direct"| s3
     wm -->|"create · complete · poll"| api
     workers -->|"read input · write output"| s3
     workers -->|"record stage state"| ddb
@@ -109,57 +112,27 @@ single small API process can serve uploads of any size.
 
 | Component | Responsibility | Why it exists |
 |---|---|---|
-| **Video picker** | Returns a URI, size and MIME type | Never copies the file — the clip stays in device storage |
+| **Video picker** | Returns a URI, size and MIME type | Never copies the file; the clip stays in device storage |
 | **Local ledger** | Durable record of upload ID and per-part ETags | This *is* the resume mechanism; without it a killed app restarts from zero |
 | **WorkManager uploader** | OS-scheduled part upload with constraints and backoff | The app process is not in the loop, so upload survives app death |
 | **HTTP API** | Job creation, presigning, completion, status | Coordinator only; it mints URLs and records facts |
 | **Queue** | At-least-once hand-off between stages | Decouples stages so any worker can pick up any message |
-| **Workers** | ffmpeg / whisper.cpp execution | One binary, four stages; `WORKER_STAGE` selects |
+| **Workers** | ffmpeg and whisper.cpp execution | One binary, four stages; `WORKER_STAGE` selects |
 | **S3** | Every video byte and derived artifact | Also supplies the multipart API that makes resume possible |
 | **DynamoDB** | Job record with per-stage state | The only source of truth about what has happened |
 | **In-process cache** | 10-second TTL on job status | Absorbs status polling without a cache server |
 
-### 3.2 The distributed-systems parts, in tandem
-
-These four pieces only make sense together — each covers a failure the others create.
-
-**At-least-once delivery, so idempotency is mandatory.** The queue guarantees a
-message is delivered *at least* once, never *exactly* once. So every stage begins
-by checking whether its own output object already exists, and consults recorded
-stage state to distinguish a duplicate delivery from a crash between uploading
-output and recording it. Without this, at-least-once means duplicated work and
-racing writes.
-
-**Leases, not locks.** Claiming a message hides it for a visibility timeout
-rather than locking it. A worker that dies holds nothing — the lease simply
-expires and another worker claims it. Stages slower than the timeout heartbeat to
-extend their lease; a stage that overruns anyway loses the message to another
-worker, and its late acknowledgement fails with a distinct "lease lost" error
-rather than being mistaken for success.
-
-**Retry budgets and dead-lettering, owned by the application.** There is no
-broker redrive policy to lean on. The runner classifies failures: permanent ones
-(bad codec, corrupt file) dead-letter immediately, transient ones back off and
-retry until the budget is spent. The failure is recorded in DynamoDB *before* the
-message is dead-lettered, so a job can never sit `running` forever with its
-message parked on the dead-letter queue.
-
-**Pointers, not payloads.** A queue message is roughly 300 bytes — a job ID, a
-stage name and an S3 key. Workers fetch the file themselves. That is what makes a
-worker stateless: it needs nothing from whichever worker ran the previous stage,
-so any replica can process any message, and the queue never becomes a data store.
-
-### 3.3 Data flow, end to end
+### 3.2 Data flow, end to end
 
 | # | Actor | Action |
 |---|---|---|
-| 1 | App → API | `POST /jobs` — filename, size, content type |
+| 1 | App → API | `POST /jobs` with filename, size and content type |
 | 2 | API → S3 | Create multipart upload, presign one URL per 5 MiB part |
 | 3 | API → DynamoDB | Write the job record |
 | 4 | App → **S3 directly** | `PUT` each part; checkpoint every ETag to the ledger |
-| 5 | App → API | `POST /jobs/{id}/complete` — part list optional, derived from `ListParts` when absent |
-| 6 | API → Queue | Publish the validate message — **the only thing that starts a pipeline** |
-| 7 | Workers | Claim → fetch from S3 → process → write output → record state → publish next stage |
+| 5 | App → API | `POST /jobs/{id}/complete`; the part list is optional, derived from `ListParts` when absent |
+| 6 | API → Queue | Publish the validate message, **the only thing that starts a pipeline** |
+| 7 | Workers | Claim, fetch from S3, process, write output, record state, publish next stage |
 | 8 | App → API | Poll `GET /jobs/{id}`, then `GET /jobs/{id}/reel` when complete |
 | 9 | S3 → App | Stream `master.m3u8` with adaptive bitrate and captions |
 
@@ -168,90 +141,155 @@ Interrupted anywhere in step 7, the lease expires and the message is redelivered
 
 ---
 
-## 4. Key features
+## 4. Queue guarantees, and how each is enforced
+
+Replacing a managed broker with a self-hosted one means the guarantees stop being
+configuration and become code. Each row is a property the pipeline depends on,
+the mechanism that enforces it, and the reasoning behind both.
+
+| Guarantee | Technique | Why this property, and why this technique |
+|---|---|---|
+| **At-least-once delivery** | Claiming hides a message rather than removing it. It rejoins the visible set if its lease expires without an acknowledgement. | Exactly-once delivery cannot be built over an unreliable network: an acknowledgement can be lost *after* the work is done, and no protocol can distinguish that from work never done. At-least-once names the ambiguity instead of hiding it, and pushes correctness into idempotence, which is checkable inside a single process. The alternative, at-most-once, silently discards a user's video, which is the one outcome this product cannot tolerate. |
+| **Idempotent stages** | Each stage issues a `HeadObject` on its own output key before doing work, and skips straight to publishing if the object is already there. | At-least-once makes repeat execution certain, so every stage must be safe to run twice. The check targets the output *artifact* rather than a "processed" flag, because the artifact is what the next stage consumes: a flag can be set when the upload that mattered never durably landed. One metadata request against a bucket the stage was going to contact anyway is a cheap way to avoid repeating a transcode. |
+| **Duplicate distinguished from crash** | Two sources are consulted: presence of the output object, *and* the per-stage record in DynamoDB. | Output present with no recorded state is ambiguous from either source alone. It means either a redelivery after a run that completed, or a crash between writing the output and recording it. Those need opposite handling: skip in the first case, finish the record in the second. Collapsing them into a single boolean makes a correct decision impossible, so the ambiguity is resolved by asking two independent questions instead of trusting one. |
+| **One worker per message** | The claim is a single `UPDATE ... WHERE visible_at <= now ... RETURNING` statement. | A read followed by a separate write leaves a window in which two workers select the same row and both proceed. Expressing the claim as one statement delegates mutual exclusion to the storage engine's transaction, which already has to be correct for other reasons. An application-level lock was rejected because a lock held by a process that dies must be reclaimed on a timeout anyway; that means implementing leases regardless, and then maintaining two mechanisms that can disagree. |
+| **Recovery from worker death** | The claim writes a future timestamp into `visible_at`, a lease, rather than holding a lock. | A lease expires on its own; a lock needs its holder to release it, and a crashed holder never will. A worker that dies therefore holds nothing and needs no cleanup path. Time-based recovery also avoids a failure detector, a heartbeat quorum and a leader election, none of which are justifiable for a pipeline of this size. |
+| **Long stages keep their work** | The worker heartbeats, pushing `visible_at` further out while processing continues. | A single fixed timeout must be either long, which delays recovery from genuine crashes, or short, which redelivers work that is still running. Extension separates the two concerns: the timeout can be tuned for how quickly a crash should be noticed, while slow jobs hold their claim by proving they are alive. Transcription forced this, being the stage whose duration scales with input rather than staying roughly constant. |
+| **Late acknowledgements cannot destroy live work** | The claim mints an opaque receipt token. Acknowledgement deletes only if the stored receipt still matches, and returns a distinct lease-lost error when it does not. | A worker that overruns its lease may still finish and try to acknowledge, by which point another worker legitimately owns the message. An unconditional delete would remove a message being actively processed and lose the job with no error raised anywhere. The distinct error matters as much as the check: the overrunning worker has to learn that its result is not authoritative, rather than reporting success. |
+| **Poison messages cannot loop forever** | `receive_count` is incremented inside the same claim statement and compared against a delivery budget. | Without a bound, one unprocessable clip occupies a worker indefinitely and starves everything queued behind it. Incrementing during the *claim* rather than on failure means the counter records deliveries, which is the quantity worth bounding: a worker that crashes hard without reporting anything still consumes budget, which is the desired behaviour, because that is precisely the failure a retry will not fix. |
+| **Failures stay inspectable** | Dead-lettering is a column transition on the existing row, and the job's failure is written to DynamoDB *before* the message is moved. | A separate physical queue doubles the plumbing for no benefit at this scale; what is actually required is that the message stop being claimable while remaining readable. The write ordering is deliberate: the reverse order allows a crash between the two steps that leaves a job reading `running` forever while its message sits parked, which is the worst state to debug because nothing appears to be broken. |
+| **Survives process restart** | SQLite in WAL journal mode, with `synchronous=NORMAL` and a `busy_timeout`. | The queue exists to tolerate process death, so it cannot lose state on process death. WAL is chosen over the default rollback journal because readers do not block the writer, and the access pattern here is several polling readers against occasional writes. `busy_timeout` is needed because multiple processes share one file: without it a contended write returns `SQLITE_BUSY` immediately and surfaces as a spurious error rather than a short wait. |
+| **The queue never becomes a data store** | A message is a job ID, a stage name and an S3 key, roughly 300 bytes. Workers fetch the file themselves. | Putting bytes in the message would make throughput a queue problem and tie each stage to whichever worker produced its input. Passing pointers keeps workers stateless, so any replica can handle any message, and keeps message size independent of video size. That independence is what lets the same design hold for a 10-second clip and a 10-minute one. |
+| **The guarantees are portable** | One `Queue` interface with SQLite and SQS implementations, selected by `QUEUE_DRIVER`. | The semantics above are the contract the pipeline relies on; the storage engine is not. Keeping them behind an interface forced each one to be stated explicitly rather than inherited from a provider's defaults, which is what made this table writable at all. It also keeps the decision reversible: workers that must run on separate hosts can move to SQS without the pipeline changing. |
+
+---
+
+## 5. Key features
 
 - **Byte-exact upload resume** across app kill, process death and network loss
-- **Direct-to-S3 transfer** — the API is never in the data path
+- **Direct-to-S3 transfer.** The API is never in the data path
 - **Four-stage processing pipeline** with per-stage state and failure isolation
-- **Pluggable queue** — a self-hosted SQLite broker implementing SQS's semantics
-  (visibility timeouts, delivery counts, dead-letter queues) in a single file
-  with no server, and real SQS behind the same interface, chosen by one env var
+- **Pluggable queue.** A self-hosted SQLite broker implementing visibility
+  timeouts, delivery counts and dead-lettering in a single file with no server,
+  plus real SQS behind the same interface, chosen by one environment variable
 - **Adaptive-bitrate HLS** with a three-rung ladder and a selectable caption track
 - **Speech-to-text** via whisper.cpp, with a mock mode for fast iteration
-- **Idempotent by construction** — every stage is safe to run twice
-- **Zero containers locally** — two Go binaries and a file
+- **Idempotent by construction.** Every stage is safe to run twice
 
 ---
 
-## 5. Technical challenges
+## 6. Technical challenges
 
-**Presigned URLs are bound to a hostname.** SigV4 signs the `Host` header, so a
-URL presigned for one address cannot be string-replaced to another — the
-signature breaks. An API and a phone that reach storage under different names
-need the URL signed for the address the *uploader* will use, not the one the
-signer uses. This is invisible until the first upload from a real device.
+The hard parts of this project were architectural rather than syntactic. Most
+were decisions taken, reversed, and taken again as the constraints became clear.
 
-**Emulator parity is a trap, not a safety net.** An S3 emulator accepted a
-wildcard in a CORS `ExposeHeaders` rule that real S3 rejects outright with
-`InvalidRequest`. The class of bug is worse than the instance: local success
-proves nothing about a service that only enforces the rule in production.
+**Deciding where the compute lives.** The first question was whether the device
+or the backend does the processing, and it was not obvious. On-device processing
+needs no infrastructure, no upload of the original, and no per-minute costs. It
+loses on a single constraint: the reel has to be ready when the user next opens
+the app, which means the work must happen while the app is dead, and both mobile
+platforms strictly limit what a terminated application may do. Once that
+constraint is taken seriously the upload becomes the critical path, and the whole
+design reorients around never losing upload progress.
 
-**S3's 5 MiB part floor fails late.** Parts below the minimum upload happily,
-returning `200` each time, and the job fails at `CompleteMultipartUpload` with
-`EntityTooSmall` — after every part has apparently succeeded. The part size is
-therefore clamped in config rather than merely validated.
+**The cloud footprint was cut repeatedly.** A CDN, managed container hosting, an
+AWS emulator and a cache server were all planned, and all removed. Each had been
+justified by a scale this project does not have. A CDN in front of a handful of
+short clips adds a distribution to invalidate and a second access model to reason
+about, in exchange for caching that means little when a reel is watched once by
+the person who recorded it. Managed container hosting solves worker autoscaling,
+which is not a problem at four workers. The discipline that mattered was
+recording *why* each was removed, so the reasoning survives the deletion instead
+of leaving a future reader to rediscover it.
 
-**Writing a queue means writing the failure semantics.** Using SQS, visibility
-timeouts and redrive policies are configuration. Self-hosted, they are code: a
-message claim must be a single atomic statement, because a read followed by a
-separate write lets two workers claim the same job in the gap between them.
-Acknowledgement must verify the claim is still held, or a worker whose lease
-expired will delete a message another worker is actively processing.
+**Emulating the cloud locally turned out worse than using it.** A local S3
+emulator makes development free and offline, which is a real benefit. It also
+accepted configuration that real S3 rejects, and served unsigned reads to any
+bucket regardless of policy, which left the security model untestable locally
+while appearing to work. Provisioning code that set Block Public Access looked
+correct against the emulator and proved nothing. Emulator parity is a weaker
+guarantee than it appears, and the failures it hides are exactly the ones that
+surface in production. The decision was to point development at real AWS and
+accept a small bill instead of a false signal.
 
-**Distinguishing a duplicate from a crash.** At-least-once delivery makes "did
-this already run?" ambiguous — output present with no recorded state could mean a
-duplicate delivery, or a crash between uploading output and recording it. The two
-need different handling, so both the object and the stage state are consulted.
+**Containers stopped paying for themselves.** Docker earned its place when the
+stack was six services with an emulator and a cache server among them. Once those
+were gone the remaining system was two Go binaries and a file, and the container
+layer was providing process isolation nobody needed at the cost of a virtual
+machine's worth of memory. The useful part was noticing that the justification
+had expired, rather than treating the earlier decision as settled.
 
-**HLS cannot be delivered by presigning.** Playlists reference their segments by
-relative path, so a presigned master playlist yields `403` on every segment the
-player then requests. Adaptive streaming needs an access model, not a signed URL
-— and the emulator hid this too, by serving unsigned reads to any bucket. The
-opt-in, reversible bucket policy that resolves it, its blast radius and its
-teardown are documented in [`docs/aws-public-hls.md`](docs/aws-public-hls.md).
+**Replacing the managed queue meant owning its failure semantics.** With a hosted
+broker, visibility timeouts, delivery counts and redrive policies are
+configuration. Self-hosted, they are code that has to be correct: a claim must be
+one atomic statement, an acknowledgement must verify the claim is still held, and
+a retry budget has to be enforced somewhere. Writing them made the semantics
+explicit in a way that merely using them never had. Section 4 is the result.
 
-Each of these is written up with symptom, cause and fix in
-[`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
+**At-least-once delivery makes "has this already run?" genuinely ambiguous.**
+Output present with no recorded state can mean a duplicate delivery after a run
+that succeeded, or a crash in the window between writing the output and recording
+it. Those demand opposite responses, and no single flag can tell them apart. This
+was the design question that most changed how the pipeline is structured: it is
+why stages consult both the object store and the job record, and why every stage
+was written to be safe to run twice rather than trying to guarantee it never
+would be.
+
+**Background upload could not stay in JavaScript.** Requiring that an upload
+survive the app being killed rules out the JavaScript runtime entirely, because
+it dies with the app. That pushes the transfer into a platform-native scheduler,
+and the cost is a second language, a bridge, and a class of bug where the native
+module ships correctly but the JavaScript side cannot resolve it. A
+cross-platform framework does not exempt a project from platform-specific work;
+it concentrates that work at exactly the points where the platform's guarantees
+matter most.
+
+**The mobile dependency surface moved underneath the project.** The document
+picker chosen at planning time does not compile against the React Native version
+in use, is deprecated, and has no drop-in successor, so the choice had to be
+remade mid-build. Mobile dependencies churn faster than backend ones, and naming
+a library in a plan written weeks earlier is a weaker commitment than it looks.
+
+**Adaptive streaming needs an access model, not a signed URL.** HLS playlists
+reference their segments by relative path, so presigning a master playlist yields
+a working playlist whose every segment request returns 403. There is nowhere in
+the format to attach a signature. Delivery therefore requires deciding how the
+bucket itself is readable, which is a security decision with a blast radius
+rather than a URL-generation detail. The opt-in, reversible policy that resolves
+it is documented in [`docs/aws-public-hls.md`](docs/aws-public-hls.md), along
+with its cost exposure and how to turn it off.
+
+Implementation-level defects, with symptom, cause and fix, are recorded
+separately in [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
 
 ---
 
-## 6. What works today
+## 7. What works today
 
 - Pick a clip, queue it, and upload it in parts that survive app termination
 - Resume an interrupted upload, re-issuing URLs only for parts S3 does not hold
 - Abort an upload and release the parts S3 is still charging for
-- Run the full pipeline: validate → extract → transcribe → package
+- Run the full pipeline: validate, extract, transcribe, package
 - Produce a three-rung HLS ladder with a WebVTT caption track
 - Play a finished reel in-app with adaptive bitrate switching
 - Survive a worker being killed mid-stage without losing or duplicating work
 - Dead-letter a poisoned clip after a bounded number of attempts
-- Run the entire backend with no Docker, no emulator and no cache server
 
 ---
 
-## 7. Tech stack, and why
+## 8. Tech stack, and why
 
 | Layer | Choice | Reasoning |
 |---|---|---|
 | Backend | **Go** | Static binaries with no runtime; goroutines match the consume-process-publish shape; first-class AWS SDK |
 | Queue | **SQLite** (default) or **Amazon SQS** | A queue is a table with a "hidden until" timestamp. The self-hosted default needs no infrastructure and makes the semantics explicit rather than hiding them behind a service; SQS is selectable via `QUEUE_DRIVER` for when workers must run on more than one machine |
-| SQLite driver | **`modernc.org/sqlite`** | Pure Go — a cgo binding will not link in a `CGO_ENABLED=0` static build |
+| SQLite driver | **`modernc.org/sqlite`** | Pure Go; a cgo binding will not link in a `CGO_ENABLED=0` static build |
 | Storage | **S3** | The multipart API *is* the resume primitive: an upload ID, per-part ETags, and parts that can be retried individually |
 | Database | **DynamoDB** | Single-table access by job ID; on-demand billing means idle costs nothing |
 | Media | **ffmpeg** | The only realistic option for probing, remuxing and HLS packaging |
 | Speech | **whisper.cpp** | Runs locally with no per-minute API cost; a mock mode keeps iteration fast |
-| Mobile | **React Native** | One UI codebase; the platform-specific work is isolated to the parts that need it |
-| Background upload | **Kotlin + WorkManager** | The OS owns the schedule, so the upload is not tied to the app process — this cannot be done in JavaScript |
+| Mobile | **React Native** | One UI codebase, with platform-specific work isolated to the parts that genuinely need it |
+| Background upload | **Kotlin + WorkManager** | The OS owns the schedule, so the upload is not tied to the app process. This cannot be done in JavaScript |
 | Playback | **react-native-video / ExoPlayer** | Native HLS with adaptive bitrate and caption track selection |
 
 ### Why the architecture looks like this
@@ -261,22 +299,17 @@ retry. A transcription failure should not re-run the transcode that already
 succeeded, and each stage's output is a checkpoint the next run can skip past.
 
 **Why not process on the device?** The reel has to be ready when the user opens
-the app, which means the work happens while the app is dead — and both mobile
-platforms strictly limit what a terminated app may do.
+the app, so the work happens while the app is dead, and both mobile platforms
+strictly limit what a terminated app may do.
 
 **Why is S3 not replaceable?** Resumable upload is the product. Rebuilding
-multipart semantics — chunk registry, integrity, retry, cleanup of abandoned
-uploads — is the hardest part of the system, and S3 provides it directly.
-
-**Why was so much removed?** A CDN, managed container hosting, an AWS emulator
-and a cache server were all planned and all cut. At a handful of short clips they
-cost ~1.5–2.5 GB of local RAM and bought nothing. The rationale for each removal
-is recorded in [`PROJECT_PLAN.md`](PROJECT_PLAN.md) rather than lost to git
-history.
+multipart semantics (a chunk registry, integrity checking, per-part retry, and
+cleanup of abandoned uploads) is the hardest part of the system, and S3 provides
+it directly.
 
 ---
 
-## 8. Running it
+## 9. Running it
 
 ### Prerequisites
 
@@ -286,8 +319,8 @@ history.
 | ffmpeg + ffprobe | Worker stages |
 | AWS account | S3 and DynamoDB are real; there is no emulator |
 | AWS CLI v2 | Provisioning and verification |
-| Node.js 22.11+, JDK 17, Android SDK | Mobile |
-| sqlite3 CLI | Optional — for inspecting the queue |
+| Node.js 22.13+, JDK 21, Android SDK | Mobile |
+| sqlite3 CLI | Optional; for inspecting the queue |
 
 ### Setup
 
@@ -330,8 +363,8 @@ make sqs-teardown         # delete them when finished
 cd mobile && npm install && npx react-native run-android
 ```
 
-The Android emulator reaches the host at `10.0.2.2`, not `localhost` — point the
-app's API base URL there.
+The Android emulator reaches the host at `10.0.2.2` rather than `localhost`, so
+the app's API base URL points there.
 
 ### Configuration
 
@@ -340,7 +373,7 @@ this repository contains credentials; `.env` is git-ignored.
 
 ---
 
-## 9. Navigating the repo
+## 10. Navigating the repo
 
 ```
 backend/          Go API and workers          → backend/CONTEXT.md
@@ -361,11 +394,11 @@ does and which decisions are non-obvious. Start there, not in the code.
 | [`PROJECT_PLAN.md`](PROJECT_PLAN.md) | Architecture, design invariants, staging, and what was deliberately deferred |
 | [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) | Every non-trivial bug: symptom, cause, fix, prevention |
 | [`docs/SETUP.md`](docs/SETUP.md) | Provisioning walkthrough |
-| [`docs/aws-public-hls.md`](docs/aws-public-hls.md) | Why presigning cannot serve HLS, and the opt-in access model — including how to turn it off |
+| [`docs/aws-public-hls.md`](docs/aws-public-hls.md) | Why presigning cannot serve HLS, and the opt-in access model, including how to turn it off |
 | [`docs/stage-plans/`](docs/stage-plans/) | One plan per stage, written *before* implementation |
 | [`config/aws-limits.md`](config/aws-limits.md) | Service constraints the design had to bend around |
 | [`config/free-tier.md`](config/free-tier.md) | Budget guardrails and cost traps |
 
 Stage plans are records, not living documents. Superseded ones carry a banner and
-are kept in [`docs/stage-plans/superseded/`](docs/stage-plans/superseded/) —
-including the plans that were wrong, and why.
+are kept in [`docs/stage-plans/superseded/`](docs/stage-plans/superseded/),
+including the plans that turned out to be wrong and the reasons why.
