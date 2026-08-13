@@ -31,7 +31,7 @@
 #
 # WHAT HAS ACTUALLY BEEN RUN
 #
-# Exercised against real S3 on 2026-08-13, account 384627056323. With bucket BPA
+# Exercised against real S3 on 2026-08-13, account <account-id>. With bucket BPA
 # on and no policy, an anonymous GET of master.m3u8 was 403. After `enable`, the
 # master playlist, all three variant playlists, the .ts segments, the subtitle
 # playlist, the .vtt and thumbnail.jpg all returned 200 anonymously — while an

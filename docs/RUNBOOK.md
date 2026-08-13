@@ -16,7 +16,7 @@ than exists:
 - **ASSUMED** — believed, with a reason, never measured.
 - **UNKNOWN** — not measured, and do not guess.
 
-**This runs on real AWS, and as of 2026-08-13 it has.** Account `384627056323`,
+**This runs on real AWS, and as of 2026-08-13 it has.** Account `<account-id>`,
 IAM user `dayreel-dev`, `us-east-1`. S3 and DynamoDB are the genuine services; the
 queue is a SQLite file and the cache is a map inside the API process. There are no
 containers anywhere in the pipeline. The line this file used to carry here — *"no
@@ -27,14 +27,14 @@ on this account and the budget is $20 total.
 
 | Resource | Name |
 |---|---|
-| Raw uploads | `dayreel-raw-videos-3962bf6d` |
-| Intermediates | `dayreel-processed-3962bf6d` |
-| HLS output | `dayreel-hls-output-3962bf6d` |
+| Raw uploads | `dayreel-raw-videos-<suffix>` |
+| Intermediates | `dayreel-processed-<suffix>` |
+| HLS output | `dayreel-hls-output-<suffix>` |
 | Job table | `dayreel-jobs` |
 
 > ### OUTSTANDING TEARDOWN — the HLS bucket is public right now
 >
-> `dayreel-hls-output-3962bf6d` was opened for anonymous `GetObject` on
+> `dayreel-hls-output-<suffix>` was opened for anonymous `GetObject` on
 > 2026-08-13 to make playback work, and **has deliberately been left open at the
 > user's explicit choice.** It is the one thing in this project that leaves a real
 > AWS account worse than it found it. Close it when the demo is done:
@@ -359,7 +359,7 @@ against any bucket. That produced false confidence three times, most expensively
 when Stage 6A built `thumbnail_url` against `dayreel-processed`, a bucket with no
 read grant — every local run served it 200. The docs predicted a 403 on real S3.
 
-**They were right. VERIFIED 2026-08-13:** `dayreel-hls-output-3962bf6d` started
+**They were right. VERIFIED 2026-08-13:** `dayreel-hls-output-<suffix>` started
 with all four Block Public Access settings ON and no bucket policy, and an
 anonymous `GET` of `master.m3u8` returned **403**. Playback was genuinely blocked.
 `./scripts/aws-hls-public.sh enable` — which relaxes the two policy-guarding BPA
@@ -375,7 +375,7 @@ one bucket and nothing else in the account. This was **ASSUMED** before — and
 Stage 8 planning assumed the *opposite*, that opening a single bucket required
 disabling an account-wide guardrail. It did not.
 
-> Only `dayreel-hls-output-3962bf6d` has a read grant. Any client-facing URL
+> Only `dayreel-hls-output-<suffix>` has a read grant. Any client-facing URL
 > built against a different bucket is wrong regardless of what it returns. Check
 > the bucket in the URL, not the response code — and remember this one is open
 > **right now** (teardown note at the top of this file).

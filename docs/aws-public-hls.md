@@ -21,7 +21,7 @@ Every command below reads the bucket from the environment. **Export it first:**
 
 ```bash
 set -a; . ./.env; set +a
-echo "$S3_HLS_BUCKET"        # e.g. dayreel-hls-output-3962bf6d
+echo "$S3_HLS_BUCKET"        # e.g. dayreel-hls-output-<suffix>
 ```
 
 This is not stylistic. **S3 bucket names are globally unique**, so a plausible
@@ -257,8 +257,8 @@ make a `GetPublicAccessBlock` request against an account that doesn't have a
 `PublicAccessBlockConfiguration` set." Nothing about creating a bucket sets it.
 
 **The consequence for this project, now checked rather than guessed:** account
-384627056323 has no account-level BPA configuration —
-`aws s3control get-public-access-block --account-id 384627056323` returns
+<account-id> has no account-level BPA configuration —
+`aws s3control get-public-access-block --account-id <account-id>` returns
 `NoSuchPublicAccessBlockConfiguration`, and the script reports `account BPA : NONE`
 (confirmed 2026-08-13). So making this one bucket readable requires **only the
 bucket-level change**: no account-wide guardrail comes off because none is on,
@@ -469,7 +469,7 @@ never tested turned out wrong.
 - **That the variant playlists are ffmpeg's and the master is ours**, read from
   `backend/internal/media/hls.go` and `playlist.go`.
 - **That the script has the intended effect on real S3** — run against account
-  384627056323 on **2026-08-13**, which is what this section used to list as the
+  <account-id> on **2026-08-13**, which is what this section used to list as the
   one thing nobody had done. Before: bucket BPA on, no policy, anonymous
   `GET master.m3u8` → **403**. After `enable --yes`: `master.m3u8`, all three
   variant playlists, the `.ts` segments, the subtitle playlist, the `.vtt` and
@@ -479,7 +479,7 @@ never tested turned out wrong.
   the same run, `403`. The `GetObject`-without-`ListBucket` split is enforced, not
   merely intended.
 - **That this account has no account-level BPA.**
-  `aws s3control get-public-access-block --account-id 384627056323` returns
+  `aws s3control get-public-access-block --account-id <account-id>` returns
   `NoSuchPublicAccessBlockConfiguration`; `status` prints `account BPA : NONE`.
   So `--allow-account-bpa-change` is not needed here, `enable` skips step 1, and
   opening this bucket affects **only this bucket**. It is also not in an
@@ -496,7 +496,7 @@ never tested turned out wrong.
   The one real run above is what settled it, exactly as this section predicted it
   would have to.
 - **That the account-level findings generalise.** They are facts about account
-  384627056323 on 2026-08-13, not about accounts. On an account with account-level
+  <account-id> on 2026-08-13, not about accounts. On an account with account-level
   BPA set, or inside an Organizations BPA policy, the blast-radius argument above
   applies in full. `status` reports the truth in about a second; run it first.
 - **The cost figures**, which are carried over from `config/free-tier.md` rather than
