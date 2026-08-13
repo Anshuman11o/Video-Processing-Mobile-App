@@ -1,5 +1,19 @@
 # DayReel
 
+## Demo
+
+A clip picked in the app, uploaded in resumable parts to S3, processed through
+the four-stage pipeline, and played back as an adaptive-bitrate reel with
+generated captions — the whole path, in one take.
+
+<video src="https://github.com/Anshuman11o/Video-Processing-Mobile-App/raw/main/docs/assets/dayreel-demo.mp4" controls muted playsinline width="320"></video>
+
+> If the player above does not load, GitHub is not rendering the embed — watch
+> it directly at
+> [`docs/assets/dayreel-demo.mp4`](https://github.com/Anshuman11o/Video-Processing-Mobile-App/raw/main/docs/assets/dayreel-demo.mp4).
+
+---
+
 An offline-first mobile video app. Record short clips on a weak network; the app
 queues them locally and uploads in the background, resuming **from the exact byte
 it stopped at** even after the app is killed. A backend pipeline then validates,
