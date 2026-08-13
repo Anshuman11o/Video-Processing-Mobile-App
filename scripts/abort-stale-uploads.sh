@@ -37,7 +37,17 @@
 # the mechanism that actually reaps and the rule as a hope.
 set -uo pipefail
 
-BUCKET="${BUCKET:-dayreel-raw-videos}"
+# S3's namespace is global, so `dayreel-raw-videos` is a name this project does
+# not own and never will — it is a last-resort placeholder, not a default that
+# works. The real name lives in .env as S3_RAW_BUCKET. Same layered chain as
+# scripts/verify-resume.sh; like every script here, this one does not source
+# .env itself, so run it under `make` or after `set -a; . ./.env; set +a`.
+#
+# Getting this wrong is quiet in the direction that matters: listing a bucket
+# you do not own fails with "could not list uploads", which reads as "nothing is
+# in flight" to anyone skimming — the exact reassurance this script exists to
+# refuse to give.
+BUCKET="${BUCKET:-${S3_RAW_BUCKET:-dayreel-raw-videos}}"
 
 abort=0
 older_than_min=0
