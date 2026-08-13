@@ -1,24 +1,39 @@
 # Stage 8A: Background Upload
 
-> Status: **partially implemented; the headline feature is NOT verified.** All
-> seven decisions settled; the answers are recorded below and inline in each
+> Status: **VERIFIED on an Android emulator, 2026-08-13.** The stage's headline
+> claim — an upload survives the app being killed — is demonstrated, not argued.
+> All seven decisions settled; the answers are recorded below and inline in each
 > section.
 >
-> **What is real as of 2026-08-13:** the backend half is done and tested — the
-> re-presign endpoint, the tolerant `CompleteUpload`, `ListParts`, the abort
-> path, the lifecycle rule and the reaper script. **[DECIDE 7]** is resolved and
-> the toolchain exists (see the outcome note in that section). The Kotlin
-> WorkManager module compiles, is registered in `MainApplication.kt`, and ships
-> in the installed APK.
+> **The evidence.** Job `bf7b1af2-3c09-41c3-beef-aadf445ecdc8`, 14,947,952 bytes
+> in 3 parts. Part 1 landed, then `am force-stop com.dayreel`; the Activity count
+> went 4 → 0 and the launcher was on screen. The OS restarted the process
+> headless — no Activity, no JavaScript — and it logged
+> `round 1: 1/3 on S3, uploading 2 missing`. Parts 2 and 3 landed **with the app
+> dead**. `head-object` reports `ContentLength 14947952` and ETag `…-3`, so the
+> assembled object is byte-identical to the source; all four pipeline stages
+> completed and `GET /jobs/{id}/reel` returned 200.
 >
-> **What is not:** **no background upload has ever been observed to run.** At the
-> last check, JavaScript could not resolve the `DayReelUpload` native module, so
-> `isBackgroundUploadAvailable()` returns false and `HomeScreen` falls back —
-> silently, by design — to the foreground uploader from Stage 7. That fallback is
-> why the verified Stage 7 run says nothing about this stage. **The stage's own
-> verification — start an upload, kill the app, watch it finish — has not been
-> run.** Until it has, treat "upload survives app kill" as UNVERIFIED regardless
-> of how much of the code exists.
+> **The bug that made this look impossible for most of the day**, recorded
+> because it will be re-introduced by anyone who "tidies up" the registration:
+> the module was flagged `isTurboModule = true`. Under the New Architecture that
+> makes the C++ half look for a codegen-generated spec, which only exists when
+> `package.json` carries a `codegenConfig` block — it does not — so
+> `getTurboModule` returned `nullptr`; meanwhile `getLegacyModule` skips anything
+> flagged as a TurboModule. The module resolved via **neither** path and JS saw
+> null. It is registered as a **legacy** module for that reason. Note also that
+> bridgeless RN installs no `__turboModuleProxy`, so `TurboModuleRegistry.get`
+> and `NativeModules.X` are the same lookup — a `??` chain between them is not a
+> fallback.
+>
+> **What is still UNKNOWN.** `setForeground` was refused on every run
+> (`startForegroundService() not allowed due to mAllowStartForeground false`), so
+> **no foreground service ever actually ran** — the worker completed as ordinary
+> deferrable work. The claim is verified for a ~40-second upload; it is **not**
+> verified against Doze or a long upload, which is precisely the case the
+> foreground service exists for. Separately, `/upload-urls` treats a wrong-sized
+> part as present, so a truncated part cannot be re-presigned and the client can
+> only abort; the server-side fix is not done.
 >
 > | | Settled as |
 > |---|---|
