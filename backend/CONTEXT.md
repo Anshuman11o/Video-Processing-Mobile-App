@@ -1,26 +1,49 @@
-# Backend (Go API)
+# Backend (Go)
 
-Go HTTP API for DayReel video processing pipeline. Handles job creation, presigned URL generation for direct-to-S3 uploads, upload completion, and job status retrieval. Never touches video bytes.
+Two binaries share one module. `cmd/api` is the HTTP API — job creation,
+presigned URL generation for direct-to-S3 uploads, upload completion and
+resumption, job status. It never touches video bytes: the phone uploads straight
+to S3 and the workers read from it. `cmd/worker` is the pipeline; one binary
+serves every stage and `WORKER_STAGE` selects which.
 
 ## Structure
 
 ```
 backend/
-├── cmd/api/main.go              # Entry point, wires dependencies, starts server
+├── cmd/
+│   ├── api/main.go              # API entry point, wires dependencies, starts server
+│   └── worker/main.go           # Worker entry point, WORKER_STAGE picks the stage
 ├── internal/
 │   ├── api/
-│   │   ├── handlers.go          # HTTP handlers (CreateJob, CompleteUpload, GetJobStatus, GetReel)
+│   │   ├── handlers.go          # HTTP handlers (CreateJob, ResumeUpload, CompleteUpload, AbortUpload, GetJobStatus, GetReel)
 │   │   ├── router.go            # gorilla/mux route setup
 │   │   └── middleware.go        # Logging + CORS middleware
-│   ├── cache/redis.go           # Redis client for job status caching (10s TTL)
+│   ├── cache/memory.go          # In-process TTL cache for job status (10s)
 │   ├── config/config.go         # Environment-based configuration
-│   ├── db/dynamodb.go           # DynamoDB CRUD for jobs (single-table design)
-│   ├── events/messages.go       # SQS message types and queue/bucket constants
+│   ├── db/                      # DynamoDB CRUD for jobs and stage state
+│   ├── events/                  # Stage message types, queue/bucket constants, extract manifest
+│   ├── media/                   # ffmpeg/ffprobe wrappers, HLS ladder, playlists
 │   ├── models/job.go            # Job, StageState, UploadInfo data models
-│   └── storage/s3.go            # S3 multipart upload + presigned URL generation
-├── Dockerfile                   # Multi-stage Go build
+│   ├── queue/                   # Broker: SQLite (default) or SQS, one interface (see its CONTEXT.md)
+│   ├── storage/                 # S3 multipart upload, presigned URLs, whole-object I/O
+│   ├── transcribe/              # whisper.cpp and the mock transcriber
+│   └── worker/                  # Shared consume loop plus the four stages
 ├── go.mod / go.sum
 ```
+
+## What is and isn't AWS
+
+S3 and DynamoDB are always real AWS — there is no emulator. The status cache
+lives in the API's own memory. The queue is a choice: `QUEUE_DRIVER=sqlite` (the
+default) is a local file at `QUEUE_DB_PATH` and touches no AWS service at all,
+while `QUEUE_DRIVER=sqs` is real Amazon SQS and needs the queues created first
+(`make sqs-setup`). Either way the AWS SDK's default credential chain must
+resolve: environment variables, `~/.aws/credentials`, or an instance/task role.
+Nothing injects static test credentials any more.
+
+The SQLite driver is the pure-Go `modernc.org/sqlite`, which registers itself as
+`sqlite` and not `sqlite3`. A cgo binding such as `mattn/go-sqlite3` would not
+link in a `CGO_ENABLED=0` build.
 
 ## API Endpoints
 
@@ -28,25 +51,75 @@ backend/
 |--------|------|-------------|
 | GET | /health | Health check |
 | POST | /jobs | Create job, get presigned upload URLs |
-| POST | /jobs/{id}/complete | Signal upload completion |
-| GET | /jobs/{id} | Get job status (cached via Redis) |
+| POST | /jobs/{id}/upload-urls | Re-issue presigned URLs for the parts S3 does not hold |
+| POST | /jobs/{id}/complete | Complete the upload; enqueues the validate stage |
+| DELETE | /jobs/{id}/upload | Abort the upload and release the parts S3 is holding |
+| GET | /jobs/{id} | Get job status (10s in-process cache, DynamoDB on miss) |
 | GET | /jobs/{id}/reel | Get HLS playback URL (completed jobs only) |
 
 ## Data Flow
 
-1. Client POSTs /jobs with filename + size
-2. API creates S3 multipart upload, generates presigned URLs, saves job to DynamoDB
-3. Client uploads parts directly to S3 using presigned URLs
-4. Client POSTs /jobs/{id}/complete with ETags
-5. API completes S3 multipart upload, updates job status to "processing"
-6. S3 event notification triggers validate queue (configured in LocalStack init)
+1. Client POSTs `/jobs` with filename + size
+2. API creates the S3 multipart upload, presigns one URL per part, writes the job to DynamoDB
+3. Client uploads parts **directly to S3** using those URLs — the API is not in the data path
+4. Client POSTs `/jobs/{id}/complete`; the part list is optional, and is derived from `ListParts` when absent
+5. API completes the S3 multipart upload and records the upload as finished
+6. API publishes a validate `StageMessage` to the local queue — **this is what starts the pipeline**
+7. Each worker stage consumes its queue, writes its output to S3, records stage state, and publishes the next stage
+
+Step 6 used to be an S3 event notification wired up by the LocalStack init
+script. Real S3 cannot notify a SQLite file, so the API is now the sole trigger.
+That is also why a failed enqueue is a 500 with code `QUEUE_ERROR` rather than a
+logged warning: nothing else will ever start that job. `CompleteMultipartUpload`
+is idempotent so the retry works, and an already-complete upload arriving at
+`/complete` again resumes at step 6 instead of being rejected.
+
+## Pipeline
+
+`validate → extract → transcribe → package`, one queue per stage. The shared
+consume loop is `internal/worker/runner.go`; a stage only implements `Process`
+and says where its output goes.
+
+Delivery is at-least-once, so **every stage must be idempotent**. The runner
+checks for the stage's output object before doing any work, and consults the
+recorded stage state to tell a duplicate delivery apart from a crash between
+uploading the output and recording it.
+
+Retries are the runner's decision, not the broker's — there is no redrive policy
+to lean on:
+
+| Failure | What happens |
+|---------|--------------|
+| Permanent (`worker.Permanent`) — bad codec, corrupt file | Stage recorded failed, message dead-lettered immediately |
+| Transient, budget left | `Nack` with a doubling backoff; stage stays `running` |
+| Transient, `QUEUE_MAX_DELIVERIES` reached | Stage recorded failed, message dead-lettered |
+| Worker crash / lost lease | Lease expires, message redelivered; the budget check dead-letters it once spent |
+
+Stages slower than `QUEUE_VISIBILITY_TIMEOUT` heartbeat their lease every 30s.
+If one runs past its lease anyway, another worker claims the message and the
+first worker's `Ack` fails with `queue.ErrLeaseLost` — logged, not treated as a
+stage failure.
 
 ## Running
 
 ```bash
-# Via Docker Compose (from infra/)
-docker-compose up -d --build api
-
-# Locally
 cd backend && go run ./cmd/api
+WORKER_STAGE=validate go run ./cmd/worker
 ```
+
+Requires a `.env` with working AWS credentials (see `.env.example`). On the
+SQLite driver the queue database and its parent directory are created on first
+start by whichever binary starts first; on the SQS driver the queues must exist
+already, and a missing one fails at the first receive rather than at boot.
+
+## Tests
+
+```bash
+cd backend && go test ./...
+```
+
+No test needs AWS, LocalStack, or a running queue: the SQLite queue tests use a
+temporary file, the SQS driver tests exercise its request shaping and error
+translation without opening a socket, and the presigning tests sign with
+credentials they put in the environment themselves. The media tests skip when
+`ffmpeg` is absent.

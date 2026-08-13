@@ -15,15 +15,29 @@ import (
 	"github.com/anshumanagarwal/dayreel/internal/config"
 )
 
-// localConfig mirrors the compose environment: the API reaches S3 at an
-// in-cluster hostname, and clients reach it somewhere else entirely.
-func localConfig() *config.Config {
+// staticCredentials puts credentials in the environment for the duration of a
+// test.
+//
+// Presigning is pure signing arithmetic — no request leaves the process — but
+// the SDK still needs a key to sign with, and the default credential chain now
+// has no emulator branch to fall back on. Without this the chain would reach for
+// IMDS and the test would fail on a machine that simply has no AWS account
+// configured.
+func staticCredentials(t *testing.T) {
+	t.Helper()
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+}
+
+// publicEndpointConfig is a deployment whose clients reach the objects at a host
+// the SDK would not resolve on its own — a bucket exposed under a custom domain,
+// or an S3-compatible endpoint in front of it.
+func publicEndpointConfig() *config.Config {
 	return &config.Config{
 		AWSRegion:        "us-east-1",
-		AWSEndpoint:      "http://localstack:4566",
-		S3PublicEndpoint: "http://10.0.2.2:4566",
+		S3PublicEndpoint: "https://media.dayreel.example",
 		S3RawBucket:      "dayreel-raw-videos",
-		UseLocalStack:    true,
 	}
 }
 
@@ -33,11 +47,13 @@ func localConfig() *config.Config {
 // This is the stage 7 regression guard aimed at stage 8A's new code path: the
 // resume handler presigns the same parts a second time, and a handler that
 // built its own presign call instead of reusing GeneratePresignedUploadURL
-// would sign the in-cluster hostname. The URL would look right, upload fine
-// from inside the compose network, and be unusable from the device — which is
-// the bug stage 7 existed to fix.
+// would sign whatever host the SDK resolved. The URL would look right, upload
+// fine from the server, and be unusable from the device — which is the bug
+// stage 7 existed to fix.
 func TestPresignedUploadURLSignsPublicEndpoint(t *testing.T) {
-	client, err := NewS3Client(context.Background(), localConfig())
+	staticCredentials(t)
+
+	client, err := NewS3Client(context.Background(), publicEndpointConfig())
 	if err != nil {
 		t.Fatalf("new s3 client: %v", err)
 	}
@@ -53,11 +69,8 @@ func TestPresignedUploadURLSignsPublicEndpoint(t *testing.T) {
 		t.Fatalf("parse presigned url %q: %v", raw, err)
 	}
 
-	if parsed.Host != "10.0.2.2:4566" {
-		t.Errorf("presigned host = %q, want the public endpoint 10.0.2.2:4566", parsed.Host)
-	}
-	if parsed.Host == "localstack:4566" {
-		t.Errorf("presigned against the in-cluster endpoint; no client can reach it")
+	if parsed.Host != "media.dayreel.example" {
+		t.Errorf("presigned host = %q, want the public endpoint media.dayreel.example", parsed.Host)
 	}
 
 	// Path style, or the bucket moves into a hostname that does not resolve.
@@ -75,10 +88,15 @@ func TestPresignedUploadURLSignsPublicEndpoint(t *testing.T) {
 	}
 }
 
-// On real AWS both endpoints are the same and the override must disappear
-// rather than sign something invented.
+// The normal case on real AWS: nothing is configured, so nothing is overridden
+// and the SDK signs the genuine regional endpoint. The override mechanism has to
+// disappear on this path rather than sign something invented — a URL signed for
+// a host that does not exist fails with SignatureDoesNotMatch, which reads as a
+// credentials problem and is not one.
 func TestPresignedUploadURLWithoutPublicEndpoint(t *testing.T) {
-	cfg := localConfig()
+	staticCredentials(t)
+
+	cfg := publicEndpointConfig()
 	cfg.S3PublicEndpoint = ""
 
 	client, err := NewS3Client(context.Background(), cfg)
@@ -86,7 +104,7 @@ func TestPresignedUploadURLWithoutPublicEndpoint(t *testing.T) {
 		t.Fatalf("new s3 client: %v", err)
 	}
 	if client.presignEndpoint != "" {
-		t.Errorf("presignEndpoint = %q, want empty when public and internal agree", client.presignEndpoint)
+		t.Errorf("presignEndpoint = %q, want empty when no public endpoint is set", client.presignEndpoint)
 	}
 
 	raw, err := client.GeneratePresignedUploadURL(
@@ -98,8 +116,10 @@ func TestPresignedUploadURLWithoutPublicEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse presigned url: %v", err)
 	}
-	if parsed.Host != "localstack:4566" {
-		t.Errorf("presigned host = %q, want the configured endpoint", parsed.Host)
+	// Virtual-hosted style against real S3, which is what the SDK does when no
+	// BaseEndpoint is forced on it.
+	if parsed.Host != "dayreel-raw-videos.s3.us-east-1.amazonaws.com" {
+		t.Errorf("presigned host = %q, want the regional S3 endpoint", parsed.Host)
 	}
 }
 

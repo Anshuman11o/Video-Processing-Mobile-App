@@ -41,21 +41,31 @@ type Options struct {
 	Ladder         []media.Rendition
 	SegmentSeconds int
 
-	// PublicEndpoint is the base URL a player will use to fetch HLS output.
+	// PublicEndpoint is the base URL a player will use to fetch HLS output,
+	// when that is not the endpoint S3 itself serves the bucket on.
 	//
-	// This is the same unresolved problem as the presigned-URL finding from 4A:
-	// inside compose the endpoint is http://localstack:4566, which does not
-	// resolve anywhere else. Left as configuration rather than solved here,
-	// because the real-AWS access model is a deliberate open question.
+	// Reels are served straight out of the HLS bucket with no CDN in front, so
+	// the host a player must reach is a deployment decision and stays
+	// configurable. It used to be forced: inside compose the endpoint was
+	// http://localstack:4566, which resolved nowhere else.
+	//
+	// Empty is the normal setting on real AWS and means "S3's own endpoint for
+	// this bucket", which publicURL derives from Region. It used to mean
+	// something much worse — see the note on publicURL.
 	PublicEndpoint string
+
+	// Region is the bucket's AWS region, used only to derive the endpoint when
+	// PublicEndpoint is empty. Ignored when PublicEndpoint is set.
+	Region string
 }
 
-// DefaultOptions returns options for the given public endpoint.
-func DefaultOptions(publicEndpoint string) Options {
+// DefaultOptions returns options for the given public endpoint and region.
+func DefaultOptions(publicEndpoint, region string) Options {
 	return Options{
 		Ladder:         DefaultLadder,
 		SegmentSeconds: SegmentSeconds,
 		PublicEndpoint: publicEndpoint,
+		Region:         region,
 	}
 }
 
@@ -294,7 +304,7 @@ func (s *Stage) Finalize(ctx context.Context, msg *events.StageMessage, outputKe
 	// so a stored thumbnail_url can never name something that was never copied.
 	published := frameKey != "" && s.publishThumbnail(ctx, msg.JobID, frameKey)
 
-	output := buildOutput(s.opts.PublicEndpoint, s.hlsBucket, msg.JobID, outputKey, duration, published)
+	output := buildOutput(s.opts.PublicEndpoint, s.opts.Region, s.hlsBucket, msg.JobID, outputKey, duration, published)
 
 	var totalMs int64
 	if !job.CreatedAt.IsZero() {
@@ -372,20 +382,45 @@ func (s *Stage) publishThumbnail(ctx context.Context, jobID, frameKey string) bo
 // decidable without S3. Every URL handed to a client names hlsBucket, because
 // it is the only bucket whose read access is settled.
 func buildOutput(
-	endpoint, hlsBucket, jobID, masterKey string, duration float64, hasThumbnail bool,
+	endpoint, region, hlsBucket, jobID, masterKey string, duration float64, hasThumbnail bool,
 ) *models.OutputInfo {
 	out := &models.OutputInfo{
-		HLSURL:          publicURL(endpoint, hlsBucket, masterKey),
+		HLSURL:          publicURL(endpoint, region, hlsBucket, masterKey),
 		DurationSeconds: duration,
 	}
 	if hasThumbnail {
-		out.ThumbnailURL = publicURL(endpoint, hlsBucket, thumbnailKey(jobID))
+		out.ThumbnailURL = publicURL(endpoint, region, hlsBucket, thumbnailKey(jobID))
 	}
 	return out
 }
 
 // publicURL builds a browser-reachable URL for an object.
-func publicURL(endpoint, bucket, key string) string {
+//
+// An explicit endpoint is treated as a prefix in front of the bucket, because
+// that is what a proxy or an emulator needs: one host serving many buckets,
+// addressed path-style.
+//
+// Empty means real S3, and there the bucket is not a path segment — it is part
+// of the host. Formatting it path-style against an empty endpoint produced
+// "/dayreel-hls-output/<job>/master.m3u8": no scheme, no host, and nothing a
+// player can resolve. Since S3_PUBLIC_ENDPOINT is documented as empty on real
+// AWS, that was the hls_url every completed job actually handed back. It went
+// unnoticed because under the emulator the endpoint was always set, so the
+// path-style format was correct for exactly as long as an emulator existed.
+//
+// Virtual-hosted style is the form S3 wants: path-style addressing is deprecated
+// for buckets created after September 2020, so deriving the path-style URL
+// instead would have been a second, slower bug.
+func publicURL(endpoint, region, bucket, key string) string {
+	if endpoint == "" {
+		if region == "" {
+			// Only reachable if a caller passes neither. us-east-1 is wrong for a
+			// bucket elsewhere, but it is a resolvable host that fails loudly on
+			// a redirect, rather than a path that resolves to nothing anywhere.
+			region = "us-east-1"
+		}
+		return fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", bucket, region, key)
+	}
 	base := strings.TrimSuffix(endpoint, "/")
 	return fmt.Sprintf("%s/%s/%s", base, bucket, key)
 }

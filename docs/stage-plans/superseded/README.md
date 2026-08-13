@@ -16,3 +16,8 @@ independently, both sets arrived at the `extract.json` manifest, never upscaling
 a rendition above its source, and treating package as a terminal stage. Where
 they differ from the active plans, the active plans won on evidence, not
 authorship.
+
+Everything in this directory also predates the infrastructure change: Docker
+Compose, LocalStack, SQS and Redis are gone, S3 and DynamoDB are real AWS, and
+the queue is a local SQLite file. Read every `--endpoint-url`, `docker compose`
+and SQS reference here as history. See `infra/CONTEXT.md`.

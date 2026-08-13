@@ -27,9 +27,11 @@ func TestOutputKeyIsTheMasterPlaylist(t *testing.T) {
 	}
 }
 
+// An explicit endpoint addresses buckets path-style, because the thing it names
+// is a proxy in front of many buckets rather than S3 itself.
 func TestPublicURL(t *testing.T) {
-	got := publicURL("http://localhost:4566", "dayreel-hls-output", "job-1/master.m3u8")
-	want := "http://localhost:4566/dayreel-hls-output/job-1/master.m3u8"
+	got := publicURL("https://media.example.com", "us-east-1", "dayreel-hls-output", "job-1/master.m3u8")
+	want := "https://media.example.com/dayreel-hls-output/job-1/master.m3u8"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
@@ -38,38 +40,82 @@ func TestPublicURL(t *testing.T) {
 // A trailing slash on the configured endpoint would otherwise produce a double
 // slash, which some players reject and others silently resolve differently.
 func TestPublicURLTrimsTrailingSlash(t *testing.T) {
-	if got := publicURL("http://localhost:4566/", "b", "k"); got != "http://localhost:4566/b/k" {
+	if got := publicURL("https://media.example.com/", "us-east-1", "b", "k"); got != "https://media.example.com/b/k" {
 		t.Errorf("trailing slash not handled: %q", got)
+	}
+}
+
+// The real-AWS case, and the one that was broken: S3_PUBLIC_ENDPOINT is
+// documented as empty there, which used to format as "/bucket/key" — a URL with
+// no scheme and no host, which is what every completed job returned as hls_url.
+// The bucket belongs in the host on real S3, not in the path.
+func TestPublicURLEmptyEndpointUsesRegionalS3Host(t *testing.T) {
+	got := publicURL("", "eu-west-1", "dayreel-hls-output", "job-1/master.m3u8")
+	want := "https://dayreel-hls-output.s3.eu-west-1.amazonaws.com/job-1/master.m3u8"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// Guards the property that actually matters to a player, independently of the
+// exact host: the URL has to be absolute. An empty endpoint is the real-AWS
+// default, so the zero-value case must not produce a bare path.
+func TestPublicURLIsAlwaysAbsolute(t *testing.T) {
+	for _, tc := range []struct{ endpoint, region string }{
+		{"", "us-east-1"},
+		{"", ""}, // neither supplied — the fallback
+		{"https://media.example.com", ""},
+	} {
+		got := publicURL(tc.endpoint, tc.region, "bucket", "job-1/master.m3u8")
+		if !strings.HasPrefix(got, "http://") && !strings.HasPrefix(got, "https://") {
+			t.Errorf("publicURL(%q, %q, ...) = %q, which no player can resolve",
+				tc.endpoint, tc.region, got)
+		}
 	}
 }
 
 // The bug this guards against: thumbnail_url was built against the processed
 // bucket, which has no public-read policy and no CORS, and which stage 1A puts
 // on a 7-day delete. It resolved anyway in every local run, because LocalStack
-// Community serves unsigned GETs to any bucket regardless of policy (see
-// docs/SETUP.md). That is why this is asserted here rather than end to end:
-// **the 403 is not reproducible against LocalStack**, so no integration test in
-// this project can catch a URL pointing at an unreadable bucket. Only the
-// construction can be pinned down, and this pins it down negatively — any
-// bucket other than the HLS one is a failure, not just the one that was wrong.
+// Community served unsigned GETs to any bucket regardless of policy. That is why
+// this is asserted here rather than end to end: the 403 was not reproducible
+// against the emulator, so no integration test in this project could catch a URL
+// pointing at an unreadable bucket. Only the construction can be pinned down,
+// and this pins it down negatively — any bucket other than the HLS one is a
+// failure, not just the one that was wrong.
+//
+// The emulator is gone, which removes the false assurance but not the need for
+// this test: nothing in a local run reaches real S3's authorization either.
+// Both endpoint forms are checked, because the real-AWS one puts the bucket in
+// the HOST rather than the path — a prefix check written for one form proves
+// nothing about the other.
 func TestBuildOutputNeverNamesABucketOtherThanHLS(t *testing.T) {
-	out := buildOutput("http://10.0.2.2:4566", "dayreel-hls-output", "job-1", "job-1/master.m3u8", 6.02, true)
-
-	for name, got := range map[string]string{
-		"hls_url":       out.HLSURL,
-		"thumbnail_url": out.ThumbnailURL,
+	for _, tc := range []struct{ name, endpoint, region, wantPrefix string }{
+		{"proxy endpoint", "https://media.example.com", "us-east-1",
+			"https://media.example.com/dayreel-hls-output/"},
+		{"real AWS", "", "us-east-1",
+			"https://dayreel-hls-output.s3.us-east-1.amazonaws.com/"},
 	} {
-		if got == "" {
-			t.Fatalf("%s is empty", name)
-		}
-		if !strings.HasPrefix(got, "http://10.0.2.2:4566/dayreel-hls-output/") {
-			t.Errorf("%s = %q, which is not in dayreel-hls-output — "+
-				"a client cannot read any other bucket on real S3", name, got)
-		}
-	}
+		t.Run(tc.name, func(t *testing.T) {
+			out := buildOutput(tc.endpoint, tc.region, "dayreel-hls-output", "job-1", "job-1/master.m3u8", 6.02, true)
 
-	if want := "http://10.0.2.2:4566/dayreel-hls-output/job-1/thumbnail.jpg"; out.ThumbnailURL != want {
-		t.Errorf("thumbnail_url = %q, want %q", out.ThumbnailURL, want)
+			for name, got := range map[string]string{
+				"hls_url":       out.HLSURL,
+				"thumbnail_url": out.ThumbnailURL,
+			} {
+				if got == "" {
+					t.Fatalf("%s is empty", name)
+				}
+				if !strings.HasPrefix(got, tc.wantPrefix) {
+					t.Errorf("%s = %q, which is not in dayreel-hls-output — "+
+						"a client cannot read any other bucket on real S3", name, got)
+				}
+			}
+
+			if want := tc.wantPrefix + "job-1/thumbnail.jpg"; out.ThumbnailURL != want {
+				t.Errorf("thumbnail_url = %q, want %q", out.ThumbnailURL, want)
+			}
+		})
 	}
 }
 
@@ -78,7 +124,7 @@ func TestBuildOutputNeverNamesABucketOtherThanHLS(t *testing.T) {
 // than advertising none: the field is optional and the client already handles
 // its absence, but it has no way to tell a 404 from a job still settling.
 func TestBuildOutputOmitsThumbnailWhenItWasNotPublished(t *testing.T) {
-	out := buildOutput("http://localhost:4566", "dayreel-hls-output", "job-1", "job-1/master.m3u8", 6.02, false)
+	out := buildOutput("", "us-east-1", "dayreel-hls-output", "job-1", "job-1/master.m3u8", 6.02, false)
 
 	if out.ThumbnailURL != "" {
 		t.Errorf("thumbnail_url = %q, want empty when the copy did not land", out.ThumbnailURL)

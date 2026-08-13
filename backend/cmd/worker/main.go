@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -47,20 +48,31 @@ func main() {
 		log.Fatalf("create dynamodb client: %v", err)
 	}
 
-	queueClient, err := queue.New(ctx, cfg)
+	// The same broker the API writes to, whichever QUEUE_DRIVER names. Nothing
+	// coordinates the stage runners in this process: on SQLite the database's
+	// own write lock is what makes a claim safe across processes, on SQS the
+	// visibility timeout is, and either way the four stages can be four separate
+	// binaries.
+	queueLogger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	queueClient, err := queue.FromConfig(ctx, cfg, queueLogger)
 	if err != nil {
-		log.Fatalf("create sqs client: %v", err)
+		log.Fatalf("open queue: %v", err)
 	}
+	defer func() {
+		if err := queueClient.Close(); err != nil {
+			log.Printf("worker[%s] close queue: %v", stageName, err)
+		}
+	}()
 
 	stage, err := buildStage(stageName, cfg, s3Client, dbClient)
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
 
-	log.Printf("worker starting: stage=%s localstack=%v endpoint=%s",
-		stageName, cfg.UseLocalStack, cfg.AWSEndpoint)
+	log.Printf("worker starting: stage=%s region=%s queue_driver=%s",
+		stageName, cfg.AWSRegion, cfg.QueueDriver)
 
-	if err := worker.NewRunner(stage, queueClient, dbClient, s3Client).Run(ctx); err != nil {
+	if err := worker.NewRunner(stage, queueClient, dbClient, s3Client, cfg).Run(ctx); err != nil {
 		log.Fatalf("worker: %v", err)
 	}
 
@@ -99,7 +111,7 @@ func buildStage(
 		return packager.New(
 			s3Client, dbClient,
 			cfg.S3HLSBucket, cfg.S3ProcessedBucket,
-			packager.DefaultOptions(cfg.PublicEndpoint()),
+			packager.DefaultOptions(cfg.PublicEndpoint(), cfg.AWSRegion),
 		), nil
 	default:
 		return nil, unknownStageError(name)
