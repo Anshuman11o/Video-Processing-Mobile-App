@@ -141,7 +141,25 @@ class UploadWorker(context: Context, params: WorkerParameters) :
                     return@withContext fail("FILE_MISMATCH")
                 }
 
+                // Presence is not correctness. See partSizeFaults.
+                val faults = partSizeFaults(plan, file.length())
+                if (faults.isNotEmpty()) {
+                    Log.e(TAG, "job $jobId: S3 holds wrong-sized parts: ${faults.joinToString()}")
+                    // No recovery is available from here: /upload-urls presigns
+                    // only the parts it considers missing, and it considers a
+                    // short part present, so this client can never obtain a URL
+                    // to overwrite it. Abort rather than complete a corrupt
+                    // object or retry forever against one.
+                    runCatching { api.abortUpload(jobId) }
+                        .onFailure { Log.w(TAG, "job $jobId: abort after size fault failed: $it") }
+                    return@withContext fail("PART_SIZE_MISMATCH")
+                }
+
                 reportProgress(plan.uploadedCount, plan.totalParts)
+
+                // Everything S3 holds for this upload, kept in step as parts go
+                // up so completion can assert the whole file is there.
+                var bytesOnS3 = plan.bytesOnS3
 
                 if (plan.missing.isEmpty()) {
                     // Every part is on S3 and the upload was never finalised.
@@ -149,6 +167,7 @@ class UploadWorker(context: Context, params: WorkerParameters) :
                     // ListParts gets right: the process that uploaded the last
                     // part may never have existed in this run at all.
                     Log.i(TAG, "job $jobId: all ${plan.totalParts} parts present; completing")
+                    assertWholeFileOnS3(jobId, bytesOnS3, file.length())
                     api.completeUpload(jobId)
                     deleteSourceCopy(file)
                     reportProgress(plan.totalParts, plan.totalParts)
@@ -204,11 +223,13 @@ class UploadWorker(context: Context, params: WorkerParameters) :
                     }
 
                     done++
+                    bytesOnS3 += length
                     reportProgress(done, plan.totalParts)
                 }
 
                 if (!expired && done >= plan.totalParts) {
                     Log.i(TAG, "job $jobId: uploaded ${plan.totalParts} parts; completing")
+                    assertWholeFileOnS3(jobId, bytesOnS3, file.length())
                     api.completeUpload(jobId)
                     deleteSourceCopy(file)
                     return@withContext Result.success(
@@ -242,6 +263,50 @@ class UploadWorker(context: Context, params: WorkerParameters) :
         } catch (e: Exception) {
             Log.e(TAG, "job $jobId: unexpected failure", e)
             Result.retry()
+        }
+    }
+
+    /**
+     * Parts S3 is holding at the wrong size, described for a log line.
+     *
+     * Stage 8A [DECIDE 2] made resume server-authoritative through ListParts,
+     * and ListParts answers "which part numbers exist" — not "are they intact".
+     * Killing this worker mid-PUT (which is 8A's own test method) can leave a
+     * part that was cut off in transit but is still listed, and the next run
+     * then skips it as already done.
+     *
+     * S3 catches that only by accident: a non-final part under 5 MiB fails the
+     * completion with EntityTooSmall. A truncation that happens to land above
+     * 5 MiB is accepted, and the assembled object has a hole in the middle that
+     * nothing downstream can see. Observed here as a 524288-byte part 2 of
+     * 5242880 after a force-stop, so this is not a hypothetical.
+     */
+    private fun partSizeFaults(plan: UploadApi.ResumePlan, fileLength: Long): List<String> =
+        plan.uploaded.mapNotNull { part ->
+            val start = (part.partNumber - 1).toLong() * plan.partSize
+            val expected = minOf(plan.partSize, fileLength - start)
+            if (part.size == expected) {
+                null
+            } else {
+                "part ${part.partNumber} is ${part.size}B, expected ${expected}B"
+            }
+        }
+
+    /**
+     * Refuse to finalise an upload whose bytes do not add up to the file.
+     *
+     * The per-part check above localises a fault; this one states the invariant
+     * that actually matters, and covers arithmetic that agrees with itself but
+     * not with the file. A successful CompleteMultipartUpload is not evidence
+     * the object is intact — it is only evidence S3 was willing to assemble it.
+     */
+    private fun assertWholeFileOnS3(jobId: String, bytesOnS3: Long, fileLength: Long) {
+        if (bytesOnS3 != fileLength) {
+            throw UploadApi.TerminalException(
+                "INCOMPLETE_OBJECT",
+                "job $jobId: S3 holds $bytesOnS3 bytes but the source is $fileLength; " +
+                    "refusing to complete an object with a hole in it",
+            )
         }
     }
 

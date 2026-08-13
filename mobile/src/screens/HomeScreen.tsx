@@ -6,6 +6,7 @@ import {
   StyleSheet,
   Alert,
   ActivityIndicator,
+  Platform,
 } from 'react-native';
 import {
   errorCodes,
@@ -17,8 +18,25 @@ import type {NativeStackNavigationProp} from '@react-navigation/native-stack';
 import type {RootStackParamList} from '../navigation/AppNavigator';
 import {blobTransport} from '../upload/blobTransport';
 import {UploadExpiredError} from '../upload/uploader';
-import {uploadVideo} from '../upload/uploadVideo';
+import {startBackgroundVideoUpload, uploadVideo} from '../upload/uploadVideo';
+import {isBackgroundUploadAvailable} from '../upload/nativeUploader';
 import {blobJobIndexStore} from '../storage/blobJobIndexStore';
+
+/**
+ * Slows the native worker so an upload can actually be interrupted.
+ *
+ * [DECIDE 6]: against LocalStack over loopback a multi-part upload finishes in
+ * well under a second, which leaves no window in which to kill the app and
+ * observe that the upload survived — the stage's entire claim. `__DEV__` gates
+ * it so a release build never carries it.
+ *
+ * 3s, not the 1.5s this started at, because the interesting kill is the one
+ * *between* parts — with no PUT in flight there is no half-sent part to confuse
+ * the resume. The 14.9 MB fixture is only 3 parts, and a host-driven kill takes
+ * about a second to land, so 1.5s was a coin flip on whether the process died
+ * in the gap or mid-body.
+ */
+const DEBUG_PART_DELAY_MS = __DEV__ ? 3000 : 0;
 
 type HomeScreenProps = {
   navigation: NativeStackNavigationProp<RootStackParamList, 'Home'>;
@@ -37,6 +55,34 @@ export default function HomeScreen({navigation}: HomeScreenProps) {
     }) => {
       setProgress(0);
       try {
+        // Prefer the background path: it is the one that survives the app
+        // being killed. It returns as soon as WorkManager has the work, not
+        // when the upload finishes, so the user goes straight to the job
+        // screen and watches it from there — which is also what they would
+        // see after relaunching mid-upload.
+        if (isBackgroundUploadAvailable()) {
+          const {jobId} = await startBackgroundVideoUpload({
+            video,
+            store: blobJobIndexStore,
+            debugPartDelayMs: DEBUG_PART_DELAY_MS,
+          });
+          setProgress(null);
+          navigation.navigate('Player', {jobId});
+          return;
+        }
+
+        // Fallback for any build without the native module — iOS, or an APK
+        // built before it existed. Uploads in the foreground and dies with the
+        // app, which is exactly the limitation 8A exists to remove. Taking this
+        // branch on Android means 8A is not working; it looks identical to
+        // success from the UI, so it is announced rather than assumed.
+        if (__DEV__ && Platform.OS === 'android') {
+          console.warn(
+            'Falling back to the foreground uploader: this upload will NOT ' +
+              'survive the app being killed.',
+          );
+        }
+
         const {jobId} = await uploadVideo({
           video,
           transport: blobTransport,

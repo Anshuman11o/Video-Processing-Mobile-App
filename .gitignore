@@ -27,6 +27,11 @@ tokens.json
 *.tfvars
 !*.tfvars.example
 
+# Agent worktree state. .claude/worktrees/ holds whole checkouts of other
+# branches, so committing this directory would vendor a second copy of the repo
+# into the repo.
+.claude/
+
 # IDE and editor
 .idea/
 .vscode/

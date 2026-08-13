@@ -11,15 +11,19 @@ import {
 import {useFocusEffect} from '@react-navigation/native';
 import Video, {
   SelectedTrackType,
+  SelectedVideoTrackType,
   type OnLoadData,
   type OnProgressData,
   type OnTextTrackDataChangedData,
   type OnTextTracksData,
   type OnVideoErrorData,
+  type OnVideoTracksData,
   type SelectedTrack,
+  type SelectedVideoTrack,
   type SubtitleStyle,
   type TextTrack,
   type VideoRef,
+  type VideoTrack,
 } from 'react-native-video';
 import type {NativeStackScreenProps} from '@react-navigation/native-stack';
 import type {RootStackParamList} from '../navigation/AppNavigator';
@@ -59,6 +63,25 @@ type PlayerScreenProps = NativeStackScreenProps<RootStackParamList, 'Player'>;
 const SELECTED_TEXT_TRACK: SelectedTrack = {
   type: SelectedTrackType.LANGUAGE,
   value: 'en',
+};
+
+/**
+ * Let ExoPlayer's adaptive bitrate logic pick the rendition.
+ *
+ * The default, and it should stay the default: ABR is what the three renditions
+ * in the master playlist are FOR. A manual pick pins the player to one variant
+ * for the rest of playback, so it belongs to the user choosing it, not to the
+ * screen opening.
+ *
+ * `SelectedVideoTrack` is the type the prop takes — checked against
+ * lib/types/video.d.ts rather than assumed, because the text-track equivalent
+ * exports two similar names that disagree (see SELECTED_TEXT_TRACK above).
+ * Video exports only this one, but the enum is used rather than the bare string
+ * 'auto' for the same reason: a wrong value has to fail at compile time, since
+ * at runtime an unrecognised type is simply ignored.
+ */
+const AUTO_VIDEO_TRACK: SelectedVideoTrack = {
+  type: SelectedVideoTrackType.AUTO,
 };
 
 /** White-on-white captions look exactly like no captions. */
@@ -107,6 +130,9 @@ export default function PlayerScreen({route}: PlayerScreenProps) {
   const videoRef = useRef<VideoRef | null>(null);
   const [paused, setPaused] = useState(false);
   const [textTracks, setTextTracks] = useState<TextTrack[] | null>(null);
+  const [videoTracks, setVideoTracks] = useState<VideoTrack[] | null>(null);
+  const [selectedVideoTrack, setSelectedVideoTrack] =
+    useState<SelectedVideoTrack>(AUTO_VIDEO_TRACK);
   const [currentCue, setCurrentCue] = useState<string | null>(null);
   const [position, setPosition] = useState(0);
   const [duration, setDuration] = useState<number | null>(null);
@@ -132,6 +158,14 @@ export default function PlayerScreen({route}: PlayerScreenProps) {
 
   const onTextTracks = useCallback((e: OnTextTracksData) => {
     setTextTracks([...e.textTracks]);
+  }, []);
+
+  const onVideoTracks = useCallback((e: OnVideoTracksData) => {
+    // Highest first, so the list reads the way the master playlist is written
+    // rather than in whatever order the track selector enumerated groups.
+    setVideoTracks(
+      [...e.videoTracks].sort((a, b) => (b.height ?? 0) - (a.height ?? 0)),
+    );
   }, []);
 
   const onTextTrackDataChanged = useCallback(
@@ -207,8 +241,10 @@ export default function PlayerScreen({route}: PlayerScreenProps) {
             controls
             resizeMode="contain"
             selectedTextTrack={SELECTED_TEXT_TRACK}
+            selectedVideoTrack={selectedVideoTrack}
             subtitleStyle={SUBTITLE_STYLE}
             progressUpdateInterval={250}
+            onVideoTracks={onVideoTracks}
             onTextTracks={onTextTracks}
             onTextTrackDataChanged={onTextTrackDataChanged}
             onLoad={onLoad}
@@ -257,7 +293,11 @@ export default function PlayerScreen({route}: PlayerScreenProps) {
           </>
         ) : null}
 
-        {reel ? (
+        {/* Dev-only. These are addresses of internal storage, useful for
+            reaching the same stream from another player while debugging and
+            meaningless to anyone else. __DEV__ is a compile-time constant, so
+            the whole block is dropped from a release bundle. */}
+        {reel && __DEV__ ? (
           <>
             <Text style={styles.label}>HLS URL</Text>
             {/* Kept selectable: it is still the fastest way to check the same
@@ -282,20 +322,34 @@ export default function PlayerScreen({route}: PlayerScreenProps) {
         ) : null}
 
         {reel ? (
-          <CaptionDiagnostics
-            textTracks={textTracks}
-            currentCue={currentCue}
-            position={position}
-            duration={duration}
-            authoredInput={authoredInput}
-            onAuthoredInput={setAuthoredInput}
-            probing={probing}
-            probeResult={probeResult}
-            probeError={probeError}
-            onProbe={runProbe}
-            onResume={() => setPaused(false)}
-            paused={paused}
-          />
+          <>
+            <VideoTrackPicker
+              videoTracks={videoTracks}
+              selected={selectedVideoTrack}
+              onSelect={setSelectedVideoTrack}
+            />
+            <CaptionDiagnostics
+              textTracks={textTracks}
+              currentCue={currentCue}
+              position={position}
+              duration={duration}
+              paused={paused}
+            />
+            {/* Dev-only: a measuring instrument, not a feature. It seeks the
+                player around and leaves it parked mid-clip. */}
+            {__DEV__ ? (
+              <CaptionOffsetProbe
+                authoredInput={authoredInput}
+                onAuthoredInput={setAuthoredInput}
+                probing={probing}
+                probeResult={probeResult}
+                probeError={probeError}
+                onProbe={runProbe}
+                onResume={() => setPaused(false)}
+                paused={paused}
+              />
+            ) : null}
+          </>
         ) : null}
 
         {failure ? (
@@ -367,38 +421,93 @@ function PlaceholderStage({
 }
 
 /**
- * The three-way caption diagnosis, plus the measured cue boundary.
+ * The renditions the master playlist offers, and which one is playing.
  *
- * The offset number is the reason this stage exists: 6A could not measure its
- * own caption defect because ffmpeg ignores X-TIMESTAMP-MAP, so a real player
- * is the only oracle. See src/player/captionProbe.ts for why it bisects rather
- * than watching the screen.
+ * Without this there is no way to tell a three-rendition ladder from a
+ * one-rendition one: ExoPlayer switches variants silently and the default
+ * control bar exposes audio and subtitle tracks but not video.
+ *
+ * The active row comes from `selected` — this screen's own state — and NOT from
+ * each track's `selected` flag. That flag is always false on Android:
+ * ReactExoplayerView.exoplayerVideoTrackToGenericVideoTrack builds every
+ * VideoTrack without ever calling setSelected, so trusting it would render a
+ * list where nothing is ever marked.
+ */
+function VideoTrackPicker({
+  videoTracks,
+  selected,
+  onSelect,
+}: {
+  videoTracks: VideoTrack[] | null;
+  selected: SelectedVideoTrack;
+  onSelect: (track: SelectedVideoTrack) => void;
+}) {
+  const isAuto = selected.type === SelectedVideoTrackType.AUTO;
+
+  return (
+    <>
+      <Text style={styles.label}>Video quality</Text>
+      <TouchableOpacity
+        style={[styles.trackRow, isAuto && styles.trackRowActive]}
+        onPress={() => onSelect(AUTO_VIDEO_TRACK)}>
+        <Text style={isAuto ? styles.trackTextActive : styles.trackText}>
+          Auto{isAuto ? ' ✓' : ''}
+        </Text>
+        <Text style={styles.trackDetail}>adaptive</Text>
+      </TouchableOpacity>
+
+      {videoTracks === null ? (
+        <Text style={styles.stageRow}>waiting for onVideoTracks…</Text>
+      ) : videoTracks.length === 0 ? (
+        <Text style={styles.error}>none reported by the player</Text>
+      ) : (
+        videoTracks.map(t => {
+          // Matched on height because that is what the RESOLUTION selector
+          // sends: setSelectedTrack compares `format.height == value`.
+          const active = !isAuto && selected.value === t.height;
+          return (
+            <TouchableOpacity
+              key={t.index}
+              style={[styles.trackRow, active && styles.trackRowActive]}
+              onPress={() =>
+                onSelect({
+                  // Selected by resolution rather than by index, for the same
+                  // reason the text track is selected by language: the index is
+                  // whatever order the track selector happened to enumerate.
+                  type: SelectedVideoTrackType.RESOLUTION,
+                  value: t.height,
+                })
+              }>
+              <Text style={active ? styles.trackTextActive : styles.trackText}>
+                {t.height}p{active ? ' ✓' : ''}
+              </Text>
+              <Text style={styles.trackDetail}>
+                {t.width}×{t.height}
+                {t.bitrate ? ` · ${(t.bitrate / 1_000_000).toFixed(1)} Mbps` : ''}
+              </Text>
+            </TouchableOpacity>
+          );
+        })
+      )}
+    </>
+  );
+}
+
+/**
+ * The three-way caption diagnosis: no track in the playlist, a track present
+ * but not selected, or a track selected that delivers no cues.
  */
 function CaptionDiagnostics({
   textTracks,
   currentCue,
   position,
   duration,
-  authoredInput,
-  onAuthoredInput,
-  probing,
-  probeResult,
-  probeError,
-  onProbe,
-  onResume,
   paused,
 }: {
   textTracks: TextTrack[] | null;
   currentCue: string | null;
   position: number;
   duration: number | null;
-  authoredInput: string;
-  onAuthoredInput: (v: string) => void;
-  probing: boolean;
-  probeResult: ProbeResult | null;
-  probeError: string | null;
-  onProbe: () => void;
-  onResume: () => void;
   paused: boolean;
 }) {
   return (
@@ -413,8 +522,14 @@ function CaptionDiagnostics({
       ) : (
         textTracks.map(t => (
           <Text key={t.index} style={styles.stageRow}>
-            #{t.index} {t.language ?? '??'} {t.title ?? '(untitled)'}{' '}
-            {t.selected ? '✓ selected' : '—'}
+            #{t.index} {t.language ?? '??'} {t.title ?? '(untitled)'}
+            {/* Only the positive case is shown. With `controls` set,
+                ReactExoplayerView reports text tracks through
+                getBasicTextTrackInfo, which calls setSelected(false) on every
+                one of them — "let PlayerView handle it". Printing a "—" for
+                false would therefore assert "not selected" about a track that
+                is in fact selected and rendering cues. */}
+            {t.selected ? ' ✓ selected' : ''}
           </Text>
         ))
       )}
@@ -429,7 +544,39 @@ function CaptionDiagnostics({
         {position.toFixed(3)}s{duration !== null ? ` / ${duration.toFixed(3)}s` : ''}
         {paused ? ' (paused)' : ''}
       </Text>
+    </>
+  );
+}
 
+/**
+ * The measured cue boundary. Development-only.
+ *
+ * The offset number is the reason this stage exists: 6A could not measure its
+ * own caption defect because ffmpeg ignores X-TIMESTAMP-MAP, so a real player
+ * is the only oracle. See src/player/captionProbe.ts for why it bisects rather
+ * than watching the screen.
+ */
+function CaptionOffsetProbe({
+  authoredInput,
+  onAuthoredInput,
+  probing,
+  probeResult,
+  probeError,
+  onProbe,
+  onResume,
+  paused,
+}: {
+  authoredInput: string;
+  onAuthoredInput: (v: string) => void;
+  probing: boolean;
+  probeResult: ProbeResult | null;
+  probeError: string | null;
+  onProbe: () => void;
+  onResume: () => void;
+  paused: boolean;
+}) {
+  return (
+    <>
       <Text style={styles.label}>Caption offset probe</Text>
       <View style={styles.probeRow}>
         <TextInput
@@ -552,6 +699,38 @@ const styles = StyleSheet.create({
   url: {
     color: '#6366f1',
     fontSize: 13,
+    fontFamily: 'monospace',
+  },
+  trackRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#262626',
+    backgroundColor: '#1a1a1a',
+    marginTop: 6,
+  },
+  trackRowActive: {
+    borderColor: '#6366f1',
+    backgroundColor: '#6366f122',
+  },
+  trackText: {
+    color: '#cccccc',
+    fontSize: 14,
+    fontFamily: 'monospace',
+  },
+  trackTextActive: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontWeight: '600',
+    fontFamily: 'monospace',
+  },
+  trackDetail: {
+    color: '#777777',
+    fontSize: 12,
     fontFamily: 'monospace',
   },
   probeRow: {

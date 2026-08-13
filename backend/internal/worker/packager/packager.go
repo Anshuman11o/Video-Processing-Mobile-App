@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,14 +45,13 @@ type Options struct {
 	// when that is not the endpoint S3 itself serves the bucket on.
 	//
 	// Reels are served straight out of the HLS bucket with no CDN in front, so
-	// the host a player must reach — a bucket website endpoint, a custom domain,
-	// eventually a distribution — is a deployment decision. It stays
-	// configurable for that reason.
+	// the host a player must reach is a deployment decision and stays
+	// configurable. It used to be forced: inside compose the endpoint was
+	// http://localstack:4566, which resolved nowhere else.
 	//
 	// Empty is the normal setting on real AWS and means "S3's own endpoint for
 	// this bucket", which publicURL derives from Region. It used to mean
-	// something much worse: the formatted URL began with a bare "/", so the
-	// hls_url handed to the client had no scheme and no host at all.
+	// something much worse — see the note on publicURL.
 	PublicEndpoint string
 
 	// Region is the bucket's AWS region, used only to derive the endpoint when
@@ -100,6 +100,13 @@ func (s *Stage) OutputBucket() string { return s.hlsBucket }
 // references every rendition playlist, which reference every segment. It is
 // uploaded last, so its existence means the whole tree landed.
 func (s *Stage) OutputKey(jobID string) string { return jobID + "/master.m3u8" }
+
+// thumbnailKey is where the poster frame is published, in the HLS bucket.
+//
+// A fixed name at the job root rather than the source frame's own key: which
+// frame was chosen is extract's business, and copying frames/frame_001.jpg
+// across would imply the rest of the frame set came with it.
+func thumbnailKey(jobID string) string { return jobID + "/thumbnail.jpg" }
 
 // Process transcodes the validated video into an HLS ladder and uploads it.
 func (s *Stage) Process(ctx context.Context, msg *events.StageMessage) (string, error) {
@@ -291,15 +298,13 @@ func (s *Stage) Finalize(ctx context.Context, msg *events.StageMessage, outputKe
 
 	// Duration and thumbnail come from the extract manifest rather than a fresh
 	// probe: extract already recorded both.
-	duration, thumbnailKey := s.outputDetails(ctx, msg.JobID)
+	duration, frameKey := s.outputDetails(ctx, msg.JobID)
 
-	output := &models.OutputInfo{
-		HLSURL:          s.publicURL(s.hlsBucket, outputKey),
-		DurationSeconds: duration,
-	}
-	if thumbnailKey != "" {
-		output.ThumbnailURL = s.publicURL(s.inputBucket, thumbnailKey)
-	}
+	// The URL is recorded only once the object is actually in the HLS bucket,
+	// so a stored thumbnail_url can never name something that was never copied.
+	published := frameKey != "" && s.publishThumbnail(ctx, msg.JobID, frameKey)
+
+	output := buildOutput(s.opts.PublicEndpoint, s.opts.Region, s.hlsBucket, msg.JobID, outputKey, duration, published)
 
 	var totalMs int64
 	if !job.CreatedAt.IsZero() {
@@ -343,34 +348,80 @@ func (s *Stage) outputDetails(ctx context.Context, jobID string) (float64, strin
 	return manifest.DurationSeconds, thumbnail
 }
 
+// publishThumbnail copies the poster frame into the HLS bucket, reporting
+// whether it landed.
+//
+// Extract writes frames to dayreel-processed, and that bucket is not something
+// a client can be pointed at. It carries no public-read policy and no CORS
+// (init-aws.sh grants both to dayreel-hls-output only), it holds the validated
+// source video and the extracted audio next to the frames, and stage 1A puts it
+// on a 7-day delete while the HLS bucket is kept indefinitely. So a
+// thumbnail_url into it is unreachable on real S3, and stale a week later even
+// if it were reachable.
+//
+// Republishing into the HLS bucket means one bucket holds everything a client
+// fetches, under the access model this project has already decided on — the
+// same one the reel itself needs, so it costs no second policy and nothing new
+// becomes world-readable.
+//
+// Best-effort, matching outputDetails above: a failed copy costs the thumbnail,
+// never the finished job.
+func (s *Stage) publishThumbnail(ctx context.Context, jobID, frameKey string) bool {
+	err := s.s3.CopyObject(ctx, s.inputBucket, frameKey, s.hlsBucket, thumbnailKey(jobID), "image/jpeg")
+	if err != nil {
+		log.Printf("worker[package] job=%s publish thumbnail: %v", jobID, err)
+		return false
+	}
+	return true
+}
+
+// buildOutput assembles the completed job's OutputInfo.
+//
+// Pure, and split out for the same reason collectUploads is: the thing that has
+// actually been wrong here is which bucket a URL is built against, and that is
+// decidable without S3. Every URL handed to a client names hlsBucket, because
+// it is the only bucket whose read access is settled.
+func buildOutput(
+	endpoint, region, hlsBucket, jobID, masterKey string, duration float64, hasThumbnail bool,
+) *models.OutputInfo {
+	out := &models.OutputInfo{
+		HLSURL:          publicURL(endpoint, region, hlsBucket, masterKey),
+		DurationSeconds: duration,
+	}
+	if hasThumbnail {
+		out.ThumbnailURL = publicURL(endpoint, region, hlsBucket, thumbnailKey(jobID))
+	}
+	return out
+}
+
 // publicURL builds a browser-reachable URL for an object.
 //
-// An explicit PublicEndpoint is treated as a prefix in front of the bucket,
-// because that is what a proxy or an emulator needs: one host serving many
-// buckets, addressed path-style.
+// An explicit endpoint is treated as a prefix in front of the bucket, because
+// that is what a proxy or an emulator needs: one host serving many buckets,
+// addressed path-style.
 //
 // Empty means real S3, and there the bucket is not a path segment — it is part
-// of the host. Formatting it path-style against an empty base produced
-// "/dayreel-hls-output/<job>/master.m3u8": no scheme, no host, and no way for a
-// player to resolve it. Since S3_PUBLIC_ENDPOINT is documented as empty on real
-// AWS, that was the URL every completed job actually handed back.
+// of the host. Formatting it path-style against an empty endpoint produced
+// "/dayreel-hls-output/<job>/master.m3u8": no scheme, no host, and nothing a
+// player can resolve. Since S3_PUBLIC_ENDPOINT is documented as empty on real
+// AWS, that was the hls_url every completed job actually handed back. It went
+// unnoticed because under the emulator the endpoint was always set, so the
+// path-style format was correct for exactly as long as an emulator existed.
 //
-// Virtual-hosted style is the form S3 wants: path-style addressing is
-// deprecated for buckets created after September 2020, so deriving the
-// path-style URL instead would have been a second, slower bug.
-func (s *Stage) publicURL(bucket, key string) string {
-	if s.opts.PublicEndpoint == "" {
-		region := s.opts.Region
+// Virtual-hosted style is the form S3 wants: path-style addressing is deprecated
+// for buckets created after September 2020, so deriving the path-style URL
+// instead would have been a second, slower bug.
+func publicURL(endpoint, region, bucket, key string) string {
+	if endpoint == "" {
 		if region == "" {
-			// Only reachable if a caller built Options by hand. us-east-1 is
-			// wrong for a bucket elsewhere, but it is a resolvable host that
-			// fails loudly on a redirect, rather than a path that resolves to
-			// nothing anywhere.
+			// Only reachable if a caller passes neither. us-east-1 is wrong for a
+			// bucket elsewhere, but it is a resolvable host that fails loudly on
+			// a redirect, rather than a path that resolves to nothing anywhere.
 			region = "us-east-1"
 		}
 		return fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", bucket, region, key)
 	}
-	base := strings.TrimSuffix(s.opts.PublicEndpoint, "/")
+	base := strings.TrimSuffix(endpoint, "/")
 	return fmt.Sprintf("%s/%s/%s", base, bucket, key)
 }
 
