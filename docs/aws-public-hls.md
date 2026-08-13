@@ -6,21 +6,36 @@
 > here that leaves a real AWS account worse than it found it.
 
 This document covers the **optional, opt-in, off-by-default** public-read access
-model for `dayreel-hls-output` on real AWS: why presigning cannot serve HLS, what
+model for the HLS output bucket on real AWS: why presigning cannot serve HLS, what
 the script changes, what Block Public Access actually does at each level, what it
 costs, how to tear it down, and the alternative that was deliberately not built.
 
-Nothing in this document is on by default. The `dayreel-hls-output` bucket has
-never had a public-read access model applied to it, and no step in this document
-has been executed against a real bucket. Read
+Nothing in this document is on by default. Read
 [VERIFIED vs ASSUMED](#verified-vs-assumed) at the bottom before acting on any of
-it.
+it — as of 2026-08-13 most of it is verified, on a real account, and the parts
+that are not are named there.
 
-(This paragraph used to say no real AWS bucket had ever been provisioned for the
-project at all. That stopped being true on 2026-08-12, when the three buckets and
-the jobs table were created by hand — the CORS failure recorded in
-`TROUBLESHOOTING.md` happened against the real `dayreel-raw-videos`. The buckets
-exist; what remains unexercised is everything below.)
+## The bucket name is `$S3_HLS_BUCKET`, and nothing else
+
+Every command below reads the bucket from the environment. **Export it first:**
+
+```bash
+set -a; . ./.env; set +a
+echo "$S3_HLS_BUCKET"        # e.g. dayreel-hls-output-<suffix>
+```
+
+This is not stylistic. **S3 bucket names are globally unique**, so a plausible
+literal like `dayreel-hls-output` is not "the bucket, unconfigured" — it is a name
+in somebody else's account or in nobody's, and every command aimed at it either
+errors or silently does nothing to yours. This document used to spell that literal
+out in eighteen places, including the teardown, where the failure mode is an
+operator running `aws s3 rb s3://dayreel-hls-output`, seeing it fail, and
+believing the real bucket was deleted. `scripts/aws-hls-public.sh` carried the
+same literal as its default and died at its own `head-bucket` guard.
+
+`.env` holds the real name; `.env.example` holds the unsuffixed placeholder, which
+is what a suffix-free literal would have collided with. The suffix exists precisely
+because the short name was taken.
 
 ---
 
@@ -64,12 +79,20 @@ upload path.
 ## What the script does
 
 ```bash
+set -a; . ./.env; set +a                                          # once per shell
+
 ./scripts/aws-hls-public.sh status                                # read-only
 ./scripts/aws-hls-public.sh status --probe-key <job-uuid>/master.m3u8
 ./scripts/aws-hls-public.sh enable                                # DRY RUN
 ./scripts/aws-hls-public.sh enable  --yes                         # mutates
 ./scripts/aws-hls-public.sh disable --yes                         # reverses
 ```
+
+The script defaults its bucket to `$S3_HLS_BUCKET` and its region to
+`$AWS_REGION`, both overridable with `BUCKET=` / `REGION=`. Like every other
+script in `scripts/`, it does **not** source `.env` itself — exporting it is the
+caller's job, which is what the first line above does. `status` prints the bucket
+it resolved on its second line; check it before running anything that mutates.
 
 Without `--yes` every path is a dry run that prints the exact calls it would make.
 The script refuses to run against LocalStack at all — both if `AWS_ENDPOINT_URL` is
@@ -85,11 +108,11 @@ down before the policy goes up.
 ```bash
 # 0. read-only, first
 aws sts get-caller-identity --query Account --output text
-aws s3api head-bucket              --bucket dayreel-hls-output
-aws s3control get-public-access-block --account-id <account>       # may 404; see below
-aws s3api get-public-access-block  --bucket dayreel-hls-output
-aws s3api get-bucket-policy        --bucket dayreel-hls-output
-aws s3api get-bucket-policy-status --bucket dayreel-hls-output
+aws s3api head-bucket              --bucket "$S3_HLS_BUCKET"
+aws s3control get-public-access-block --account-id <account>       # 404s here; see below
+aws s3api get-public-access-block  --bucket "$S3_HLS_BUCKET"
+aws s3api get-bucket-policy        --bucket "$S3_HLS_BUCKET"
+aws s3api get-bucket-policy-status --bucket "$S3_HLS_BUCKET"
 
 # 1. ONLY if account-level BPA blocks public policies, and only behind the
 #    second flag --allow-account-bpa-change. ACL flags are preserved as found.
@@ -99,20 +122,20 @@ aws s3control put-public-access-block --account-id <account> \
 
 # 2. bucket level. Note the ACL guards stay ON — access is granted by policy,
 #    not by ACL, so there is no reason to relax them.
-aws s3api put-public-access-block --bucket dayreel-hls-output \
+aws s3api put-public-access-block --bucket "$S3_HLS_BUCKET" \
   --public-access-block-configuration \
     BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=false,RestrictPublicBuckets=false
 
 # 3. the policy
-aws s3api put-bucket-policy --bucket dayreel-hls-output --policy '<see below>'
+aws s3api put-bucket-policy --bucket "$S3_HLS_BUCKET" --policy '<see below>'
 ```
 
 `disable`, in this order. **Policy first**, so that a partial run leaves the bucket
 private rather than exposed:
 
 ```bash
-aws s3api delete-bucket-policy   --bucket dayreel-hls-output
-aws s3api put-public-access-block --bucket dayreel-hls-output \
+aws s3api delete-bucket-policy   --bucket "$S3_HLS_BUCKET"
+aws s3api put-public-access-block --bucket "$S3_HLS_BUCKET" \
   --public-access-block-configuration \
     BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
 aws s3control put-public-access-block --account-id <account> \
@@ -129,6 +152,9 @@ faithfully "restore" the bucket to public.
 
 ## The bucket policy
 
+`$S3_HLS_BUCKET` below is substituted by the script; the ARN carries the real
+name, suffix and all.
+
 ```json
 {
   "Version": "2012-10-17",
@@ -138,7 +164,7 @@ faithfully "restore" the bucket to public.
       "Effect": "Allow",
       "Principal": "*",
       "Action": "s3:GetObject",
-      "Resource": "arn:aws:s3:::dayreel-hls-output/*"
+      "Resource": "arn:aws:s3:::$S3_HLS_BUCKET/*"
     }
   ]
 }
@@ -148,7 +174,7 @@ faithfully "restore" the bucket to public.
 
 > **This is the most important detail in this document.**
 
-`s3:GetObject` on `arn:aws:s3:::dayreel-hls-output/*` grants reads only to a caller
+`s3:GetObject` on `arn:aws:s3:::$S3_HLS_BUCKET/*` grants reads only to a caller
 who **already knows the full key**. The keys are
 
 ```
@@ -162,7 +188,7 @@ and `job_id` is a UUID (`OutputKey` and the upload loop in
 of secret to read one reel. Guessing gets them nothing.
 
 `s3:ListBucket` is a **different action on a different resource** — the bare bucket
-ARN `arn:aws:s3:::dayreel-hls-output`, with no `/*`. Adding it would let anyone on
+ARN `arn:aws:s3:::$S3_HLS_BUCKET`, with no `/*`. Adding it would let anyone on
 the internet call `ListObjectsV2` and enumerate **every job the pipeline has ever
 processed**, converting the unguessable key into a published index. The secrecy of
 the key is the only thing separating "readable by the person who made it" from
@@ -170,6 +196,12 @@ the key is the only thing separating "readable by the person who made it" from
 
 Its absence is a decision, not an oversight and not a hardening TODO. The same goes
 for the bare bucket ARN never appearing in `Resource`.
+
+**And it holds in practice.** With the policy applied on 2026-08-13, an anonymous
+`GET` of `master.m3u8`, all three variant playlists, the `.ts` segments, the
+subtitle playlist, the `.vtt` and `thumbnail.jpg` each returned `200`, while an
+anonymous bucket listing on the same bucket returned `403`. The split between the
+two ARNs is real and enforced, not just documented.
 
 **What this still does not give you:** anyone who obtains a reel URL — from a log,
 a screenshot, a shared link, a referrer header — can read that reel, forever, until
@@ -224,11 +256,14 @@ substantially.
 make a `GetPublicAccessBlock` request against an account that doesn't have a
 `PublicAccessBlockConfiguration` set." Nothing about creating a bucket sets it.
 
-**The consequence for this project:** on a plain single account that has never had
-account-level BPA configured — the likely case here — making this one bucket
-readable requires **only the bucket-level change**. No account-wide guardrail has to
-come off, because none is on. The script reports `account BPA : NONE` and skips
-step 1 entirely.
+**The consequence for this project, now checked rather than guessed:** account
+<account-id> has no account-level BPA configuration —
+`aws s3control get-public-access-block --account-id <account-id>` returns
+`NoSuchPublicAccessBlockConfiguration`, and the script reports `account BPA : NONE`
+(confirmed 2026-08-13). So making this one bucket readable requires **only the
+bucket-level change**: no account-wide guardrail comes off because none is on,
+`--allow-account-bpa-change` is not needed and has never been passed, and opening
+the HLS bucket touches that bucket and nothing else in the account.
 
 **When the account-wide blast radius is real:** if account-level BPA *is* set — by a
 person, by Control Tower, by a Security Hub remediation, or inherited from an
@@ -277,10 +312,15 @@ Confirm with the only check that measures what anyone cares about — an
 unauthenticated GET, which is what a stranger's player is:
 
 ```bash
+set -a; . ./.env; set +a
 curl -s -o /dev/null -w '%{http_code}\n' \
-  https://dayreel-hls-output.s3.us-east-1.amazonaws.com/<job-uuid>/master.m3u8
+  "https://$S3_HLS_BUCKET.s3.$AWS_REGION.amazonaws.com/<job-uuid>/master.m3u8"
 # 403 = shut. 200 = still open.
 ```
+
+`./scripts/aws-hls-public.sh status --probe-key <job-uuid>/master.m3u8` runs the
+same request and builds the host the same way, so it cannot be aimed at the wrong
+bucket by a typo.
 
 Reading the configuration back from the API is *not* the same check. That is the
 class of evidence that has been wrong in this project twice.
@@ -318,16 +358,28 @@ catches a mistake while it is still small.
 
 All four. Stopping after two leaves either a live public grant or a live bill.
 
+**Export the environment first, or none of steps 3 and 4 touch your bucket:**
+
+```bash
+set -a; . ./.env; set +a; echo "$S3_HLS_BUCKET"
+```
+
+A hardcoded `dayreel-hls-output` here is worse than useless: `aws s3 rb` on a name
+you do not own fails, the operator reads it as "already gone", and the real bucket
+keeps billing. Confirm the echo prints the suffixed name before running either.
+
 - [ ] **1. Delete the bucket policy** — `./scripts/aws-hls-public.sh disable --yes`,
-      or `aws s3api delete-bucket-policy --bucket dayreel-hls-output`.
+      or `aws s3api delete-bucket-policy --bucket "$S3_HLS_BUCKET"`.
       Masking it with BPA is not deleting it.
 - [ ] **2. Re-enable Block Public Access, bucket *and* account.** `disable` does the
       bucket unconditionally and the account only if `enable` changed it, restoring
-      exactly what it recorded. If the state file is gone, set the account level by
-      hand — it is account-wide, so do not leave it to chance.
-- [ ] **3. Delete the objects** — `aws s3 rm s3://dayreel-hls-output --recursive`.
+      exactly what it recorded. On this account `enable` never changes the account
+      level (there is nothing set to change), so in practice the bucket-level restore
+      is the whole of it — but if the state file is gone and you are on a different
+      account, set the account level by hand rather than leave it to chance.
+- [ ] **3. Delete the objects** — `aws s3 rm "s3://$S3_HLS_BUCKET" --recursive`.
       They bill as storage regardless of the access model.
-- [ ] **4. Delete the bucket** — `aws s3 rb s3://dayreel-hls-output`.
+- [ ] **4. Delete the bucket** — `aws s3 rb "s3://$S3_HLS_BUCKET"`.
       An empty bucket is free, but it is also a name that outlives the project and
       can be made public again by anyone with the credentials.
 
@@ -416,32 +468,36 @@ never tested turned out wrong.
   read from `backend/internal/worker/packager/packager.go`.
 - **That the variant playlists are ffmpeg's and the master is ours**, read from
   `backend/internal/media/hls.go` and `playlist.go`.
+- **That the script has the intended effect on real S3** — run against account
+  <account-id> on **2026-08-13**, which is what this section used to list as the
+  one thing nobody had done. Before: bucket BPA on, no policy, anonymous
+  `GET master.m3u8` → **403**. After `enable --yes`: `master.m3u8`, all three
+  variant playlists, the `.ts` segments, the subtitle playlist, the `.vtt` and
+  `thumbnail.jpg` → **200** anonymously. `disable --yes` put it back. The dry-run
+  output, the state file and the restore all behaved as described above.
+- **That an anonymous LIST is still refused while those GETs succeed** — checked in
+  the same run, `403`. The `GetObject`-without-`ListBucket` split is enforced, not
+  merely intended.
+- **That this account has no account-level BPA.**
+  `aws s3control get-public-access-block --account-id <account-id>` returns
+  `NoSuchPublicAccessBlockConfiguration`; `status` prints `account BPA : NONE`.
+  So `--allow-account-bpa-change` is not needed here, `enable` skips step 1, and
+  opening this bucket affects **only this bucket**. It is also not in an
+  Organizations BPA policy — such a policy would have made the bucket-level
+  `put-public-access-block` fail, and it did not.
 
 ### ASSUMED
 
-- **That the script has the intended effect on real S3.** It has never been run
-  against a real AWS account. The buckets themselves do exist as of 2026-08-12,
-  but no access model has been applied to `dayreel-hls-output` and spending is
-  budgeted at $20 total, so it was not run to find out. The effect of `enable` —
-  that an anonymous GET returns 200 afterwards — and of `disable` — that it
-  returns 403 again — is **unverified**.
 - **That the emulator could never have substituted for that verification.** This
   was not a gap effort would have closed: LocalStack Community **stored bucket
   policies and public-access-block settings and then ignored them entirely** —
   verified twice in this project and recorded in `docs/SETUP.md`. Both calls
   succeeded, both read back verbatim, and an unsigned request still succeeded.
-  Now that the emulator is gone there is no local substitute at all, which is
-  clearer if less convenient: the only way to know is to run it once.
-  Running the script against LocalStack would print an unbroken column of successes
-  and prove nothing, which is why the script refuses to run there.
-- **That this account has no account-level BPA and is not in an Organizations BPA
-  policy.** Not checked — checking it means calling a real account. `status` reports
-  the truth in about a second; run it before assuming either way.
+  The one real run above is what settled it, exactly as this section predicted it
+  would have to.
+- **That the account-level findings generalise.** They are facts about account
+  <account-id> on 2026-08-13, not about accounts. On an account with account-level
+  BPA set, or inside an Organizations BPA policy, the blast-radius argument above
+  applies in full. `status` reports the truth in about a second; run it first.
 - **The cost figures**, which are carried over from `config/free-tier.md` rather than
   re-derived, and which are list prices in one region.
-
-**The first real-AWS run is the verification.** Do it in this order: `status` (expect
-`account BPA : NONE`), `enable --yes`, `status --probe-key <job>/master.m3u8` (expect
-`200`), play the reel, `disable --yes`, probe again (expect `403`), then the teardown
-checklist. Record what actually happened here — including anything above that turns
-out to be wrong.

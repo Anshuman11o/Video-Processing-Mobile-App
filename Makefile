@@ -79,12 +79,20 @@ worker:
 # All four stages at once, which is what the four worker containers used to do.
 # Output is interleaved and Ctrl-C stops the lot; run `make worker STAGE=...`
 # in separate terminals when you need to read one stage's log on its own.
+#
+# The prefix is a `read` loop and not `sed`, because sed block-buffers when its
+# stdout is not a terminal. `make workers > run.log` therefore printed the echo
+# above and then NOTHING, indefinitely, while four workers ran perfectly and
+# their output sat in 4 KiB of sed buffer — unobservable in exactly the case you
+# redirect for. There is no portable sed flag for it: -u is GNU, -l is BSD, and
+# this repo is developed on macOS and runs on Linux. The loop needs neither.
 workers:
 	@echo "Starting validate, extract, transcribe and package workers. Ctrl-C stops all."
 	@$(LOAD_ENV) cd backend && \
 		trap 'kill 0' INT TERM; \
 		for s in validate extract transcribe package; do \
-			WORKER_STAGE=$$s go run ./cmd/worker 2>&1 | sed "s/^/[$$s] /" & \
+			WORKER_STAGE=$$s go run ./cmd/worker 2>&1 \
+				| while IFS= read -r line; do printf '[%s] %s\n' "$$s" "$$line"; done & \
 		done; \
 		wait
 

@@ -121,9 +121,20 @@ The gap is invisible until the first real run, where it surfaces as an exec
 failure part-way through a pipeline — a confusing place to discover a missing
 dependency, which is what the setup-script warning exists to prevent.
 
+**On macOS the whole answer is two commands** — see the two sections below for
+why each is the right one:
+
+```bash
+brew install whisper-cpp                       # the binary, v1.9.2, Metal-accelerated
+docker run --rm -v infra_whisper-models:/m -v "$PWD/backend/models":/out \
+  --entrypoint sh infra-worker-transcribe:latest -c 'cp /m/ggml-base.bin /out/'
+```
+
 ### Building it from source
 
-The reliable route, and the one already exercised — `Dockerfile.worker` builds
+**Not the recommended route any more on macOS — see "From a package manager"
+below, which is now verified.** Keep this for platforms with no package, and for
+the reasoning, which still applies to any host build. `Dockerfile.worker` builds
 whisper.cpp v1.9.2 this way:
 
 ```bash
@@ -164,11 +175,29 @@ Two things the Dockerfile learned that apply to a host build just as much:
 
 ### From a package manager
 
-Package managers do ship whisper.cpp, and in recent versions the binary is called
-`whisper-cli` — which is the name this repo execs. **Unverified: no
-package-manager install has been tried for this project**, so treat any specific
-command you find as a lead rather than an instruction, and check what it actually
-installed. Two things make a package a real answer rather than a plausible one:
+**VERIFIED 2026-08-13 on macOS arm64 — this is now the recommended route, and
+the source build above is the fallback.** Homebrew ships the same version the
+Dockerfile compiles, as a bottle, so there is no compile at all:
+
+```bash
+brew install whisper-cpp          # installs whisper-cli 1.9.2 into /opt/homebrew/bin
+```
+
+That is the whole install. It lands as `whisper-cli` — the name this repo execs —
+and needs no `PATH` change on a normal Homebrew setup, because `/opt/homebrew/bin`
+is already there. It pulls in `ggml` and `sdl2-compat`; the three come to ~19 MB.
+
+It beats the source build on two counts beyond convenience:
+
+- **It is the same version**, 1.9.2, that `Dockerfile.worker` pins. Verified by
+  `whisper-cli --version` against the binary inside `infra-worker-transcribe`.
+- **It is GPU-accelerated.** The bottle loads Metal and BLAS backends
+  (`libggml-metal.so`, `libggml-blas.so`), which the plain CMake invocation above
+  does not configure. Measured: a 7.6-second clip transcribes in ~1.2 s including
+  model load, about 0.15× realtime.
+
+Two things make any *other* package a real answer rather than a plausible one —
+check both before trusting one:
 
 ```bash
 command -v whisper-cli            # the name matters; older builds shipped "main"
@@ -176,6 +205,28 @@ command -v whisper-cli            # the name matters; older builds shipped "main
 ```
 
 If neither holds, build from source above — that path is known to work.
+
+### Why not run the binary out of the old Docker image
+
+`infra-worker-transcribe:latest` still exists locally and still contains a
+working `/usr/local/bin/whisper-cli`, so a shell wrapper on `PATH` that forwarded
+each invocation to `docker run` was considered. **It works** — bind-mounting a Go
+`os.MkdirTemp` directory (macOS puts these under `/var/folders/…`) succeeds, and
+files the container writes come back owned by the host user, so the stage's
+`os.RemoveAll` cleanup is fine. It was rejected anyway:
+
+- The binary is Alpine/musl **linux/arm64** and cannot exec on the host, so every
+  transcription pays a container start. Measured 6.0 s against the native 4.4 s
+  on the same clip, and the gap widens on longer audio because the container is
+  CPU-only — no Metal.
+- A wrapper would have to rewrite **three independent host paths** into container
+  paths (`-m` model, `-f` audio from the extract stage, `-of` output base in a
+  fresh temp dir), which live in three unrelated directory trees. That is real
+  parsing logic in shell, and it silently breaks the moment a path moves.
+- It reintroduces a hard Docker dependency into a local loop that was
+  deliberately made containerless (`infra/CONTEXT.md`).
+
+The image is still worth keeping for one thing — recovering the model, below.
 
 ### The model
 
@@ -197,6 +248,23 @@ curl -L -o models/ggml-base.bin \
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
 ```
 
+**Before downloading, check whether you already have it.** The old compose stack
+kept the model in a named Docker volume, `infra_whisper-models`, and removing
+compose did not remove the volume — it survives with the full 141.1 MB file in
+it. Copying it out is faster than a re-download and costs no bandwidth:
+
+```bash
+docker volume ls | grep whisper-models        # is it still there?
+mkdir -p backend/models
+docker run --rm -v infra_whisper-models:/m -v "$PWD/backend/models":/out \
+  --entrypoint sh infra-worker-transcribe:latest -c 'cp /m/ggml-base.bin /out/'
+```
+
+The file that comes out is byte-identical to the published one
+(sha256 `60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe`,
+147,951,465 bytes) and lands owned by the host user. Do **not** `docker volume
+prune` while this is the only copy.
+
 **A relative `WHISPER_MODEL_PATH` does not mean the same directory to everything
 that reads it.** `make worker` does `cd backend` before `go run`, so the worker
 resolves `./models/ggml-base.bin` to `backend/models/ggml-base.bin`, while
@@ -205,6 +273,15 @@ script from — normally the project root. The two can disagree, and the shape o
 the disagreement is a setup script that reports the model missing while the
 worker is happily using it, or the reverse. Set an absolute path in `.env` if you
 want one copy and one answer.
+
+There is a third reader, and it has the most expensive failure mode: **`go test`
+runs each package with its working directory set to that package's own
+directory.** A test that constructs `WhisperCPP` with the default relative path
+resolves it to `backend/internal/transcribe/models/ggml-base.bin`, finds nothing,
+and — because `ensureModel` downloads on miss — quietly pulls a *second* 141 MB
+copy into the source tree. `.gitignore` covers `models/`, so it does not even
+show up in `git status`. Observed 2026-08-13. Pass an absolute path to any test
+that exercises the real binary.
 
 Sizing, from the stage 5A verification run: transcription is roughly 0.1×
 realtime on the `base` model, so a 60-second clip takes 5–8 seconds against a 5

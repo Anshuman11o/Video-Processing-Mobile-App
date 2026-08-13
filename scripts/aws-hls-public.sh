@@ -23,21 +23,35 @@
 #   ./scripts/aws-hls-public.sh enable  --yes
 #   ./scripts/aws-hls-public.sh disable --yes
 #
-# WHAT THIS SCRIPT DOES NOT PROVE
+# THE BUCKET NAME IS NOT A CONSTANT. S3 bucket names are globally unique, so the
+# name in .env is the only one this project owns; a literal in here is a name
+# belonging to somebody else. Export the environment first — `set -a; . ./.env;
+# set +a` — the way the Makefile does for the Go processes. BUCKET= and REGION=
+# still override.
 #
-# Nothing here has been run against real S3 — no real bucket has ever been
-# provisioned for this project. The AWS CLI command names and argument shapes
-# were checked against the installed CLI (`aws s3api help`, `aws s3control
-# put-public-access-block help`), and the Block Public Access semantics against
-# current AWS documentation. The EFFECT is unverified, and cannot be verified
-# locally even in principle: LocalStack accepts put-bucket-policy and
-# put-public-access-block, reads both back verbatim, and enforces neither.
-# Running this against LocalStack would produce a green run that means nothing,
-# which is why the guard below refuses to.
+# WHAT HAS ACTUALLY BEEN RUN
+#
+# Exercised against real S3 on 2026-08-13, account <account-id>. With bucket BPA
+# on and no policy, an anonymous GET of master.m3u8 was 403. After `enable`, the
+# master playlist, all three variant playlists, the .ts segments, the subtitle
+# playlist, the .vtt and thumbnail.jpg all returned 200 anonymously — while an
+# anonymous bucket LIST still returned 403, which is the GetObject-without-
+# ListBucket split below doing exactly what it claims. `disable` put it back.
+# Account-level BPA is not configured on that account, so step 1 was skipped and
+# --allow-account-bpa-change was never needed.
+#
+# What remains untestable locally is unchanged: LocalStack accepts
+# put-bucket-policy and put-public-access-block, reads both back verbatim, and
+# enforces neither. A run there would print an unbroken column of OK and prove
+# nothing, which is why the guard below refuses it.
 set -uo pipefail
 
-BUCKET="${BUCKET:-dayreel-hls-output}"
-REGION="${REGION:-us-east-1}"
+# Same resolution order as scripts/verify-resume.sh: an explicit override, then
+# the name the rest of the stack uses, then a last-resort literal that exists so
+# `--help` still prints something. Like every other script here this does NOT
+# source .env itself — the caller exports it, or make does.
+BUCKET="${BUCKET:-${S3_HLS_BUCKET:-dayreel-hls-output}}"
+REGION="${REGION:-${AWS_REGION:-$(aws configure get region 2>/dev/null || echo us-east-1)}}"
 
 # Where `enable` records the settings it displaced, so `disable` can put them
 # back rather than guess. Kept out of the repo on purpose — it names a real
@@ -106,10 +120,10 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-# usage reprints the header comment. Line 36 is the last line of it — keep this
+# usage reprints the header comment. Line 46 is the last line of it — keep this
 # in step with the header, or the banner ends mid-sentence.
 usage() {
-  sed -n '2,36p' "$0" | sed 's/^#\{1,2\} \{0,1\}//'
+  sed -n '2,46p' "$0" | sed 's/^#\{1,2\} \{0,1\}//'
   exit 2
 }
 
