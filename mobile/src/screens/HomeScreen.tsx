@@ -163,7 +163,7 @@ export default function HomeScreen({navigation}: HomeScreenProps) {
   return (
     <View style={styles.container}>
       <Text style={styles.title}>CaptionClips</Text>
-      <Text style={styles.subtitle}>From clip to captioned stream.</Text>
+      <Text style={styles.subtitle}>Raw video clip to captioned clips.</Text>
 
       <TouchableOpacity
         style={[styles.button, preparing && styles.buttonDisabled]}

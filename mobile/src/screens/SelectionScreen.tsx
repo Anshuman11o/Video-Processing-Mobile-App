@@ -83,8 +83,7 @@ export default function SelectionScreen({
             <Text style={styles.headerTitle}>Ready to upload</Text>
             <Text style={styles.headerSubtitle}>{totalLabel}</Text>
             <Text style={styles.headerHint}>
-              Tap a clip to preview the original — full resolution, with sound,
-              no captions.
+              Tap a clip to preview the original.
             </Text>
           </View>
         }

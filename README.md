@@ -1,6 +1,6 @@
 # CaptionClips
 
-**From clip to captioned stream.**
+**Raw video clip to captioned clips.**
 
 ## Demo
 
