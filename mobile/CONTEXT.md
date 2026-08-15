@@ -1,6 +1,6 @@
-# Mobile App (DayReel)
+# Mobile App (CaptionClips)
 
-React Native + TypeScript mobile shell for the DayReel video processing app.
+React Native + TypeScript mobile shell for the CaptionClips video processing app.
 
 ## Structure
 

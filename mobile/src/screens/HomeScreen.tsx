@@ -6,199 +6,184 @@ import {
   StyleSheet,
   Alert,
   ActivityIndicator,
-  Platform,
 } from 'react-native';
 import {
   errorCodes,
   isErrorWithCode,
   keepLocalCopy,
   pick,
+  type DocumentPickerResponse,
 } from '@react-native-documents/picker';
 import type {NativeStackNavigationProp} from '@react-navigation/native-stack';
 import type {RootStackParamList} from '../navigation/AppNavigator';
-import {blobTransport} from '../upload/blobTransport';
-import {UploadExpiredError} from '../upload/uploader';
-import {startBackgroundVideoUpload, uploadVideo} from '../upload/uploadVideo';
-import {isBackgroundUploadAvailable} from '../upload/nativeUploader';
-import {blobJobIndexStore} from '../storage/blobJobIndexStore';
-
-/**
- * Slows the native worker so an upload can actually be interrupted.
- *
- * [DECIDE 6]: against LocalStack over loopback a multi-part upload finishes in
- * well under a second, which leaves no window in which to kill the app and
- * observe that the upload survived — the stage's entire claim. `__DEV__` gates
- * it so a release build never carries it.
- *
- * 3s, not the 1.5s this started at, because the interesting kill is the one
- * *between* parts — with no PUT in flight there is no half-sent part to confuse
- * the resume. The 14.9 MB fixture is only 3 parts, and a host-driven kill takes
- * about a second to land, so 1.5s was a coin flip on whether the process died
- * in the gap or mid-body.
- */
-const DEBUG_PART_DELAY_MS = __DEV__ ? 3000 : 0;
+import type {PickedClip} from '../types/clips';
 
 type HomeScreenProps = {
   navigation: NativeStackNavigationProp<RootStackParamList, 'Home'>;
 };
 
+/** A file the picker returned that cannot be uploaded, and why. */
+interface RejectedClip {
+  filename: string;
+  reason: string;
+}
+
+/**
+ * Turn the picker's results into clips, copying each one into app storage.
+ *
+ * Exported for the sake of being readable in one piece rather than for reuse:
+ * this is where four separate failure modes are handled, and burying them in a
+ * button handler is how the single-select version ended up with the only
+ * `status` check in the app.
+ *
+ * Every file is copied in a single `keepLocalCopy` call, whose result array is
+ * positional — response `i` describes file `i`. That is the only thing tying a
+ * copy back to its source, so the two arrays are zipped by index and a file
+ * with no corresponding response is rejected rather than assumed good.
+ */
+export async function toClips(
+  picked: DocumentPickerResponse[],
+): Promise<{clips: PickedClip[]; rejected: RejectedClip[]}> {
+  const clips: PickedClip[] = [];
+  const rejected: RejectedClip[] = [];
+
+  // `POST /jobs` rejects an empty filename, a non-positive size or an empty
+  // content type with a 400. The picker types all three as nullable, so they
+  // are checked here rather than discovered as a failed request — and with
+  // several files at once, one unreadable file must not sink the others.
+  const usable = picked.filter(result => {
+    if ((result.size ?? 0) <= 0) {
+      rejected.push({
+        filename: result.name ?? 'unnamed file',
+        reason: 'no readable contents',
+      });
+      return false;
+    }
+    return true;
+  });
+
+  if (usable.length === 0) {
+    return {clips, rejected};
+  }
+
+  // On Android `result.uri` is a `content://` URI, which is not a path the
+  // native uploader can slice, and whose permission grant Android can revoke.
+  // keepLocalCopy turns it into a real local file.
+  //
+  // documentDirectory, not cachesDirectory: Android reclaims cache directories
+  // under storage pressure, and an upload that has to survive the app being
+  // killed must not have its source file vanish underneath it. That is Stage
+  // 8A [DECIDE 5], settled here because the picker is where the choice is
+  // actually made.
+  const files = usable.map(result => ({
+    uri: result.uri,
+    fileName: result.name ?? 'video.mp4',
+  }));
+  const copies = await keepLocalCopy({
+    // `usable.length > 0` is checked above; the picker's own option type wants
+    // a non-empty tuple, which `map` cannot produce on its own.
+    files: files as [(typeof files)[0], ...typeof files],
+    destination: 'documentDirectory',
+  });
+
+  usable.forEach((result, i) => {
+    const filename = result.name ?? 'video.mp4';
+    const copy = copies[i];
+
+    // keepLocalCopy resolves even when it failed — the failure is reported in
+    // `status`, not thrown. Checking it is not optional: a missing check would
+    // read `localUri` off an error result and carry a broken path forward
+    // silently, one clip at a time, all the way to a failed upload.
+    if (!copy) {
+      rejected.push({filename, reason: 'no copy result'});
+      return;
+    }
+    if (copy.status !== 'success') {
+      rejected.push({filename, reason: copy.copyError});
+      return;
+    }
+
+    clips.push({
+      id: `${i}-${result.uri}`,
+      fileUri: copy.localUri,
+      filename,
+      sizeBytes: result.size ?? 0,
+      contentType: result.type ?? 'video/mp4',
+    });
+  });
+
+  return {clips, rejected};
+}
+
 export default function HomeScreen({navigation}: HomeScreenProps) {
-  const [progress, setProgress] = useState<number | null>(null);
-  const uploading = progress !== null;
+  const [preparing, setPreparing] = useState(false);
 
-  const startUpload = useCallback(
-    async (video: {
-      fileUri: string;
-      filename: string;
-      sizeBytes: number;
-      contentType: string;
-    }) => {
-      setProgress(0);
-      try {
-        // Prefer the background path: it is the one that survives the app
-        // being killed. It returns as soon as WorkManager has the work, not
-        // when the upload finishes, so the user goes straight to the job
-        // screen and watches it from there — which is also what they would
-        // see after relaunching mid-upload.
-        if (isBackgroundUploadAvailable()) {
-          const {jobId} = await startBackgroundVideoUpload({
-            video,
-            store: blobJobIndexStore,
-            debugPartDelayMs: DEBUG_PART_DELAY_MS,
-          });
-          setProgress(null);
-          navigation.navigate('Player', {jobId});
-          return;
-        }
+  const handleSelectVideos = useCallback(async () => {
+    try {
+      const picked = await pick({
+        type: ['video/*'],
+        // The flow now starts with a selection, not with a single file: the
+        // point of the app is turning a set of clips into one captioned
+        // stream, and picking them one at a time made that four round trips
+        // through the system picker.
+        allowMultiSelection: true,
+      });
+      if (picked.length === 0) {
+        return;
+      }
 
-        // Fallback for any build without the native module — iOS, or an APK
-        // built before it existed. Uploads in the foreground and dies with the
-        // app, which is exactly the limitation 8A exists to remove. Taking this
-        // branch on Android means 8A is not working; it looks identical to
-        // success from the UI, so it is announced rather than assumed.
-        if (__DEV__ && Platform.OS === 'android') {
-          console.warn(
-            'Falling back to the foreground uploader: this upload will NOT ' +
-              'survive the app being killed.',
-          );
-        }
+      setPreparing(true);
+      const {clips, rejected} = await toClips(picked);
+      setPreparing(false);
 
-        const {jobId} = await uploadVideo({
-          video,
-          transport: blobTransport,
-          store: blobJobIndexStore,
-          onProgress: setProgress,
-        });
-        setProgress(null);
-        navigation.navigate('Player', {jobId});
-      } catch (err) {
-        setProgress(null);
+      if (rejected.length > 0) {
         Alert.alert(
-          'Upload failed',
-          err instanceof UploadExpiredError
-            ? 'The upload link expired. Please select the video again.'
-            : err instanceof Error
-              ? err.message
-              : String(err),
+          clips.length > 0 ? 'Some clips were skipped' : 'Cannot use those files',
+          rejected.map(r => `${r.filename}: ${r.reason}`).join('\n'),
         );
       }
-    },
-    [navigation],
-  );
-
-  const handleSelectVideo = useCallback(async () => {
-    try {
-      const [result] = await pick({type: ['video/*']});
-      if (!result) {
+      if (clips.length === 0) {
         return;
       }
 
-      const filename = result.name ?? 'video.mp4';
-      const sizeBytes = result.size ?? 0;
-      // POST /jobs rejects an empty filename, a non-positive size or an empty
-      // content type with a 400. The picker types all three as nullable, so
-      // they are checked here rather than discovered as a failed request.
-      if (sizeBytes <= 0) {
-        Alert.alert('Cannot upload', 'That file has no readable contents.');
-        return;
-      }
-
-      // On Android `result.uri` is a `content://` URI, which is not a path the
-      // native uploader can slice, and whose permission grant Android can
-      // revoke. keepLocalCopy turns it into a real local file.
-      //
-      // documentDirectory, not cachesDirectory: Android reclaims cache
-      // directories under storage pressure, and an upload that has to survive
-      // the app being killed must not have its source file vanish underneath
-      // it. That is Stage 8A [DECIDE 5], settled here because the picker is
-      // where the choice is actually made.
-      const [copy] = await keepLocalCopy({
-        files: [{uri: result.uri, fileName: filename}],
-        destination: 'documentDirectory',
-      });
-
-      // keepLocalCopy resolves even when it failed — the failure is reported
-      // in `status`, not thrown. Checking it is not optional: a missing check
-      // would read `localUri` off an error result and upload nothing.
-      if (copy.status !== 'success') {
-        Alert.alert('Cannot upload', `Could not read that file: ${copy.copyError}`);
-        return;
-      }
-
-      Alert.alert(
-        'Video selected',
-        `${filename}\nSize: ${(sizeBytes / 1024 / 1024).toFixed(1)} MB`,
-        [
-          {text: 'Cancel', style: 'cancel'},
-          {
-            text: 'Upload',
-            onPress: () => {
-              startUpload({
-                fileUri: copy.localUri,
-                filename,
-                sizeBytes,
-                contentType: result.type ?? 'video/mp4',
-              });
-            },
-          },
-        ],
-      );
+      // Straight to the selection screen, not to an upload. Uploading on pick
+      // is what the old single-select flow did, and it left no moment in which
+      // the originals could be seen — which is the whole "before" half of what
+      // this app claims to do.
+      navigation.navigate('Selection', {clips});
     } catch (err) {
+      setPreparing(false);
       if (isErrorWithCode(err) && err.code === errorCodes.OPERATION_CANCELED) {
         return;
       }
       Alert.alert('Could not open the picker', String(err));
     }
-  }, [startUpload]);
+  }, [navigation]);
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>DayReel</Text>
-      <Text style={styles.subtitle}>Turn your videos into reels</Text>
+      <Text style={styles.title}>CaptionClips</Text>
+      <Text style={styles.subtitle}>From clip to captioned stream.</Text>
 
       <TouchableOpacity
-        style={[styles.button, uploading && styles.buttonDisabled]}
-        disabled={uploading}
-        onPress={handleSelectVideo}>
+        style={[styles.button, preparing && styles.buttonDisabled]}
+        disabled={preparing}
+        onPress={handleSelectVideos}>
         <Text style={styles.buttonText}>
-          {uploading ? `Uploading ${Math.round(progress * 100)}%` : 'Select Video'}
+          {preparing ? 'Preparing clips…' : 'Select Videos'}
         </Text>
       </TouchableOpacity>
 
-      {uploading ? (
-        <View style={styles.progressBar}>
-          <View style={[styles.progressFill, {width: `${progress * 100}%`}]} />
-        </View>
-      ) : null}
-
       <TouchableOpacity
         style={styles.secondaryButton}
-        disabled={uploading}
+        disabled={preparing}
         onPress={() => navigation.navigate('JobList')}>
         <Text style={styles.secondaryButtonText}>View Jobs</Text>
       </TouchableOpacity>
 
-      {uploading ? <ActivityIndicator style={styles.spinner} color="#6366f1" /> : null}
+      {preparing ? (
+        <ActivityIndicator style={styles.spinner} color="#6366f1" />
+      ) : null}
     </View>
   );
 }
@@ -238,18 +223,6 @@ const styles = StyleSheet.create({
     color: '#ffffff',
     fontSize: 18,
     fontWeight: '600',
-  },
-  progressBar: {
-    height: 4,
-    width: '100%',
-    backgroundColor: '#333333',
-    borderRadius: 2,
-    marginBottom: 16,
-  },
-  progressFill: {
-    height: '100%',
-    borderRadius: 2,
-    backgroundColor: '#6366f1',
   },
   spinner: {
     marginTop: 24,

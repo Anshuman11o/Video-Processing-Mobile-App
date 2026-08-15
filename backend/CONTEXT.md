@@ -18,7 +18,7 @@ backend/
 │   │   ├── handlers.go          # HTTP handlers (CreateJob, ResumeUpload, CompleteUpload, AbortUpload, GetJobStatus, GetReel)
 │   │   ├── router.go            # gorilla/mux route setup
 │   │   └── middleware.go        # Logging + CORS middleware
-│   ├── cache/memory.go          # In-process TTL cache for job status (10s)
+│   ├── cache/memory.go          # In-process TTL cache for job status (JOB_CACHE_TTL, 1s)
 │   ├── config/config.go         # Environment-based configuration
 │   ├── db/                      # DynamoDB CRUD for jobs and stage state
 │   ├── events/                  # Stage message types, queue/bucket constants, extract manifest
@@ -54,7 +54,7 @@ link in a `CGO_ENABLED=0` build.
 | POST | /jobs/{id}/upload-urls | Re-issue presigned URLs for the parts S3 does not hold |
 | POST | /jobs/{id}/complete | Complete the upload; enqueues the validate stage |
 | DELETE | /jobs/{id}/upload | Abort the upload and release the parts S3 is holding |
-| GET | /jobs/{id} | Get job status (10s in-process cache, DynamoDB on miss) |
+| GET | /jobs/{id} | Get job status (in-process cache, `JOB_CACHE_TTL` default 1s; DynamoDB on miss) |
 | GET | /jobs/{id}/reel | Get HLS playback URL (completed jobs only) |
 
 ## Data Flow

@@ -34,6 +34,41 @@ type Config struct {
 	QueueMaxDeliveries     int
 	QueuePollInterval      time.Duration
 
+	// JobCacheTTL is how long GET /jobs/{id} may serve a job snapshot from the
+	// API's in-process cache before re-reading DynamoDB.
+	//
+	// It is a knob rather than a constant because the right value is a
+	// freshness-versus-reads trade that differs per deployment, and hard-coding
+	// it once already produced a visible bug: no worker can invalidate an
+	// in-process map, so the TTL is the *only* bound on how far behind a stage
+	// transition the API's answer can be. See DefaultJobCacheTTL for the default
+	// and why it is what it is.
+	JobCacheTTL time.Duration
+
+	// WorkerConcurrency is how many messages one stage process handles at the
+	// same time. 1 preserves the original behaviour: claim a message, finish
+	// it, claim the next.
+	//
+	// This is concurrency WITHIN a stage, which is not where the pipeline's
+	// parallelism has been coming from. The four stages are already separate
+	// processes consuming separate queues, so clip B's validate overlaps clip
+	// A's package without this setting doing anything — measured 2026-08-14,
+	// job B's validate starting one second after job A's did and running
+	// alongside A's remaining three stages.
+	//
+	// Raising it is therefore not a cure for a pipeline that looks serial.
+	// Every stage shells out to ffmpeg, package alone runs a three-rung ladder
+	// as three simultaneous x264 encodes, and every stage moves the whole video
+	// to and from S3. On one machine the second concurrent job competes for the
+	// same cores and the same link: in the run above, B's validate took 218s
+	// against A's 67s for the same work, purely from contention. Two at once
+	// can finish both later than one at a time would have.
+	//
+	// It earns its keep where a stage is waiting rather than working — a slow
+	// S3 round trip, a stage whose ffmpeg does not saturate the box — or on a
+	// host with cores to spare.
+	WorkerConcurrency int
+
 	// MockTranscribe skips the speech model and emits synthetic cues. Default
 	// true: the budget rules allow only a handful of real runs, so every stage
 	// downstream of transcribe is developed against the mock.
@@ -96,6 +131,16 @@ func Load() *Config {
 		QueueMaxDeliveries:     getEnvInt("QUEUE_MAX_DELIVERIES", 3),
 		QueuePollInterval:      getEnvDuration("QUEUE_POLL_INTERVAL", defaultPollInterval(driver)),
 
+		JobCacheTTL: getEnvDuration("JOB_CACHE_TTL", DefaultJobCacheTTL),
+
+		// Clamped rather than validated: 0 or a negative would deadlock the
+		// consume loop on a semaphore that can never be acquired, and a worker
+		// that silently processes nothing is the worst of the available
+		// failures. WORKER_CONCURRENCY sat in .env and .env.example for months
+		// with no Go code reading it, so a deployment could believe it had
+		// parallelism it did not have; this is the line that makes it true.
+		WorkerConcurrency: maxInt(1, getEnvInt("WORKER_CONCURRENCY", 1)),
+
 		MockTranscribe:   getEnv("MOCK_TRANSCRIBE", "true") == "true",
 		S3PublicEndpoint: getEnv("S3_PUBLIC_ENDPOINT", ""),
 		UploadPartSize:   getEnvBytes("UPLOAD_PART_SIZE", DefaultUploadPartSize),
@@ -138,6 +183,23 @@ func defaultPollInterval(driver string) time.Duration {
 	}
 	return 250 * time.Millisecond
 }
+
+// DefaultJobCacheTTL is the default window GET /jobs/{id} may answer from cache.
+//
+// One second, not the ten it used to be, because nothing invalidates the cache
+// on a stage transition: the cache is a map inside the API process and the four
+// workers are separate processes, so a worker cannot reach it even in principle.
+// The API invalidates only on POST /jobs/{id}/complete and
+// DELETE /jobs/{id}/upload, the two transitions it owns. Every later transition
+// is therefore visible to a client only once the entry expires, so the TTL is
+// the observation lag, and at 10s an app polling every 2s could get the same
+// answer five times and skip whole stages of a ~37s pipeline.
+//
+// One second still absorbs a poll storm — several job screens polling at 2s
+// collapse to roughly one DynamoDB read per job per second — and the reads it
+// gives back are worth a fraction of a cent per hour on a ~1.7 KB item. Raise it
+// via JOB_CACHE_TTL where reads cost more than freshness does.
+const DefaultJobCacheTTL = 1 * time.Second
 
 // DefaultUploadPartSize is S3's minimum size for a non-final part. Anything
 // smaller is valid to upload but fails at CompleteMultipartUpload on real S3.
@@ -206,6 +268,17 @@ func getEnvInt(key string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+// maxInt is the floor guard for settings where a non-positive value would not
+// merely be wrong but would hang the process — WorkerConcurrency being the case
+// it exists for. Go 1.21's builtin `max` would do, but spelling it out keeps
+// the clamp visible at the call site.
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // PublicEndpoint is the base URL for objects a player must reach.

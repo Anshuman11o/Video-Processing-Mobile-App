@@ -2,10 +2,15 @@
 //
 // It replaces the previous Redis client. The cache exists to absorb mobile
 // clients polling GET /jobs/{id} every second or two while a video processes;
-// with a 10s TTL that turns a poll storm into one DynamoDB read per job per ten
-// seconds. Nothing here is a source of truth, so a process restart losing the
-// whole map costs one extra DynamoDB read per job — which is why an entire
-// network service was not worth keeping for it.
+// several job screens polling at that rate collapse into roughly one DynamoDB
+// read per job per TTL. Nothing here is a source of truth, so a process restart
+// losing the whole map costs one extra DynamoDB read per job — which is why an
+// entire network service was not worth keeping for it.
+//
+// The TTL is also the ceiling on how stale an answer can be, because no worker
+// invalidates: the map lives in the API process and the stage workers are
+// separate processes. It is configurable through JOB_CACHE_TTL and defaults to
+// config.DefaultJobCacheTTL, which documents the trade.
 package cache
 
 import (
@@ -20,9 +25,14 @@ import (
 )
 
 const (
-	defaultTTL = 10 * time.Second
+	// defaultTTL is the fallback for a missing or unusable configured TTL. It
+	// tracks config.DefaultJobCacheTTL rather than restating the number, so the
+	// documented default and the one actually applied cannot drift apart.
+	defaultTTL = config.DefaultJobCacheTTL
 
-	// sweepInterval is how often the janitor reclaims expired entries.
+	// sweepInterval is how often the janitor reclaims expired entries. It is
+	// independent of the TTL: reads enforce expiry on their own, so this only
+	// bounds how long dead entries occupy memory.
 	sweepInterval = 30 * time.Second
 )
 
@@ -48,12 +58,19 @@ type Cache struct {
 	once sync.Once
 }
 
-// New creates a Cache with the default 10s TTL and starts its janitor.
+// New creates a Cache with the configured TTL and starts its janitor.
 //
-// It takes the config for symmetry with the other clients wired in main.go, and
-// so a future TTL knob does not change every call site.
-func New(_ *config.Config) *Cache {
-	return newWithTTL(defaultTTL, sweepInterval)
+// A nil config or a non-positive TTL falls back to defaultTTL rather than being
+// honoured. Zero would make every entry expire before it could be read — a
+// cache that only ever costs a map write — and a negative one is meaningless;
+// neither is worth taking the API down for, and neither is what someone setting
+// JOB_CACHE_TTL meant.
+func New(cfg *config.Config) *Cache {
+	ttl := defaultTTL
+	if cfg != nil && cfg.JobCacheTTL > 0 {
+		ttl = cfg.JobCacheTTL
+	}
+	return newWithTTL(ttl, sweepInterval)
 }
 
 func newWithTTL(ttl, sweep time.Duration) *Cache {
@@ -110,7 +127,7 @@ func (c *Cache) SetJob(_ context.Context, job *models.Job) error {
 }
 
 // InvalidateJob drops a job from the cache, for when the API knows the status
-// just changed and must not serve the old one for another ten seconds.
+// just changed and must not serve the old one for another whole TTL.
 func (c *Cache) InvalidateJob(_ context.Context, jobID string) error {
 	c.mu.Lock()
 	delete(c.entries, jobID)

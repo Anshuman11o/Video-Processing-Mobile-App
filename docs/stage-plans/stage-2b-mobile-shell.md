@@ -72,7 +72,7 @@ mobile/
 
 ```
 ┌─────────────────────────────────────┐
-│  DayReel                    [Jobs]  │  <- Header with nav to JobList
+│  CaptionClips              [Jobs]  │  <- Header with nav to JobList
 ├─────────────────────────────────────┤
 │                                     │
 │                                     │
@@ -301,7 +301,7 @@ export default function App() {
   return (
     <NavigationContainer>
       <Stack.Navigator initialRouteName="Home">
-        <Stack.Screen name="Home" component={HomeScreen} options={{ title: 'DayReel' }} />
+        <Stack.Screen name="Home" component={HomeScreen} options={{ title: 'CaptionClips' }} />
         <Stack.Screen name="JobList" component={JobListScreen} options={{ title: 'Jobs' }} />
         <Stack.Screen name="Player" component={PlayerScreen} />
       </Stack.Navigator>

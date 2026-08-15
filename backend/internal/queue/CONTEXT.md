@@ -1,6 +1,6 @@
 # Queue Package
 
-This package is DayReel's message broker. It has **two drivers behind one interface**:
+This package is CaptionClips's message broker. It has **two drivers behind one interface**:
 
 - **SQLite** (`QUEUE_DRIVER=sqlite`, the default) — a self-hosted, SQS-equivalent queue in a single file. No server, no account, no per-request cost.
 - **SQS** (`QUEUE_DRIVER=sqs`) — real Amazon SQS.

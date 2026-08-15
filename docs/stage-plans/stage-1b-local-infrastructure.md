@@ -127,7 +127,7 @@ volumes:
 #!/bin/bash
 set -euo pipefail
 
-echo "Initializing DayReel AWS resources..."
+echo "Initializing CaptionClips AWS resources..."
 
 ENDPOINT="http://localhost:4566"
 REGION="us-east-1"
@@ -255,7 +255,7 @@ echo "S3 event notifications configured."
 
 echo ""
 echo "============================================"
-echo "DayReel local infrastructure initialized!"
+echo "CaptionClips local infrastructure initialized!"
 echo "============================================"
 echo ""
 echo "S3 Buckets:"
@@ -285,13 +285,13 @@ echo ""
 #!/bin/bash
 set -euo pipefail
 
-# DayReel Development Setup
+# CaptionClips Development Setup
 # Run this once to set up your local environment
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
-echo "Setting up DayReel development environment..."
+echo "Setting up CaptionClips development environment..."
 
 # Check prerequisites
 command -v docker >/dev/null 2>&1 || { echo "Docker is required but not installed. Aborting."; exit 1; }
@@ -407,7 +407,7 @@ make dev-up
 
 # Wait for init script to complete (watch logs)
 make dev-logs
-# Look for "DayReel local infrastructure initialized!"
+# Look for "CaptionClips local infrastructure initialized!"
 
 # Verify resources
 make test-infra

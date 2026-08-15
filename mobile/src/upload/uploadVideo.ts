@@ -16,6 +16,23 @@ export interface SelectedVideo {
   filename: string;
   sizeBytes: number;
   contentType: string;
+  /**
+   * Video length in seconds, if the decoder has reported it. Not sent to the
+   * API — `POST /jobs` has no field for it — but recorded in the local index so
+   * the job list can show it before the pipeline has produced any output.
+   */
+  durationSeconds?: number;
+}
+
+/** The local-index row for a video, kept in one place so both paths agree. */
+function indexEntry(jobId: string, video: SelectedVideo) {
+  return {
+    job_id: jobId,
+    filename: video.filename,
+    created_at: new Date().toISOString(),
+    size_bytes: video.sizeBytes,
+    duration_seconds: video.durationSeconds,
+  };
 }
 
 export interface UploadVideoOptions {
@@ -52,11 +69,7 @@ export async function uploadVideo(
   });
 
   if (store) {
-    await recordJob(store, {
-      job_id: created.job_id,
-      filename: video.filename,
-      created_at: new Date().toISOString(),
-    });
+    await recordJob(store, indexEntry(created.job_id, video));
   }
 
   const parts = await uploadParts({
@@ -115,11 +128,7 @@ export async function startBackgroundVideoUpload(opts: {
   // must still be in the list when it comes back, or the device has no way to
   // rediscover it: there is no GET /jobs.
   if (store) {
-    await recordJob(store, {
-      job_id: created.job_id,
-      filename: video.filename,
-      created_at: new Date().toISOString(),
-    });
+    await recordJob(store, indexEntry(created.job_id, video));
   }
 
   await startBackgroundUpload({

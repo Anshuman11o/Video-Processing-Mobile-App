@@ -491,8 +491,10 @@ func (h *Handler) GetJobStatus(w http.ResponseWriter, r *http.Request) {
 	jobID := mux.Vars(r)["id"]
 
 	// Check the in-process cache first. It exists for exactly this handler: the
-	// app polls it every second or two for the whole length of a job, and a 10s
-	// TTL turns that into one DynamoDB read per job per ten seconds.
+	// app polls it every second or two for the whole length of a job, and the
+	// TTL (JOB_CACHE_TTL, 1s by default) collapses that into about one DynamoDB
+	// read per job per TTL. Since no worker can invalidate an in-process map,
+	// that same TTL is the lag before a stage transition becomes visible here.
 	job, err := h.cache.GetJob(r.Context(), jobID)
 	if err != nil {
 		log.Printf("WARN: cache get: %v", err)

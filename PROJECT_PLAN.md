@@ -1,11 +1,11 @@
-# DayReel Project Plan
+# CaptionClips Project Plan
 
 ## Context
 
-DayReel is an offline-first mobile video capture app with a backend processing
+CaptionClips is an offline-first mobile video capture app with a backend processing
 pipeline. Users record short clips, the app queues and uploads them via resumable
 chunked transfer, and a backend pipeline validates, extracts, transcribes, and
-packages clips into adaptive-bitrate HLS reels.
+packages clips into captioned adaptive-bitrate HLS streams.
 
 **Time budget: ~3 hours.** This plan prioritizes the narrowest possible E2E demo
 path. Expand incrementally once the core flow works.

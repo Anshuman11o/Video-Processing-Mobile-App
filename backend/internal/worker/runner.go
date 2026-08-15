@@ -29,9 +29,17 @@ const (
 	initialReceiveBackoff = 1 * time.Second
 	maxReceiveBackoff     = 30 * time.Second
 
-	// receiveMax is how many messages a single receive claims. One at a time
-	// keeps the failure story simple; parallelism comes from running more
-	// worker processes.
+	// receiveMax is how many messages a single receive claims.
+	//
+	// It stays 1 even when WorkerConcurrency is higher, and that is deliberate.
+	// Concurrency is expressed by how many messages are IN FLIGHT, not by how
+	// many are claimed per call: the loop takes a slot, claims one message,
+	// hands it to a goroutine and immediately comes back for the next, so N
+	// slots still yield N concurrent handlers. Claiming a batch instead would
+	// mean holding leases on messages this process has not started, which go
+	// stale while they wait — and on SQS a partial batch failure has to be
+	// unpicked message by message. One at a time keeps the failure story the
+	// same at any concurrency.
 	receiveMax = 1
 
 	// heartbeatInterval is how often a running stage extends its message's
@@ -111,6 +119,17 @@ type Runner struct {
 	// broker's own visibility timeout, so a heartbeat buys exactly as much time
 	// as a fresh delivery would.
 	leaseExtension time.Duration
+
+	// concurrency is how many messages this runner processes at once. 1 is the
+	// original behaviour and the default.
+	//
+	// Everything handle() touches is safe to run in parallel, which is what
+	// makes this a bounded pool rather than a rewrite: each stage does its work
+	// in its own os.MkdirTemp directory, the AWS SDK clients are documented as
+	// goroutine-safe, both queue drivers state the same, and the only
+	// package-level state in the stages is read-only defaults. The Runner
+	// itself is immutable after construction.
+	concurrency int
 }
 
 // NewRunner wires a Runner for the given stage.
@@ -128,13 +147,43 @@ func NewRunner(
 		pollWait:       cfg.QueuePollInterval,
 		maxDeliveries:  cfg.QueueMaxDeliveries,
 		leaseExtension: cfg.QueueVisibilityTimeout,
+		concurrency:    maxInt(1, cfg.WorkerConcurrency),
 	}
 }
 
+// maxInt guards the pool size a second time, at the boundary the deadlock would
+// actually happen. config.Load already clamps, but a Runner built in a test or
+// by any other caller must not be able to ask for a semaphore of size zero —
+// that worker would block forever on its first acquire and never log a reason.
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // Run consumes until ctx is cancelled.
+//
+// Up to concurrency messages are processed at once. A slot is taken BEFORE the
+// message is claimed, never after: claiming first and then waiting for capacity
+// would hold a lease on work this process has not begun, burning visibility
+// timeout while the message sits idle and eventually letting another worker
+// take it mid-flight. Taking the slot first means a full runner simply does not
+// ask for work, and the message stays visible for a runner that can start it
+// now.
 func (r *Runner) Run(ctx context.Context) error {
-	log.Printf("worker[%s] consuming %s (max %d deliveries, %s lease)",
-		r.stage.Name(), r.queueName, r.maxDeliveries, r.leaseExtension)
+	log.Printf("worker[%s] consuming %s (max %d deliveries, %s lease, concurrency %d)",
+		r.stage.Name(), r.queueName, r.maxDeliveries, r.leaseExtension, r.concurrency)
+
+	// A token in the channel is a message in flight; capacity is the pool size.
+	slots := make(chan struct{}, r.concurrency)
+
+	// Wait for in-flight handlers before returning, so shutdown does not orphan
+	// a stage mid-encode. Each abandoned message would come back anyway once
+	// its lease expired, but that is a redelivery and a repeated transcode, not
+	// a clean stop. Deferred before the loop so every exit path drains.
+	var wg sync.WaitGroup
+	defer wg.Wait()
 
 	backoff := initialReceiveBackoff
 
@@ -144,8 +193,21 @@ func (r *Runner) Run(ctx context.Context) error {
 			return nil
 		}
 
+		// Block until the pool has room. At concurrency 1 this is the original
+		// behaviour exactly: acquire, claim, process, release.
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			log.Printf("worker[%s] shutting down", r.stage.Name())
+			return nil
+		}
+
 		msgs, err := r.queue.Receive(ctx, r.queueName, receiveMax, r.pollWait)
 		if err != nil {
+			// Release before handling the error: every path below either
+			// continues the loop or returns, and a slot leaked here would
+			// shrink the pool by one for the life of the process.
+			<-slots
 			// A cancelled context surfaces here as a receive error; that is a
 			// clean shutdown, not a failure.
 			if ctx.Err() != nil {
@@ -172,8 +234,35 @@ func (r *Runner) Run(ctx context.Context) error {
 
 		backoff = initialReceiveBackoff
 
-		for _, m := range msgs {
-			r.handle(ctx, m)
+		// An empty receive is the common case on an idle queue — the poll simply
+		// timed out. Give the slot back and go round again.
+		if len(msgs) == 0 {
+			<-slots
+			continue
+		}
+
+		// receiveMax is 1, so this is one message; the loop is kept so a future
+		// batch size does not silently drop the rest. The first message uses the
+		// slot already held and each additional one takes its own, blocking
+		// until the pool has room rather than over-committing.
+		for i, m := range msgs {
+			if i > 0 {
+				select {
+				case slots <- struct{}{}:
+				case <-ctx.Done():
+					return nil
+				}
+			}
+
+			wg.Add(1)
+			go func(m queue.Message) {
+				defer wg.Done()
+				// Release the slot however handle exits, panic included — a
+				// leaked slot silently shrinks the pool, and a pool that reaches
+				// zero is a worker that polls forever and processes nothing.
+				defer func() { <-slots }()
+				r.handle(ctx, m)
+			}(m)
 		}
 	}
 }

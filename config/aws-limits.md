@@ -7,7 +7,7 @@ against them.
 
 ## S3
 
-| Constraint | Value | Impact on DayReel |
+| Constraint | Value | Impact on CaptionClips |
 |------------|-------|-------------------|
 | Minimum part size (multipart) | 5 MB | Parts must be >= 5MB except the last. `UPLOAD_PART_SIZE` sits on the floor |
 | Maximum part size | 5 GB | Not a concern for short clips |
@@ -38,7 +38,7 @@ Both are implemented in `backend/internal/queue/`. Most of these are settings we
 choose rather than limits AWS imposes, but they bind the same way: get them wrong
 and the pipeline stalls or reprocesses.
 
-| Setting | SQLite | SQS | Impact on DayReel |
+| Setting | SQLite | SQS | Impact on CaptionClips |
 |---------|--------|-----|-------------------|
 | Message size | No hard limit | 256 KiB per message | Messages carry S3 pointers, not payloads; ~300 bytes typical |
 | Visibility timeout | 5 minutes (`QUEUE_VISIBILITY_TIMEOUT`) | Same, but the **queue's own attribute** is what AWS enforces | Must exceed the slowest stage; transcribe is the risk |
@@ -66,7 +66,7 @@ raise the timeout above the p99 stage duration or make the stage cheap to repeat
 
 ## DynamoDB
 
-| Constraint | Value | Impact on DayReel |
+| Constraint | Value | Impact on CaptionClips |
 |------------|-------|-------------------|
 | Item size | 400 KB max | Job item with stages map is ~2KB; not a concern |
 | Partition key | Required | Use `job_id` as PK |
@@ -86,7 +86,7 @@ per-stage state. One `GetItem` returns full job status.
 
 ## Lambda (if used for workers)
 
-| Constraint | Value | Impact on DayReel |
+| Constraint | Value | Impact on CaptionClips |
 |------------|-------|-------------------|
 | Payload size (sync) | 6 MB | Not using sync invoke |
 | Payload size (async) | 256 KB | Would need an event source we no longer have |
@@ -126,7 +126,7 @@ freed 1.5–2.5 GB, which is most of a t3.micro.
 
 Reels are served **directly from the HLS bucket** on S3. No CDN.
 
-| Constraint | Value | Impact on DayReel |
+| Constraint | Value | Impact on CaptionClips |
 |------------|-------|-------------------|
 | Bucket read access | Must be reachable by the player | Bucket policy allows public read on `hls-output` |
 | CORS | Required for browser/ExoPlayer range requests | Set once on the bucket, by hand or later by Terraform |
@@ -146,7 +146,7 @@ Not Redis, not ElastiCache: one process reads this cache, the working set is a
 few hundred bytes per in-flight job, and a separate cache server costs more RAM
 than the whole rest of the local stack.
 
-| Constraint | Value | Impact on DayReel |
+| Constraint | Value | Impact on CaptionClips |
 |------------|-------|-------------------|
 | Entry size | ~1 KB per job | Bounded by in-flight jobs, which is single digits |
 | Lifetime | Process lifetime | Restarting the API drops the cache; next poll hits DynamoDB |

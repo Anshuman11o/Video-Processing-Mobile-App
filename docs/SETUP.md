@@ -1,6 +1,6 @@
 # Setup and known limitations
 
-How to run DayReel locally, and the caveats that will otherwise be discovered the
+How to run CaptionClips locally, and the caveats that will otherwise be discovered the
 hard way.
 
 ## Running the stack
@@ -330,22 +330,28 @@ request, so every call that names a job in its path (`POST /jobs/<id>/complete`,
 inside the handler and returned in the body, and the log line is just the path.
 A job created and then abandoned appears in no log line at all.
 
-### Pipeline stages are usually invisible in the UI
+### Pipeline stage visibility is bounded by the cache TTL
 
-`GET /jobs/{id}` is served from a 10-second in-process cache
-(`backend/internal/cache/memory.go`), and no worker invalidates it. A job can
-begin and finish inside a single cached response, and the app then jumps straight
-from `uploading` to `completed` without displaying any intermediate stage. The
-progress display is correct when it updates; it may simply have nothing to show.
+> **Correction, 2026-08-14.** This section was headed *"Pipeline stages are
+> usually invisible in the UI"* and described a 10-second cache. **The TTL is
+> now 1 second** (`config.DefaultJobCacheTTL`, overridable with
+> `JOB_CACHE_TTL`), so stages are normally *visible*. The mechanism below is
+> unchanged and still worth understanding — only the size of the window moved.
 
-This was a cache-coherence gap when the cache was Redis, and it is a **stronger**
-one now. The cache is a map inside the API process and the workers are separate
-processes, so a worker cannot reach it even in principle — there is no cache
-server between them to invalidate. The API invalidates on
-`POST /jobs/{id}/complete` and `DELETE /jobs/{id}/upload`, which are the two
-transitions it owns; every stage transition after that belongs to a worker, and
-none of them reach the cache. The trade was left open deliberately rather than
-fixed.
+`GET /jobs/{id}` is served from an in-process cache
+(`backend/internal/cache/memory.go`), and **no worker invalidates it.** The
+cache is a map inside the API process and the workers are separate processes,
+so a worker cannot reach it even in principle — there is no cache server between
+them to invalidate. The API invalidates on `POST /jobs/{id}/complete` and
+`DELETE /jobs/{id}/upload`, the two transitions it owns; every stage transition
+after that belongs to a worker, and none of them reach the cache.
+
+**So the TTL is not a performance knob, it is the observation lag.** It is the
+only bound on how far behind a stage transition the API's answer can be. At the
+old 10 s an app polling every 2 s could receive the same answer five times and
+skip whole stages; at 1 s a transition surfaces on the next poll. The gap is
+narrowed, not closed — that would need worker-side invalidation, which is not
+built.
 
 > **Correction, 2026-08-13.** This section used to assert that "the whole
 > pipeline completes in about four seconds", which made stages *always*
@@ -363,9 +369,10 @@ pipeline makes stages *more* visible, not less — so the headline conclusion ho
 a fortiori. The 12.8 s package stage is the one to watch, since it uploads every
 segment of every rendition individually.
 
-To watch stages transition, bypass the cache. Each worker logs its own stage to
-its own stdout, so run the stage you care about on its own, and read the queue
-directly:
+Polling now shows transitions within about a second, so none of the following is
+a workaround any more — it is simply the better view when you want per-stage
+detail the API does not expose. Each worker logs its own stage to its own
+stdout, so run the stage you care about on its own, and read the queue directly:
 
 ```bash
 make worker STAGE=validate    # this stage's log, uninterleaved

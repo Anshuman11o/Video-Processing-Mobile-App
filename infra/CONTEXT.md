@@ -1,4 +1,4 @@
-# DayReel Infrastructure
+# CaptionClips Infrastructure
 
 **This directory is currently empty apart from this file.** It is a placeholder
 for the Terraform stage (`infra/terraform/`, Stage 10). Nothing in the local

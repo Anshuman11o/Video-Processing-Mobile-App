@@ -1,4 +1,4 @@
-# DayReel Metrics
+# CaptionClips Metrics
 
 The four metrics `PROJECT_PLAN.md` → "Metrics Plan" asked for, measured against
 **real AWS** on **2026-08-13**. This is the first time any of them has been

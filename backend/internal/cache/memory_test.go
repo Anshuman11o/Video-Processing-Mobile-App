@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anshumanagarwal/dayreel/internal/config"
 	"github.com/anshumanagarwal/dayreel/internal/models"
 )
 
@@ -75,6 +76,83 @@ func TestEntriesExpire(t *testing.T) {
 	}
 	if got != nil {
 		t.Errorf("GetJob after TTL = %+v, want nil (entry should have expired)", got)
+	}
+}
+
+// TestNewHonoursConfiguredTTL proves JobCacheTTL reaches the entries themselves
+// and is not merely stored on the struct. The TTL is the whole reason a stage
+// transition becomes visible to the app at all, so "wired through" has to mean
+// an entry actually stops being served.
+func TestNewHonoursConfiguredTTL(t *testing.T) {
+	const ttl = 60 * time.Millisecond
+	c := New(&config.Config{JobCacheTTL: ttl})
+	defer c.Close()
+	ctx := context.Background()
+
+	job := models.NewJob("clip.mp4", 1024, "video/mp4")
+	if err := c.SetJob(ctx, job); err != nil {
+		t.Fatalf("SetJob: %v", err)
+	}
+	if got, _ := c.GetJob(ctx, job.JobID); got == nil {
+		t.Fatal("entry missing immediately after SetJob")
+	}
+
+	time.Sleep(ttl + 60*time.Millisecond)
+
+	if got, _ := c.GetJob(ctx, job.JobID); got != nil {
+		t.Errorf("GetJob after the configured %s = %+v, want nil", ttl, got)
+	}
+}
+
+// TestNewDefaultTTLIsOneSecond pins the demo-critical value. GET /jobs/{id} has
+// no invalidation from the workers, so this number is exactly how far behind the
+// pipeline the app's stage display can be.
+func TestNewDefaultTTLIsOneSecond(t *testing.T) {
+	if config.DefaultJobCacheTTL != time.Second {
+		t.Errorf("config.DefaultJobCacheTTL = %s, want 1s", config.DefaultJobCacheTTL)
+	}
+
+	// An unset JOB_CACHE_TTL must reach the cache as that default.
+	t.Setenv("JOB_CACHE_TTL", "")
+	c := New(config.Load())
+	defer c.Close()
+
+	if c.ttl != time.Second {
+		t.Errorf("cache TTL from a default config = %s, want 1s", c.ttl)
+	}
+}
+
+// TestNewFallsBackOnUnusableTTL covers the values that would silently disable
+// the cache rather than tune it.
+func TestNewFallsBackOnUnusableTTL(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  *config.Config
+	}{
+		{"nil config", nil},
+		{"zero TTL", &config.Config{JobCacheTTL: 0}},
+		{"negative TTL", &config.Config{JobCacheTTL: -5 * time.Second}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := New(tc.cfg)
+			defer c.Close()
+
+			if c.ttl != defaultTTL {
+				t.Fatalf("TTL = %s, want the %s default", c.ttl, defaultTTL)
+			}
+
+			// And the fallback is a working cache, not just a stored number.
+			ctx := context.Background()
+			job := models.NewJob("clip.mp4", 1024, "video/mp4")
+			if err := c.SetJob(ctx, job); err != nil {
+				t.Fatalf("SetJob: %v", err)
+			}
+			if got, _ := c.GetJob(ctx, job.JobID); got == nil {
+				t.Error("entry expired immediately; the fallback TTL was not applied")
+			}
+		})
 	}
 }
 

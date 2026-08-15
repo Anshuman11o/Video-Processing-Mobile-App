@@ -1,9 +1,11 @@
-# DayReel
+# CaptionClips
+
+**From clip to captioned stream.**
 
 ## Demo
 
 <p align="center">
-  <img src="docs/assets/dayreel-demo.gif" width="300" alt="DayReel: a clip picked in the app, uploaded, processed, and played back as a captioned reel">
+  <img src="docs/assets/dayreel-demo.gif" width="300" alt="CaptionClips: a clip picked in the app, uploaded, processed, and played back as a captioned stream">
 </p>
 
 <p align="center">
@@ -15,8 +17,19 @@
 An offline-first mobile video app. Record short clips on a weak network; the app
 queues them locally and uploads in the background, resuming **from the exact byte
 it stopped at** even after the app is killed. A backend pipeline then validates,
-extracts, transcribes and packages each clip into an adaptive-bitrate reel,
-waiting the next time you open the app.
+extracts, transcribes and packages each clip into a captioned adaptive-bitrate
+stream, waiting the next time you open the app.
+
+> **On the name.** The product was called *DayReel* until it was renamed to
+> *CaptionClips*. The rename stopped at the product: the Android package id
+> (`com.dayreel`), the Go module path (`github.com/anshumanagarwal/dayreel`), the
+> S3 buckets (`dayreel-raw-videos`, `dayreel-processed`, `dayreel-hls-output`),
+> the DynamoDB table (`dayreel-jobs`), the queue names (`dayreel-validate` and
+> friends), the emulator AVD (`dayreel-avd`) and the logcat tag (`DayReelUpload`)
+> all still say `dayreel`. They name live infrastructure and shipped code, so
+> renaming them in the docs would only send you to resources that do not exist.
+> Where you see `dayreel` in a command or an identifier anywhere in this
+> repository, it is deliberate and correct.
 
 ---
 
@@ -75,7 +88,7 @@ exists before doing any work. A worker can fail mid-encode without the job being
 lost or duplicated.
 
 The result accepts a clip on a poor connection, finishes the upload whenever the
-network allows, and has a completed reel ready when the user returns.
+network allows, and has a finished captioned stream ready when the user returns.
 
 ---
 
@@ -112,7 +125,7 @@ flowchart TB
     workers -->|"read input · write output"| s3
     workers -->|"record stage state"| ddb
     api -->|"job state"| ddb
-    s3 ==>|"stream reel"| player
+    s3 ==>|"stream captioned HLS"| player
     api -->|"playback URL"| player
 ```
 
@@ -132,7 +145,7 @@ single small API process can serve uploads of any size.
 | **Workers** | ffmpeg and whisper.cpp execution | One binary, four stages; `WORKER_STAGE` selects |
 | **S3** | Every video byte and derived artifact | Also supplies the multipart API that makes resume possible |
 | **DynamoDB** | Job record with per-stage state | The only source of truth about what has happened |
-| **In-process cache** | 10-second TTL on job status | Absorbs status polling without a cache server |
+| **In-process cache** | 1-second TTL on job status (`JOB_CACHE_TTL`) | Absorbs polling bursts. No worker can invalidate it, so the TTL *is* the stage-transition lag |
 
 ### 3.2 Data flow, end to end
 

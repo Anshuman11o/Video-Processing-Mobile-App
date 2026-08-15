@@ -1,6 +1,6 @@
 # Events Package
 
-This package contains stage message types and resource constants for the DayReel video processing pipeline.
+This package contains stage message types and resource constants for the CaptionClips video processing pipeline.
 
 ## Overview
 

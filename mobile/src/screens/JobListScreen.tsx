@@ -1,4 +1,4 @@
-import React, {useCallback, useEffect, useState} from 'react';
+import React, {useCallback, useRef, useState} from 'react';
 import {
   View,
   Text,
@@ -22,6 +22,9 @@ import {
 import {getJobStatus} from '../api/client';
 import {blobJobIndexStore} from '../storage/blobJobIndexStore';
 import {type JobIndexEntry, loadIndex} from '../storage/jobIndex';
+import {StageTracker} from '../components/StageTracker';
+import {useTicker} from '../hooks/useTicker';
+import {formatDuration, formatMB} from '../metrics/jobMetrics';
 
 type JobListScreenProps = {
   navigation: NativeStackNavigationProp<RootStackParamList, 'JobList'>;
@@ -42,8 +45,33 @@ interface JobRow {
   error?: string;
 }
 
-function JobCard({row, onPress}: {row: JobRow; onPress: () => void}) {
+/** How often to re-poll the list while any job on it is still running. */
+const LIST_POLL_MS = 2000;
+
+function JobCard({
+  row,
+  nowMs,
+  onPress,
+}: {
+  row: JobRow;
+  nowMs: number;
+  onPress: () => void;
+}) {
   const {entry, job} = row;
+
+  // The local index carries the filename, size and length, so a row is
+  // readable before — or without — the API answering for it. That matters most
+  // during an upload, when `GET /jobs/{id}` has almost nothing to say and this
+  // is exactly when someone is watching.
+  const sizeLabel = entry.size_bytes ?? job?.size_bytes;
+  const meta = [
+    sizeLabel !== undefined ? formatMB(sizeLabel) : null,
+    entry.duration_seconds !== undefined
+      ? formatDuration(entry.duration_seconds)
+      : null,
+  ]
+    .filter(Boolean)
+    .join(' · ');
 
   if (!job) {
     return (
@@ -51,6 +79,7 @@ function JobCard({row, onPress}: {row: JobRow; onPress: () => void}) {
         <Text style={styles.filename} numberOfLines={1}>
           {entry.filename}
         </Text>
+        {meta ? <Text style={styles.meta}>{meta}</Text> : null}
         <Text style={styles.stageInfo}>
           {row.error ? `unavailable — ${row.error}` : 'loading…'}
         </Text>
@@ -64,31 +93,35 @@ function JobCard({row, onPress}: {row: JobRow; onPress: () => void}) {
   // not all been written yet would otherwise show "1/1 stages complete".
   const totalStages = ALL_STAGES.length;
   const failure = jobErrorMessage(job);
+  const done = job.status === 'completed';
 
   return (
     <TouchableOpacity style={styles.card} onPress={onPress}>
       <View style={styles.cardHeader}>
-        <Text style={styles.filename} numberOfLines={1}>
-          {job.filename}
-        </Text>
-        <View style={[styles.statusBadge, {backgroundColor: statusColor + '22'}]}>
-          <Text style={[styles.statusText, {color: statusColor}]}>
-            {job.status}
+        <View style={styles.cardHeaderText}>
+          <Text style={styles.filename} numberOfLines={1}>
+            {job.filename}
           </Text>
+          {meta ? <Text style={styles.meta}>{meta}</Text> : null}
         </View>
+        {done ? (
+          // Deliberately louder than the other statuses. "Is it finished yet"
+          // is the only question this list is asked, and a lowercase chip the
+          // same size as `processing` made it something you had to read rather
+          // than see.
+          <View style={styles.doneBadge}>
+            <Text style={styles.doneBadgeText}>✓ COMPLETED</Text>
+          </View>
+        ) : (
+          <View style={[styles.statusBadge, {backgroundColor: statusColor + '22'}]}>
+            <Text style={[styles.statusText, {color: statusColor}]}>
+              {job.status}
+            </Text>
+          </View>
+        )}
       </View>
 
-      <View style={styles.progressBar}>
-        <View
-          style={[
-            styles.progressFill,
-            {
-              width: `${(completedStages / totalStages) * 100}%`,
-              backgroundColor: statusColor,
-            },
-          ]}
-        />
-      </View>
+      <StageTracker job={job} nowMs={nowMs} compact />
 
       <Text style={styles.stageInfo}>
         {completedStages}/{totalStages} stages complete
@@ -99,13 +132,23 @@ function JobCard({row, onPress}: {row: JobRow; onPress: () => void}) {
   );
 }
 
-/** How often to re-poll the list while any job on it is still running. */
-const LIST_POLL_MS = 2000;
-
 export default function JobListScreen({navigation}: JobListScreenProps) {
   const [rows, setRows] = useState<JobRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+
+  // The compact trackers carry no seconds counters, so this only has to be
+  // fast enough that a stage changing colour does not wait on the next poll.
+  const now = useTicker(1000);
+
+  /**
+   * Whether anything on the list is still moving.
+   *
+   * Held in a ref, not read from state, because the poll loop that has to stop
+   * is created once per focus — reading `rows` from the closure would give it
+   * the empty list it was created with, and it would poll forever.
+   */
+  const anyRunning = useRef(true);
 
   const load = useCallback(async () => {
     const entries = await loadIndex(blobJobIndexStore);
@@ -128,48 +171,36 @@ export default function JobListScreen({navigation}: JobListScreenProps) {
       }),
     );
 
+    anyRunning.current = fetched.some(r => !r.job || !isTerminal(r.job.status));
     setRows(fetched);
     setLoading(false);
   }, []);
 
   // Refresh on focus, and keep polling only while something is unfinished.
+  // Left running, this is N requests every 2s for as long as the screen is
+  // open — the client-side version of the hot loop `config/free-tier.md`
+  // forbids.
   useFocusEffect(
     useCallback(() => {
       let cancelled = false;
-      let timer: ReturnType<typeof setInterval> | null = null;
+      anyRunning.current = true;
 
-      const tick = async () => {
-        await load();
-        if (cancelled) {
+      const timer = setInterval(() => {
+        if (cancelled || !anyRunning.current) {
+          clearInterval(timer);
           return;
         }
-      };
-
-      tick();
-      timer = setInterval(() => {
-        if (cancelled) {
-          return;
-        }
-        tick();
+        load();
       }, LIST_POLL_MS);
+
+      load();
 
       return () => {
         cancelled = true;
-        if (timer) {
-          clearInterval(timer);
-        }
+        clearInterval(timer);
       };
     }, [load]),
   );
-
-  // Stop polling once every known job has settled. Left running, this is a
-  // request every 2s for as long as the screen is open.
-  const anyRunning = rows.some(r => !r.job || !isTerminal(r.job.status));
-  useEffect(() => {
-    if (!anyRunning && rows.length > 0) {
-      setLoading(false);
-    }
-  }, [anyRunning, rows.length]);
 
   if (loading) {
     return (
@@ -183,7 +214,7 @@ export default function JobListScreen({navigation}: JobListScreenProps) {
     return (
       <View style={styles.centered}>
         <Text style={styles.emptyText}>No jobs yet</Text>
-        <Text style={styles.emptySubtext}>Select a video to get started</Text>
+        <Text style={styles.emptySubtext}>Select videos to get started</Text>
       </View>
     );
   }
@@ -207,8 +238,16 @@ export default function JobListScreen({navigation}: JobListScreenProps) {
         renderItem={({item}) => (
           <JobCard
             row={item}
+            nowMs={now}
             onPress={() =>
-              navigation.navigate('Player', {jobId: item.entry.job_id})
+              // The detail screen, not the player. The player is only worth
+              // opening once there is something to play, and it says nothing
+              // about a job that is still running — which is most of the time
+              // a user spends here.
+              navigation.navigate('JobDetail', {
+                jobId: item.entry.job_id,
+                filename: item.entry.filename,
+              })
             }
           />
         )}
@@ -242,14 +281,22 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 12,
+    marginBottom: 14,
+  },
+  cardHeaderText: {
+    flex: 1,
+    marginRight: 8,
   },
   filename: {
     color: '#ffffff',
     fontSize: 16,
     fontWeight: '600',
-    flex: 1,
-    marginRight: 8,
+  },
+  meta: {
+    color: '#777777',
+    fontSize: 12,
+    fontFamily: 'monospace',
+    marginTop: 2,
   },
   statusBadge: {
     paddingHorizontal: 10,
@@ -261,19 +308,21 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     textTransform: 'uppercase',
   },
-  progressBar: {
-    height: 4,
-    backgroundColor: '#333333',
-    borderRadius: 2,
-    marginBottom: 8,
+  doneBadge: {
+    backgroundColor: '#22c55e',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 8,
   },
-  progressFill: {
-    height: '100%',
-    borderRadius: 2,
+  doneBadgeText: {
+    color: '#0f0f0f',
+    fontSize: 12,
+    fontWeight: '800',
   },
   stageInfo: {
     color: '#666666',
     fontSize: 13,
+    marginTop: 10,
   },
   errorText: {
     color: '#ef4444',

@@ -1,4 +1,4 @@
-# DayReel Runbook
+# CaptionClips Runbook
 
 The page to open at 2am when the pipeline is silent. Commands to get from a cold
 machine to a video moving through the pipeline, where to look when it does not,
@@ -262,7 +262,7 @@ Measured 2026-08-13; ~9 GiB total.
 
 - **`~/.cache/huggingface`** was 7.9 GiB of model weights (faster-whisper,
   wav2vec2, PaddleOCR, vit-gpt2) belonging to *other projects on this machine*.
-  **DayReel uses none of them** — it uses whisper.cpp with `ggml-base.bin` in the
+  **CaptionClips uses none of them** — it uses whisper.cpp with `ggml-base.bin` in the
   `infra_whisper-models` volume, and Stage 5A explicitly rejected faster-whisper.
   It was the single largest lever available and was cleared with the user's
   explicit approval. It is now empty. Deleting is reversible but means a slow

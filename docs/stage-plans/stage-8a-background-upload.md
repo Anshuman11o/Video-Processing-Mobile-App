@@ -808,7 +808,7 @@ Phase 3 onward is in the same boat.
 
 **(a) Reclaim host disk first.** Docker holds 4.344 GB of images and 2.302 GB of
 build cache (1.759 GB reclaimable). `docker builder prune -f` plus removing
-non-DayReel images is the cheapest few GB available.
+non-CaptionClips images is the cheapest few GB available.
 - Nowhere near enough on its own — it gets to maybe 6–8 GB free against a 15–20 GB
   need — and it must not delete the `whisper-models` volume (~141 MB, re-downloads)
   or force a full rebuild of images the pipeline needs.

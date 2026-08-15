@@ -33,7 +33,7 @@
 
 ## Aim
 
-Play a finished reel — video and captions — inside the DayReel app, from the
+Play a finished reel — video and captions — inside the CaptionClips app, from the
 `hls_url` the pipeline has been producing since 6A and that Stage 7 currently
 only displays as text.
 
