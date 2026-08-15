@@ -18,7 +18,7 @@ Pick a video on your phone and get back a **captioned, adaptive-bitrate stream**
 
 Raw clips arrive with no captions and one fixed resolution. CaptionClips uploads
 them in resumable 5 MiB parts that survive the app being killed, then runs each
-clip through a four-stage backend pipeline — validate, extract the audio,
+clip through a four-stage backend pipeline: validate, extract the audio,
 transcribe it with a speech model, and package the result as HLS. What comes
 back is the same footage with **generated captions** and a **three-rung
 resolution ladder** the player switches between on the fly.
@@ -26,17 +26,6 @@ resolution ladder** the player switches between on the fly.
 Uploads and processing run in parallel across clips, and every job reports its
 own live progress: which stage it is in, how long each one took, and how many
 megabytes have landed.
-
-> **On the name.** The product was called *DayReel* until it was renamed to
-> *CaptionClips*. The rename stopped at the product: the Android package id
-> (`com.dayreel`), the Go module path (`github.com/anshumanagarwal/dayreel`), the
-> S3 buckets (`dayreel-raw-videos`, `dayreel-processed`, `dayreel-hls-output`),
-> the DynamoDB table (`dayreel-jobs`), the queue names (`dayreel-validate` and
-> friends), the emulator AVD (`dayreel-avd`) and the logcat tag (`DayReelUpload`)
-> all still say `dayreel`. They name live infrastructure and shipped code, so
-> renaming them in the docs would only send you to resources that do not exist.
-> Where you see `dayreel` in a command or an identifier anywhere in this
-> repository, it is deliberate and correct.
 
 ---
 
@@ -59,57 +48,43 @@ megabytes have landed.
 
 ## 1. The problem
 
-A raw clip off a phone is a poor thing to publish. It carries **no captions**,
-so it is unwatchable on mute and unusable to anyone deaf or hard of hearing —
-and most social video is watched on mute. It exists at **exactly one
-resolution**, so a viewer on bad data either buffers or gets nothing. Fixing
-both means transcription and multi-resolution encoding.
-
-Neither can happen on the phone, and getting the clip off the phone is its own
-problem.
-
-**Processing on-device is impractical.** An adaptive-bitrate ladder means
-encoding the same clip three times over, and captions mean running a speech
-model of several hundred megabytes. That is minutes of sustained CPU on hardware
-the user is holding, and both mobile platforms restrict what an app may do once
-it leaves the foreground — so the work stops when the user switches away.
+Uploading video from a mobile device fails in two ways, and each makes the other
+harder to solve.
 
 **Networks are unreliable and video files are large.** A 60-second 1080p clip
 runs to tens of megabytes. On a train, in a lift, or on rural data, a
 single-request upload that fails at 90 percent restarts from zero. Users respond
 by not uploading.
 
-The naive design — upload in the foreground, process on-device — produces an app
-that works only on strong Wi-Fi with the screen open, and asks the user to watch
-a progress bar to get there.
+**Processing video on the device is impractical.** Adaptive-bitrate streaming
+requires encoding the same clip at three resolutions, plus speech-to-text against
+a model of several hundred megabytes. That is minutes of sustained CPU on
+hardware the user is holding, and both mobile platforms restrict what an
+application may do once it leaves the foreground.
+
+The naive design, uploading in the foreground and processing on-device, produces
+an application that works only on strong Wi-Fi with the screen open.
 
 ---
 
 ## 2. The solution
 
-Send the bytes once, reliably, and do the expensive work where it is allowed to
-take its time.
+Separate the work at the boundary where the guarantees differ.
 
 **On the device: never lose upload progress.** The clip is divided into 5 MiB
 parts, each uploaded independently and recorded to a local ledger as soon as it
 succeeds. The transfer is owned by the operating system's scheduler rather than
-the app process, so it survives termination and resumes at the first part that
-has not landed. Several clips upload at once, and each reports its own progress.
+the application process, so it survives termination and resumes at the first part
+that has not landed.
 
-**On the backend: turn one clip into a captioned stream.** Four stages, each
-restartable. `validate` checks the file is really playable video and normalises
-it; `extract` pulls out a 16 kHz audio track; `transcribe` runs it through
-whisper.cpp to produce timed WebVTT cues; `package` encodes the three-rung HLS
-ladder and publishes the captions as a selectable subtitle track.
+**On the backend: make every stage restartable.** A four-stage pipeline processes
+each clip. Messages carry pointers rather than payloads, the database holds the
+only authoritative state, and each stage checks whether its own output already
+exists before doing any work. A worker can fail mid-encode without the job being
+lost or duplicated.
 
-**Make every stage safe to run twice.** Messages carry S3 pointers rather than
-payloads, the database holds the only authoritative state, and each stage checks
-whether its own output already exists before doing any work. A worker can be
-killed mid-encode and the job continues rather than duplicating or dying.
-
-The result takes a clip on a poor connection, finishes the upload whenever the
-network allows, and has a captioned, resolution-switchable stream waiting when
-the user comes back.
+The result accepts a clip on a poor connection, finishes the upload whenever the
+network allows, and has a finished captioned stream ready when the user returns.
 
 ---
 
@@ -440,8 +415,8 @@ does and which decisions are non-obvious. Start there, not in the code.
 | [`PROJECT_PLAN.md`](PROJECT_PLAN.md) | Architecture, design invariants, staging, and what was deliberately deferred |
 | [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) | Every non-trivial bug: symptom, cause, fix, prevention |
 | [`docs/SETUP.md`](docs/SETUP.md) | Provisioning walkthrough |
-| [`docs/METRICS.md`](docs/METRICS.md) | The four project metrics, measured on real AWS — and which two the sample cannot support |
-| [`docs/aws-public-hls.md`](docs/aws-public-hls.md) | Why presigning cannot serve HLS, and the opt-in access model — including how to turn it off |
+| [`docs/METRICS.md`](docs/METRICS.md) | The four project metrics, measured on real AWS, and which two the sample cannot support |
+| [`docs/aws-public-hls.md`](docs/aws-public-hls.md) | Why presigning cannot serve HLS, and the opt-in access model, including how to turn it off |
 | [`docs/stage-plans/`](docs/stage-plans/) | One plan per stage, written *before* implementation |
 | [`config/aws-limits.md`](config/aws-limits.md) | Service constraints the design had to bend around |
 | [`config/free-tier.md`](config/free-tier.md) | Budget guardrails and cost traps |
