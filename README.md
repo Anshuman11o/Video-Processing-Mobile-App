@@ -5,20 +5,27 @@
 ## Demo
 
 <p align="center">
-  <img src="docs/assets/dayreel-demo.gif" width="300" alt="CaptionClips: a clip picked in the app, uploaded, processed, and played back as a captioned stream">
+  <img src="docs/assets/captionclips-demo.gif" width="340" alt="CaptionClips: two raw clips selected, uploaded in parallel, processed through the pipeline with live metrics, and played back with generated captions and selectable resolutions">
 </p>
 
 <p align="center">
-  <a href="https://github.com/Anshuman11o/Video-Processing-Mobile-App/raw/main/docs/assets/dayreel-demo.mp4">▶ Watch with sound (MP4, 1m11s)</a>
+  <a href="https://github.com/Anshuman11o/Video-Processing-Mobile-App/raw/main/docs/assets/captionclips-demo.mp4">▶ Watch with sound (MP4, 1m51s)</a>
 </p>
 
 ---
 
-An offline-first mobile video app. Record short clips on a weak network; the app
-queues them locally and uploads in the background, resuming **from the exact byte
-it stopped at** even after the app is killed. A backend pipeline then validates,
-extracts, transcribes and packages each clip into a captioned adaptive-bitrate
-stream, waiting the next time you open the app.
+Pick a video on your phone and get back a **captioned, adaptive-bitrate stream**.
+
+Raw clips arrive with no captions and one fixed resolution. CaptionClips uploads
+them in resumable 5 MiB parts that survive the app being killed, then runs each
+clip through a four-stage backend pipeline — validate, extract the audio,
+transcribe it with a speech model, and package the result as HLS. What comes
+back is the same footage with **generated captions** and a **three-rung
+resolution ladder** the player switches between on the fly.
+
+Uploads and processing run in parallel across clips, and every job reports its
+own live progress: which stage it is in, how long each one took, and how many
+megabytes have landed.
 
 > **On the name.** The product was called *DayReel* until it was renamed to
 > *CaptionClips*. The rename stopped at the product: the Android package id
@@ -52,43 +59,57 @@ stream, waiting the next time you open the app.
 
 ## 1. The problem
 
-Uploading video from a mobile device fails in two ways, and each makes the other
-harder to solve.
+A raw clip off a phone is a poor thing to publish. It carries **no captions**,
+so it is unwatchable on mute and unusable to anyone deaf or hard of hearing —
+and most social video is watched on mute. It exists at **exactly one
+resolution**, so a viewer on bad data either buffers or gets nothing. Fixing
+both means transcription and multi-resolution encoding.
+
+Neither can happen on the phone, and getting the clip off the phone is its own
+problem.
+
+**Processing on-device is impractical.** An adaptive-bitrate ladder means
+encoding the same clip three times over, and captions mean running a speech
+model of several hundred megabytes. That is minutes of sustained CPU on hardware
+the user is holding, and both mobile platforms restrict what an app may do once
+it leaves the foreground — so the work stops when the user switches away.
 
 **Networks are unreliable and video files are large.** A 60-second 1080p clip
 runs to tens of megabytes. On a train, in a lift, or on rural data, a
 single-request upload that fails at 90 percent restarts from zero. Users respond
 by not uploading.
 
-**Processing video on the device is impractical.** Adaptive-bitrate streaming
-requires encoding the same clip at three resolutions, plus speech-to-text against
-a model of several hundred megabytes. That is minutes of sustained CPU on
-hardware the user is holding, and both mobile platforms restrict what an
-application may do once it leaves the foreground.
-
-The naive design, uploading in the foreground and processing on-device, produces
-an application that works only on strong Wi-Fi with the screen open.
+The naive design — upload in the foreground, process on-device — produces an app
+that works only on strong Wi-Fi with the screen open, and asks the user to watch
+a progress bar to get there.
 
 ---
 
 ## 2. The solution
 
-Separate the work at the boundary where the guarantees differ.
+Send the bytes once, reliably, and do the expensive work where it is allowed to
+take its time.
 
 **On the device: never lose upload progress.** The clip is divided into 5 MiB
 parts, each uploaded independently and recorded to a local ledger as soon as it
 succeeds. The transfer is owned by the operating system's scheduler rather than
-the application process, so it survives termination and resumes at the first part
-that has not landed.
+the app process, so it survives termination and resumes at the first part that
+has not landed. Several clips upload at once, and each reports its own progress.
 
-**On the backend: make every stage restartable.** A four-stage pipeline processes
-each clip. Messages carry pointers rather than payloads, the database holds the
-only authoritative state, and each stage checks whether its own output already
-exists before doing any work. A worker can fail mid-encode without the job being
-lost or duplicated.
+**On the backend: turn one clip into a captioned stream.** Four stages, each
+restartable. `validate` checks the file is really playable video and normalises
+it; `extract` pulls out a 16 kHz audio track; `transcribe` runs it through
+whisper.cpp to produce timed WebVTT cues; `package` encodes the three-rung HLS
+ladder and publishes the captions as a selectable subtitle track.
 
-The result accepts a clip on a poor connection, finishes the upload whenever the
-network allows, and has a finished captioned stream ready when the user returns.
+**Make every stage safe to run twice.** Messages carry S3 pointers rather than
+payloads, the database holds the only authoritative state, and each stage checks
+whether its own output already exists before doing any work. A worker can be
+killed mid-encode and the job continues rather than duplicating or dying.
+
+The result takes a clip on a poor connection, finishes the upload whenever the
+network allows, and has a captioned, resolution-switchable stream waiting when
+the user comes back.
 
 ---
 
